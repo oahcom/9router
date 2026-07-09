@@ -1,0 +1,1424 @@
+{
+  "plan": {
+    "title": "9router Proxy Chain Test Plan",
+    "version": "1.0",
+    "date": "2026-07-07",
+    "components": {
+      "proxy_global_js": "/path/to/proxy-global.js",
+      "daemon_py": "/path/to/daemon.py",
+      "data_sqlite": "/path/to/9router/data.sqlite",
+      "singbox_config": "/path/to/singbox-config.json",
+      "bad_nodes_json": "/path/to/.bad_nodes.json",
+      "singbox_secret": "~/.singbox_secret",
+      "singbox_clash_api": "http://127.0.0.1:9090",
+      "singbox_mixed_port": 7890,
+      "okz_fallback": "okz:6696"
+    },
+    "environment_prerequisites": {
+      "services_running": ["nine-router", "sing-box"],
+      "test_tools": ["curl", "jq", "nc", "node", "python3", "sqlite3"],
+      "mock_server": "python3 -m http.server 18888 (for proxy-js CONNECT test target)"
+    }
+  },
+  "test_cases": [
+    {
+      "test_point_id": "T-001",
+      "steps": [
+        "启动 mock 目标 HTTPS 服务器在端口 18443（返回固定 JSON 响应）",
+        "确认 9router 运行中，outboundProxyUrl=http://127.0.0.1:7890",
+        "通过 9router API 发送一条 AI 客户端请求（如 curl -X POST http://localhost:20128/v1/chat/completions ...）",
+        "在 mock 目标服务器端验证请求确实通过 sing-box:7890 到达（检查 X-Forwarded-For 或来源 IP）",
+        "检查 9router 返回的响应内容与 mock 服务器返回一致"
+      ],
+      "expected_results": [
+        "mock 服务器收到请求，来源 IP 为出口节点 IP（非本机 127.0.0.1）",
+        "9router 正确返回 AI 响应，状态码 200",
+        "proxy-global.js 日志显示 CONNECT 隧道成功建立",
+        "完整链路时延在预期范围内"
+      ],
+      "setup": "启动 mock HTTPS 服务器；确认 sing-box 运行中且 Clash API 可用；确认 9router 已加载 proxy-global.js；备份当前 outboundProxyUrl",
+      "teardown": "关闭 mock 服务器；恢复 outboundProxyUrl 至备份值；清理 9router 请求日志"
+    },
+    {
+      "test_point_id": "T-002",
+      "steps": [
+        "直接构造一个 CONNECT 请求发送至 proxy-global.js 监听的端口",
+        "设置目标为 mock HTTPS 服务器:18443",
+        "检查握手响应状态码",
+        "验证 CONNECT 隧道建立后可通过该隧道发送 HTTP 请求"
+      ],
+      "expected_results": [
+        "CONNECT 响应状态码在 200-299 范围内",
+        "tlsTunnel 成功建立 TLS 连接到目标",
+        "通过隧道发送的 HTTP GET 请求返回 mock 服务器的正确响应",
+        "connectThroughProxy 正确转发流量到 sing-box:7890"
+      ],
+      "setup": "启动 mock HTTPS 服务器；确认 proxy-global.js 运行中",
+      "teardown": "关闭 mock 服务器"
+    },
+    {
+      "test_point_id": "T-003",
+      "steps": [
+        "对 shouldUseProxy 函数传入以下目标地址：127.0.0.1:8080, localhost:3000, ::1, 10.0.0.1:80, 172.16.0.1:443, 192.168.1.1:9090, 169.254.1.1:53, [::1]:8080（IPv6 括号格式）",
+        "对每个传入地址检查返回值",
+        "同时验证非私网地址如 8.8.8.8:53, 1.1.1.1:443 返回 true"
+      ],
+      "expected_results": [
+        "所有私网地址 shouldUseProxy 返回 false",
+        "所有公网地址 shouldUseProxy 返回 true",
+        "IPv6 括号格式正确处理，不因括号导致解析失败",
+        "匹配规则与 _NO_PROXY 列表完全一致"
+      ],
+      "setup": "准备 Node.js 测试脚本引入 proxy-global.js 的 shouldUseProxy 函数",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-004",
+      "steps": [
+        "准备测试用 data.sqlite，在 settings 表中写入 outboundProxyUrl='http://test-proxy:7890' 和 outboundProxyEnabled=1",
+        "启动 proxy-global.js 并观察初始化日志",
+        "读取 proxyUrl 和 proxyEnabled 的值并与 SQLite 写入值对比"
+      ],
+      "expected_results": [
+        "proxyUrl 被设置为 'http://test-proxy:7890'",
+        "proxyEnabled 为 true",
+        "初始化日志输出从 SQLite 加载的配置值",
+        "CONNECT 隧道使用 test-proxy:7890"
+      ],
+      "setup": "使用 sqlite3 创建测试 data.sqlite 并插入测试记录；设置环境变量指向测试 SQLite",
+      "teardown": "删除测试 data.sqlite；恢复环境变量"
+    },
+    {
+      "test_point_id": "T-005",
+      "steps": [
+        "准备 data.sqlite，写入 outboundProxyUrl='not-a-valid-url!!!' 和 outboundProxyEnabled=1",
+        "启动 proxy-global.js",
+        "检查初始化后 proxyUrl 和 proxyEnabled 的值",
+        "检查 proxy-global.js 日志中是否有 URL 解析失败的 catch 日志"
+      ],
+      "expected_results": [
+        "new URL('not-a-valid-url!!!') 抛出 TypeError 并被 try/catch 捕获",
+        "proxyUrl 回退为 'http://127.0.0.1:7890'",
+        "proxyEnabled 设置为 false",
+        "日志记录 proxy URL 解析失败并打印回退信息"
+      ],
+      "setup": "创建含非法 URL 的测试 SQLite",
+      "teardown": "清理测试 SQLite"
+    },
+    {
+      "test_point_id": "T-006",
+      "steps": [
+        "创建 .singbox_secret 测试文件，分别测试 mode=600, mode=644, mode=777",
+        "对每个模式调用 _readSingboxSecret 函数",
+        "检查脚本输出/日志中是否打印权限警告",
+        "验证不同模式下是否能正确读取 secret 内容"
+      ],
+      "expected_results": [
+        "mode=600 时正常读取 secret 内容，无警告",
+        "mode=644 时读取 secret 内容但打印权限过宽警告",
+        "mode=777 时读取 secret 内容但打印权限过宽警告",
+        "警告信息包含文件路径和当前权限值",
+        "stat.mode & 0o077 检查正确实现"
+      ],
+      "setup": "准备测试用 .singbox_secret 文件",
+      "teardown": "删除测试 .singbox_secret 文件"
+    },
+    {
+      "test_point_id": "T-007",
+      "steps": [
+        "准备测试 SQLite，向 requestDetails 表插入 10 条 opencode provider 记录，其中 2 条 status=500, 8 条 status=200",
+        "调用 get_9router_error_rate()",
+        "返回结果应与插入数据对应：total=10, errors=2, consecutive_errors 根据最后几条记录的状态计算",
+        "验证 RECENT_WINDOW=10 正确限制窗口大小"
+      ],
+      "expected_results": [
+        "get_9router_error_rate 返回 (10, 2, [...], 0..N) 或 (total=10, errors=2, ...)",
+        "计算的 error_rate=0.2 (20%)",
+        "consecutive_errors 数值正确（取决于最后几条记录的顺序）",
+        "当有 11 条时只统计最近 10 条"
+      ],
+      "setup": "创建临时 SQLite，建 requestDetails 表结构，插入测试数据",
+      "teardown": "清理临时 SQLite"
+    },
+    {
+      "test_point_id": "T-008",
+      "steps": [
+        "注入 2 条错误记录使窗口错误率 > 10%（如 10 条中 2 条失败 = 20%）",
+        "确保主循环不在 cooldown 期内（cooldown_until < now）",
+        "执行 daemon 主循环的一次迭代",
+        "检查是否有调用当前节点加入 fail_set、pick_next_node、switch_proxy"
+      ],
+      "expected_results": [
+        "错误率 20% > 10% 阈值，触发轮换",
+        "当前节点被加入 fail_set",
+        "pick_next_node 被调用并返回新节点",
+        "switch_proxy 被调用且参数为新节点",
+        "cooldown_until 被更新为 now + 10s"
+      ],
+      "setup": "准备 daemon 测试环境，注入错误率超过阈值的测试数据；确保 cooldown 已过期",
+      "teardown": "清理测试数据；重置 fail_set 和 cooldown"
+    },
+    {
+      "test_point_id": "T-009",
+      "steps": [
+        "注入 requestDetails 记录使 consecutive_errors=2（如最后 2 条记录均为 500，且 total ≤ 2 使 2/2=100%）",
+        "即使 2/2=100% 已经超过 10% 阈值，仍需验证是 consecutive_errors >= 2 这个条件独立触发",
+        "构造一个场景：total=20, errors=1, consecutive_errors=2（最后 2 条连续失败，但总体错误率仅 5%）",
+        "执行主循环"
+      ],
+      "expected_results": [
+        "consecutive_errors >= 2 独立触发轮换，即使总体错误率 5% < 10%",
+        "当前节点被加入 fail_set",
+        "pick_next_node 和 switch_proxy 被调用",
+        "cooldown 被设置"
+      ],
+      "setup": "注入连续 2 条失败记录但总体错误率在阈值以下",
+      "teardown": "清理测试数据"
+    },
+    {
+      "test_point_id": "T-010",
+      "steps": [
+        "在 requestDetails 表中插入 3 条 status=500 的 kiro provider 记录，3 条 status=500 的 nvidia provider 记录",
+        "不插入任何 opencode 的错误记录",
+        "调用 get_9router_error_rate 并检查返回值和主循环行为"
+      ],
+      "expected_results": [
+        "SQL 查询 WHERE provider='opencode' 不匹配任何非 opencode 记录",
+        "get_9router_error_rate 返回 (0, 0, [], 0) 或全零状态",
+        "主循环的轮换条件不触发（should_error=False）",
+        "非 opencode provider 的错误不影响节点选择决策"
+      ],
+      "setup": "插入仅包含 kiro/nvidia 错误的测试数据",
+      "teardown": "清理测试数据"
+    },
+    {
+      "test_point_id": "T-011",
+      "steps": [
+        "准备空的 requestDetails 表（无任何 opencode 记录）",
+        "调用 get_9router_error_rate()",
+        "验证返回值",
+        "验证主循环以此返回值时的行为"
+      ],
+      "expected_results": [
+        "返回 (0, 0, [], 0) 或等效空结果",
+        "主循环检测到 total=0 时跳过轮换判断",
+        "不产生任何切换操作",
+        "不抛出异常"
+      ],
+      "setup": "清空或使用空的 requestDetails 表",
+      "teardown": "恢复原始数据"
+    },
+    {
+      "test_point_id": "T-012",
+      "steps": [
+        "触发一次错误轮换，记录 cooldown_until",
+        "在冷却期内（10s 内）再次制造错误率超标条件",
+        "检查主循环是否跳过切换",
+        "等待冷却期过期后再次制造错误率超标条件",
+        "检查主循环是否正确触发切换"
+      ],
+      "expected_results": [
+        "冷却期 cooldown_until=now+10s",
+        "冷却期内即使错误率超标也不触发切换",
+        "冷却期内日志打印 'cooldown skip' 或类似信息",
+        "冷却期过期后错误率超标正常触发切换",
+        "不发生级联频繁切换（>1 次/10s）"
+      ],
+      "setup": "记录初始 cooldown_until；注入错误数据",
+      "teardown": "重置 cooldown_until"
+    },
+    {
+      "test_point_id": "T-013",
+      "steps": [
+        "记录当前时间 T0",
+        "确保已设置 proactive_rotate_sec=60",
+        "等待 60s 或触发一轮主循环迭代（模拟时间推进）",
+        "检查是否调用了 pick_next_node 和 switch_proxy",
+        "检查选中的节点是否加入了 _recent_nodes（maxlen=5）",
+        "连续执行 6 次主动轮换，验证 _recent_nodes 始终保持 maxlen=5"
+      ],
+      "expected_results": [
+        "每 60s 主动轮换触发一次",
+        "pick_next_node 被调用并返回新节点",
+        "switch_proxy 被调用",
+        "选中节点被加入 _recent_nodes",
+        "_recent_nodes 队列始终保持 maxlen=5，旧节点被移出"
+      ],
+      "setup": "设置 proactive_rotate_sec=60；确保足够的可用候选节点",
+      "teardown": "重置 proactive_rotate_sec；清空 _recent_nodes"
+    },
+    {
+      "test_point_id": "T-014",
+      "steps": [
+        "记录初始 _NODE_CALL_COUNTS 值",
+        "通过错误触发路径调用 pick_next_node(count_call=False)",
+        "检查 _NODE_CALL_COUNTS 是否递增",
+        "通过主动轮换路径调用 pick_next_node(count_call=True)",
+        "检查 _NODE_CALL_COUNTS 是否递增",
+        "对比两种路径的计数差异"
+      ],
+      "expected_results": [
+        "错误触发路径 count_call=False 时 _NODE_CALL_COUNTS 不增加",
+        "主动轮换路径 count_call=True 时 _NODE_CALL_COUNTS 正常递增",
+        "429 错误导致的节点切换不计入成功调用次数"
+      ],
+      "setup": "记录初始调用计数快照",
+      "teardown": "恢复 _NODE_CALL_COUNTS 快照"
+    },
+    {
+      "test_point_id": "T-015",
+      "steps": [
+        "准备包含 10 个节点的 pool，每个节点分配不同的延迟和调用次数",
+        "在 normal 模式下调用 _p2c_select（排序规则: (delay_score, -call_count)）",
+        "验证从 pool 中随机抽样 2 个候选",
+        "验证分数计算逻辑",
+        "在 pressure 模式下调用 _p2c_select（排序规则: (-call_count, delay_score)）",
+        "构造 k < 2 场景（pool 中仅 1 个节点）",
+        "构造 k=0 场景"
+      ],
+      "expected_results": [
+        "normal 模式对候选按 (ds, -calls) 排序，选择排序第一的节点",
+        "pressure 模式对候选按 (-calls, ds) 排序，选择排序第一的节点",
+        "k < 2 时直接返回唯一候选，不执行随机抽样",
+        "k=0 时返回 None"
+      ],
+      "setup": "准备测试节点 pool 数据",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-016",
+      "steps": [
+        "构造一组节点，其中 3 个节点出口 IP 相同（如 node_a=1.2.3.4, node_b=1.2.3.4, node_c=1.2.3.4）但 call_count 不同（5, 10, 2）",
+        "另设 2 个节点 IP 不同",
+        "调用 _dedup_by_ip",
+        "检查去重结果"
+      ],
+      "expected_results": [
+        "同 IP 的三个节点只保留 call_count=2（最小）的一个",
+        "其余两个同 IP 节点加入 dedup_skip",
+        "不同 IP 的节点不受影响",
+        "返回的候选列表中去重正确"
+      ],
+      "setup": "准备带 IP 信息的测试节点列表",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-017",
+      "steps": [
+        "构造 pool 大小为 4（小于 5）的场景",
+        "验证 _filter_candidates 逻辑：放行 recent_nodes → 跳过 fail_set → 跳过 dead",
+        "构造 pool 为 0 的场景",
+        "调用 pick_next_node 检查返回值"
+      ],
+      "expected_results": [
+        "候选 < 5 时依次放宽限制：先允许 recent_nodes 中的节点",
+        "recent_nodes 不够时放行 fail_set 中的节点",
+        "fail_set 不够时放行 dead 节点",
+        "候选最终为 0 时 pick_next_node 返回 None"
+      ],
+      "setup": "构造小 pool 测试环境",
+      "teardown": "恢复正常 pool"
+    },
+    {
+      "test_point_id": "T-018",
+      "steps": [
+        "配置 mock 上游服务器返回 HTTP 429 Too Many Requests",
+        "通过 proxy-global.js 发送一条请求",
+        "检查节点切换是否触发",
+        "检查重试次数和退避逻辑",
+        "配置 mock 上游服务器返回 HTTP 502 Bad Gateway",
+        "再次发送请求检查"
+      ],
+      "expected_results": [
+        "429 响应触发 triggerNodeSwitch",
+        "节点切换后重试请求，退避 sleep(500*attempt) ms",
+        "最多重试 MAX_RETRIES(3) 次",
+        "500+ 状态码同样触发节点切换+重试"
+      ],
+      "setup": "配置 mock HTTP 服务器返回 429/5xx；确保 proxy-global.js 正常运行",
+      "teardown": "恢复 mock 服务器正常响应"
+    },
+    {
+      "test_point_id": "T-019",
+      "steps": [
+        "配置 mock 上游服务器返回 200 OK 但 body 为空（Content-Length: 0 或直接关闭连接）",
+        "发送一条非流式 HTTP 请求",
+        "检查 proxy-global.js 是否检测到 body.length === 0",
+        "检查是否触发 triggerNodeSwitch 和重试"
+      ],
+      "expected_results": [
+        "非流式响应 body.length === 0 被识别为空响应",
+        "triggerNodeSwitch 被调用",
+        "重试向新节点发起请求",
+        "3 次重试耗尽后返回 502"
+      ],
+      "setup": "配置 mock 服务器返回 200 空 body",
+      "teardown": "恢复 mock 服务器正常响应"
+    },
+    {
+      "test_point_id": "T-020",
+      "steps": [
+        "配置 mock 上游服务器返回 SSE 流，但建立连接后 3s 内不发送任何数据",
+        "发送带 Accept: text/event-stream 的请求",
+        "检查 _peekSseStream 是否在 2s 超时后返回 hasData=false",
+        "检查是否 triggerNodeSwitch + retry"
+      ],
+      "expected_results": [
+        "_peekSseStream 设置 AbortSignal.timeout(2000)",
+        "2s 超时后 hasData=false",
+        "triggerNodeSwitch 被调用",
+        "重试到新节点",
+        "3 次耗尽后返回 502"
+      ],
+      "setup": "配置 mock 服务器 SSE endpoint，建立连接后延迟 3s 才发数据",
+      "teardown": "恢复 mock 服务器正常 SSE"
+    },
+    {
+      "test_point_id": "T-021",
+      "steps": [
+        "配置 mock 上游服务器返回 SSE 流，chunk 中带 error 字段（如 data: {\"error\":{\"message\":\"rate_limit_exceeded\"}}）",
+        "发送 SSE 请求",
+        "检查 _isSseChunkError 是否检测到 error 字段",
+        "检查是否中断当前流并 triggerNodeSwitch + retry",
+        "遍历测试所有 error 关键词：rate, limit, quota, exhausted, overload, unavailable, server_error"
+      ],
+      "expected_results": [
+        "SSE chunk 含 error 字段时 _isSseChunkError 返回 true",
+        "当前 SSE 流被中断",
+        "triggerNodeSwitch 被调用",
+        "节点切换后重试",
+        "所有 error 关键词均被正确匹配"
+      ],
+      "setup": "配置 mock 服务器 SSE endpoint 返回含 error 的 chunk",
+      "teardown": "恢复 mock 服务器正常 SSE"
+    },
+    {
+      "test_point_id": "T-022",
+      "steps": [
+        "模拟网络异常（如关闭上游服务器端口、iptables 阻断）",
+        "发送请求",
+        "检查 attemptReq.on('error') 或 try-catch 是否捕获",
+        "检查 triggerNodeSwitch 调用"
+      ],
+      "expected_results": [
+        "网络连接异常被捕获",
+        "triggerNodeSwitch 被调用",
+        "重试向新节点发起连接",
+        "3 次耗尽后返回 502"
+      ],
+      "setup": "使用 iptables/nftables 阻断到目标端口的流量，或直接停止 mock 服务器",
+      "teardown": "恢复 iptables 规则或重启 mock 服务器"
+    },
+    {
+      "test_point_id": "T-023",
+      "steps": [
+        "配置 mock 服务器返回 200 OK，但 body 为 JSON 含 {error: {message: 'rate_limit_exceeded'}}",
+        "发送请求",
+        "检查 _shouldRetryFetch(200, body) 返回值",
+        "检查 triggerNodeSwitch 调用",
+        "遍历测试所有模式串：rate_limit, quota_exhausted, server_error, upstream"
+      ],
+      "expected_results": [
+        "_shouldRetryFetch(200, body) 返回 true",
+        "triggerNodeSwitch 被调用",
+        "节点切换后重试",
+        "所有 error message 中的模式串都被正确匹配"
+      ],
+      "setup": "配置 mock 服务器返回 200+error body",
+      "teardown": "恢复 mock 服务器正常响应"
+    },
+    {
+      "test_point_id": "T-024",
+      "steps": [
+        "配置 mock 服务器持续返回错误（如一直返回 429）",
+        "发送请求，等待重试耗尽",
+        "检查最终响应"
+      ],
+      "expected_results": [
+        "经过 MAX_RETRIES(3) 次尝试后返回",
+        "响应状态码为 502",
+        "Content-Type 为 application/json",
+        "body 中包含 proxy-global_error type",
+        "响应体结构如 {error:{type:'proxy-global_error', message:'...'}}"
+      ],
+      "setup": "配置 mock 服务器持续返回错误",
+      "teardown": "恢复 mock 服务器正常响应"
+    },
+    {
+      "test_point_id": "T-025",
+      "steps": [
+        "配置 mock 服务器返回 429",
+        "同时发送 3 个并发请求",
+        "检查 triggerNodeSwitch 是否只被调用一次",
+        "检查 _switching Promise 链"
+      ],
+      "expected_results": [
+        "第一个请求调用 triggerNodeSwitch 后设置 _switching Promise",
+        "后续并发请求不调用 triggerNodeSwitch，而是 await 同一个 _switching",
+        "_switching 在 finally 块中被清空为 null",
+        "全局只执行一次节点切换"
+      ],
+      "setup": "配置 mock 服务器返回 429",
+      "teardown": "恢复 mock 服务器正常响应；清空 _switching"
+    },
+    {
+      "test_point_id": "T-026",
+      "steps": [
+        "模拟 triggerNodeSwitch 正在执行切换时（_switching 非空）",
+        "模拟切换最终失败（如 PUT /proxies/proxy 失败）",
+        "触发另一个请求进行重试",
+        "检查该请求的响应"
+      ],
+      "expected_results": [
+        "triggerNodeSwitch 返回 false（因 _switching 进行中且切换失败）",
+        "重试路径检测到切换失败",
+        "不继续等待切换",
+        "直接返回 502 响应给调用方"
+      ],
+      "setup": "注入 triggerNodeSwitch 切换失败条件",
+      "teardown": "恢复正常的切换能力"
+    },
+    {
+      "test_point_id": "T-027",
+      "steps": [
+        "向 _DEAD_NODES 添加几个测试节点",
+        "调用 cleanup_dead_ttl",
+        "检查 .bad_nodes.json 文件内容"
+      ],
+      "expected_results": [
+        "bad_nodes.json 被写入（或更新）",
+        "格式为 {node: {expire: <int>, reason: 'daemon_dead'}}",
+        "旧条目（daemon 未覆盖的）被保留",
+        "未在 _DEAD_NODES 中的旧节点从文件中移除",
+        "文件的写入使用原子操作（先写临时文件再 rename）"
+      ],
+      "setup": "准备测试节点加入 _DEAD_NODES；备份现有 bad_nodes.json",
+      "teardown": "清理测试节点；恢复 bad_nodes.json"
+    },
+    {
+      "test_point_id": "T-028",
+      "steps": [
+        "准备包含多种格式的 .bad_nodes.json：部分为 {node: {expire: ..., reason: ...}} 格式，部分为 {node: <timestamp>} 纯数字格式",
+        "确保有已过期和未过期的条目",
+        "调用 loadBadNodes()",
+        "检查返回值"
+      ],
+      "expected_results": [
+        "兼容 dict 格式 {expire, reason} 正常解析",
+        "兼容纯数字时间戳格式",
+        "已过期条目被过滤掉（expire < now）",
+        "未过期条目正常返回",
+        "mtime 缓存命中时跳过文件读取"
+      ],
+      "setup": "准备多格式 .bad_nodes.json 测试文件",
+      "teardown": "清理测试文件"
+    },
+    {
+      "test_point_id": "T-029",
+      "steps": [
+        "准备一个 .bad_nodes.json 文件",
+        "调用 loadBadNodes，验证第一次读取正常",
+        "记录文件的 mtime",
+        "再次调用 loadBadNodes（mtime 未变），验证使用缓存",
+        "修改文件内容并更新 mtime（touch）",
+        "再次调用 loadBadNodes，验证重新读取",
+        "在读文件前修改文件（模拟 daemon 刚替换），验证读后 mtime 二次确认"
+      ],
+      "expected_results": [
+        "第一次读取返回文件内容",
+        "mtime 缓存命中时跳过读文件（stat 不变化）",
+        "mtime 变化时重新读取文件",
+        "读文件后二次 stat 确认 mtime 与读前一致",
+        "如果读前后 mtime 不一致，丢弃读取结果（避免 TOCTOU）"
+      ],
+      "setup": "准备测试 .bad_nodes.json",
+      "teardown": "清理测试文件"
+    },
+    {
+      "test_point_id": "T-030",
+      "steps": [
+        "准备 .bad_nodes.json 包含 'host:port' 格式和 'host:port-any' 格式的条目",
+        "调用 _load_shared_bad_nodes",
+        "检查 _DEAD_NODES 的合并结果"
+      ],
+      "expected_results": [
+        "host:port-any 格式的条目被过滤（不与 daemon 的死节点冲突）",
+        "host:port 格式的其他条目被导入",
+        "导入的节点保留原始 TTL (expire 时间)",
+        "已过期的条目不被导入"
+      ],
+      "setup": "准备测试 .bad_nodes.json",
+      "teardown": "清理测试文件"
+    },
+    {
+      "test_point_id": "T-031",
+      "steps": [
+        "记录 daemon._load_shared_bad_nodes 的最后读取 mtime",
+        "在 5s 内再次调用，验证使用缓存",
+        "修改 .bad_nodes.json 的 mtime（touch）",
+        "等待 5s 后再次调用，验证重新读取",
+        "验证间隔检查机制"
+      ],
+      "expected_results": [
+        "5s 内 mtime 未变时使用缓存，不读文件",
+        "mtime 变化后最晚 5s 感知到变化",
+        "最小化 I/O 次数（不频繁 stat 文件）"
+      ],
+      "setup": "准备测试 .bad_nodes.json",
+      "teardown": "清理测试文件"
+    },
+    {
+      "test_point_id": "T-032",
+      "steps": [
+        "准备 10 个测试节点（部分可达、部分不可达）",
+        "调用 batch_test_nodes",
+        "检查 _NODE_DELAYS 中存活节点的延迟记录",
+        "检查 _DEAD_NODES 中超时/失败节点的加入情况",
+        "检查 _health_pool 线程池（30 workers）的并发行为"
+      ],
+      "expected_results": [
+        "可达节点的延迟被记录到 _NODE_DELAYS",
+        "不可达节点按指数退避 TTL 加入 _DEAD_NODES",
+        "30 workers 并发测试所有节点",
+        "测试结果正确反映了节点的网络可达性"
+      ],
+      "setup": "准备测试节点列表（包括部分不可达节点）",
+      "teardown": "清空测试节点列表"
+    },
+    {
+      "test_point_id": "T-033",
+      "steps": [
+        "对同一节点连续触发失败：第 1 次、第 2 次、第 3 次、第 4 次、第 5 次",
+        "每次检查该节点在 _DEAD_NODES 中的 TTL",
+        "检查 _dead_fail_count 的递增"
+      ],
+      "expected_results": [
+        "第 1 次失败：TTL=60s，fail_count=1",
+        "第 2 次失败：TTL=120s，fail_count=2",
+        "第 3 次失败：TTL=300s，fail_count=3",
+        "第 4 次失败：TTL=600s，fail_count=4",
+        "第 5 次失败：TTL=永久(∞)，fail_count=5",
+        "_dead_fail_count[fail_count-1] 正确映射到 _DEAD_TTL_STAGES=[60,120,300,600]"
+      ],
+      "setup": "准备单个测试节点",
+      "teardown": "重置 _dead_fail_count 和 _DEAD_NODES"
+    },
+    {
+      "test_point_id": "T-034",
+      "steps": [
+        "构造场景：总节点数 10，活跃节点不断减少 -> 当活跃节点数 < 10*30%=3 时",
+        "再次触发一个节点失败",
+        "检查该节点是否被加入 _DEAD_NODES",
+        "检查 _dead_fail_count 是否回退"
+      ],
+      "expected_results": [
+        "活跃节点 < _POOL_MIN_RATIO(30%) * 总节点数时跳过拉黑",
+        "失败的节点不被加入 _DEAD_NODES",
+        "_dead_fail_count 回退（不递增）",
+        "日志输出保底机制触发的提示"
+      ],
+      "setup": "构造活跃节点数低于 30% 的场景",
+      "teardown": "恢复活跃节点数"
+    },
+    {
+      "test_point_id": "T-035",
+      "steps": [
+        "向 _DEAD_NODES 加入一个 TTL=2s 的节点",
+        "记录 _DEAD_NODES_RELEASE_TS",
+        "等待 3s",
+        "调用 cleanup_dead_ttl",
+        "检查 _DEAD_NODES 和 _dead_fail_count"
+      ],
+      "expected_results": [
+        "_DEAD_NODES_RELEASE_TS 记录节点的过期时间戳",
+        "TTL 过期后 cleanup_dead_ttl 将节点从 _DEAD_NODES 移除",
+        "_dead_fail_count 中该节点被重置",
+        "释放的节点有公平重试机会"
+      ],
+      "setup": "添加 TTL=2s 的测试节点",
+      "teardown": "清理测试节点"
+    },
+    {
+      "test_point_id": "T-036",
+      "steps": [
+        "构造场景：可测节点 < 3",
+        "确保 _DEAD_NODES 中有已过期的节点",
+        "调用 batch_test_nodes",
+        "检查是否从已过期 _DEAD_NODES 中取出节点重测",
+        "检查重测通过的节点是否从死列表移除",
+        "检查重测仍然失败的节点行为"
+      ],
+      "expected_results": [
+        "可测节点 < 3 时从已过期 _DEAD_NODES 中取节点重测",
+        "重测通过（可达）的节点从 _DEAD_NODES 移除",
+        "重测失败（仍不可达）的节点继续留在 _DEAD_NODES"
+      ],
+      "setup": "构造低候选节点数 + 有已过期死节点",
+      "teardown": "恢复节点池"
+    },
+    {
+      "test_point_id": "T-037",
+      "steps": [
+        "构造延迟数据：一组节点延迟 [10, 20, 30, 40, 50]ms（median=30）",
+        "测试 _delay_score 在各延迟点的返回值",
+        "构造 median=0 场景（所有延迟为 0）",
+        "构造 d=None 场景（延迟未知）",
+        "验证 d <= median 时线性下降",
+        "验证 d > median 时二次下降"
+      ],
+      "expected_results": [
+        "median=30, d=10 时 score ≈ 1.0（最左侧线性段）",
+        "median=30, d=30 时 score ≈ 0.5（线性段终点）",
+        "median=30, d=60 时 score ≈ 0.125（二次段 - 陡峭下降）",
+        "median=30, d=150 时 score ≈ 0.0（二次段趋于 0）",
+        "median=0 时返回 1.0（除零保护）",
+        "d=None 时返回 0.1"
+      ],
+      "setup": "准备测试用延迟数据",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-038",
+      "steps": [
+        "确认 sing-box 正常运行且在 Clash API 端口 9090 监听",
+        "调用 is_singbox_alive()",
+        "第 1 步：通过 curl 检查 Clash API /proxies 返回 200",
+        "第 2 步：通过 nc -z 检查 MIXED_PORT 7890 可连接",
+        "模拟 Clash API 不通（如停止 sing-box），再次检查"
+      ],
+      "expected_results": [
+        "Clash API 正常时返回值包含成功",
+        "7890 端口可达时返回值包含成功",
+        "任一失败（Clash API 404 或 7890 端口关闭）返回 False",
+        "总执行时间不超过 4s（硬超时）"
+      ],
+      "setup": "确认 sing-box 运行中；测试环境可访问 9090 和 7890 端口",
+      "teardown": "恢复 sing-box（如果停止）"
+    },
+    {
+      "test_point_id": "T-039",
+      "steps": [
+        "触发 restart_singbox()",
+        "观察执行顺序：停代理 → pkill sing-box → sleep 2s → fuser -k 7890 → sleep 1s → 日志轮转 → Popen 启动 → sleep 10s → check alive → 恢复代理",
+        "检查每个中间步骤的状态",
+        "验证 _RESTART_LOCK 防止并发重启"
+      ],
+      "expected_results": [
+        "先调用 _set_outbound_proxy(enabled=False) 停代理",
+        "pkill sing-box 成功",
+        "sleep 2s 等待进程退出",
+        "fuser -k 7890 释放端口绑定",
+        "日志轮转执行（如果日志 > 10MB）",
+        "Popen 启动新 sing-box 进程",
+        "sleep 10s 等待服务就绪",
+        "check alive 验证新进程健康",
+        "_set_outbound_proxy(url, enabled=True) 恢复代理",
+        "_RESTART_LOCK 防止第二个线程同时重启"
+      ],
+      "setup": "确保 sing-box 运行中；备份当前代理配置",
+      "teardown": "恢复代理配置；确认 sing-box 正常运行"
+    },
+    {
+      "test_point_id": "T-040",
+      "steps": [
+        "连续触发 sing-box 重启 4 次",
+        "前 3 次检查是否正常重启",
+        "第 4 次检查是否调用 check_and_handle_fallback",
+        "检查 _RESTART_COUNT 的累计值"
+      ],
+      "expected_results": [
+        "第 1-3 次重启正常执行",
+        "_RESTART_COUNT 累计到 3",
+        "第 4 次触发时不调用 restart_singbox",
+        "直接调用 check_and_handle_fallback 降级到 okz:6696",
+        "日志记录达到最大重启次数"
+      ],
+      "setup": "设置 max_restart_attempts=3",
+      "teardown": "重置 _RESTART_COUNT"
+    },
+    {
+      "test_point_id": "T-041",
+      "steps": [
+        "在 restart_singbox 执行前、中、后检查 outboundProxyUrl 的状态",
+        "检查 _set_outbound_proxy 调用参数",
+        "模拟启动失败场景，验证代理恢复逻辑"
+      ],
+      "expected_results": [
+        "restart_singbox 刚执行时：_set_outbound_proxy(enabled=False) → proxyEnabled=false",
+        "重启执行期间：9router 不经过代理（但也不裸奔到公网）",
+        "重启成功：_set_outbound_proxy(url, enabled=True) → 恢复代理",
+        "重启失败/异常：同样执行 _set_outbound_proxy 恢复代理",
+        "9router 在任何时候都不直接暴露到公网"
+      ],
+      "setup": "记录初始 outboundProxyUrl",
+      "teardown": "恢复初始 outboundProxyUrl"
+    },
+    {
+      "test_point_id": "T-042",
+      "steps": [
+        "创建大小超过 10MB 的 singbox.log 测试文件",
+        "触发日志轮转逻辑",
+        "检查备份文件 .1 是否创建",
+        "检查原日志文件是否被截断",
+        "模拟已有 .1 文件场景，验证 os.remove 旧 .1"
+      ],
+      "expected_results": [
+        "超过 10MB 的日志被备份为 singbox.log.1",
+        "原 singbox.log 被截断清空",
+        "如果 singbox.log.1 已存在，先 os.remove 再备份",
+        "小于 10MB 时不触发轮转"
+      ],
+      "setup": "创建大小超过 10MB 的测试日志文件",
+      "teardown": "删除测试日志文件"
+    },
+    {
+      "test_point_id": "T-043",
+      "steps": [
+        "初始化 connectFailCount=0",
+        "连续 3 次调用 recordProxyConnectResult(false)",
+        "每次调用后检查 connectFailCount 的累加值",
+        "在 connectFailCount 达到 BYPASS_THRESHOLD(3) 后，检查 bypassMode 和 proxyEnabled",
+        "确认后续请求走直连"
+      ],
+      "expected_results": [
+        "第 1 次 false：connectFailCount=1",
+        "第 2 次 false：connectFailCount=2",
+        "第 3 次 false：connectFailCount=3 >= BYPASS_THRESHOLD(3)",
+        "bypassMode=true, proxyEnabled=false",
+        "后续请求绕过代理直接发出"
+      ],
+      "setup": "初始化 proxy-global.js 状态；记录初始 connectFailCount",
+      "teardown": "退出 BYPASS 模式；重置 connectFailCount"
+    },
+    {
+      "test_point_id": "T-044",
+      "steps": [
+        "进入 BYPASS 模式（bypassMode=true, proxyEnabled=false）",
+        "确认 setInterval(checkBypassHealth, 10000) 已启动",
+        "恢复 sing-box 到正常状态（如重新启动 sing-box）",
+        "等待下一次健康检查（最多 11s）",
+        "检查 bypassMode 和 proxyEnabled 是否恢复"
+      ],
+      "expected_results": [
+        "BYPASS 模式下 setInterval 每 10s 执行健康检查",
+        "健康检查通过 net.connect(7890, '127.0.0.1') 检测 sing-box",
+        "检测到 sing-box 恢复后调用 exitBypass",
+        "exitBypass 设置 bypassMode=false, proxyEnabled=true",
+        "后续请求重新走代理"
+      ],
+      "setup": "先进入 BYPASS 模式（3 次 CONNECT 失败）；备份 sing-box 配置",
+      "teardown": "退出 BYPASS 模式；重启 sing-box"
+    },
+    {
+      "test_point_id": "T-045",
+      "steps": [
+        "CONNECT 失败使 connectFailCount=3（进入 BYPASS）",
+        "调用 recordProxyConnectResult(true)（模拟一次成功的 CONNECT 探测）",
+        "检查 connectFailCount 是否递减",
+        "连续多次成功调用测试递减到 0",
+        "验证 Math.max(0, c-1) 确保不下溢"
+      ],
+      "expected_results": [
+        "recordProxyConnectResult(true) 使 connectFailCount = Math.max(0, 3-1) = 2",
+        "再成功一次 = 1",
+        "再成功一次 = 0",
+        "c-1 不会低于 0（Math.max 保护）",
+        "成功响应自动递减计数器，降低误入 BYPASS 的概率"
+      ],
+      "setup": "初始化 connectFailCount=3（BYPASS 状态）",
+      "teardown": "重置 connectFailCount"
+    },
+    {
+      "test_point_id": "T-046",
+      "steps": [
+        "标记所有节点为 dead（_DEAD_NODES 包含全部节点）",
+        "调用 check_and_handle_fallback",
+        "检查 alive 节点数是否为 0",
+        "检查 _set_outbound_proxy 是否被调用且参数为 okz:6696",
+        "验证 9router 的 outboundProxyUrl 被修改",
+        "检查 _ALL_DEAD_FALLBACK 是否为 True"
+      ],
+      "expected_results": [
+        "alive 节点数为 0 触发 fallback 逻辑",
+        "_set_outbound_proxy('http://okz:6696/') 被调用",
+        "9router 的 outboundProxyUrl 变为 okz:6696",
+        "_ALL_DEAD_FALLBACK=True 防止重复降级",
+        "日志记录 fallback 触发信息"
+      ],
+      "setup": "将所有节点标记为 dead；备份当前 outboundProxyUrl",
+      "teardown": "恢复 outboundProxyUrl；重置 _ALL_DEAD_FALLBACK"
+    },
+    {
+      "test_point_id": "T-047",
+      "steps": [
+        "设置 _ALL_DEAD_FALLBACK=True 且 outboundProxyUrl=okz:6696（模拟已降级状态）",
+        "确保有节点恢复为 alive（如重置部分节点为正常）",
+        "调用 check_and_handle_fallback",
+        "检查 _set_outbound_proxy 是否被调用且参数为 sing-box:7890",
+        "验证 outboundProxyUrl 恢复",
+        "检查 _ALL_DEAD_FALLBACK 是否重置为 False"
+      ],
+      "expected_results": [
+        "_ALL_DEAD_FALLBACK=True 且有可用节点时触发回切",
+        "_set_outbound_proxy('http://127.0.0.1:7890') 被调用",
+        "outboundProxyUrl 恢复为 sing-box:7890",
+        "_ALL_DEAD_FALLBACK=False",
+        "日志记录从 fallback 恢复的信息"
+      ],
+      "setup": "设置降级状态；提供至少 1 个 alive 节点",
+      "teardown": "恢复代理配置"
+    },
+    {
+      "test_point_id": "T-048",
+      "steps": [
+        "调用 refresh_subscription()",
+        "检查 parse_subscription.py 是否正确执行",
+        "检查新的 singbox-config.json 是否生成",
+        "检查 restart_singbox() 是否被调用",
+        "验证新配置已生效（节点列表更新）"
+      ],
+      "expected_results": [
+        "parse_subscription.py 成功运行返回 0",
+        "新的 singbox-config.json 生成且内容有效",
+        "restart_singbox 被调用加载新配置",
+        "sing-box 重启后新节点列表可用",
+        "整个过程在后台执行不阻塞主循环（如果配置为 1h 间隔）"
+      ],
+      "setup": "备份当前 singbox-config.json；确保 parse_subscription.py 可用",
+      "teardown": "恢复配置；重启 sing-box"
+    },
+    {
+      "test_point_id": "T-049",
+      "steps": [
+        "使 parse_subscription.py 执行失败（如让订阅 URL 不可达）",
+        "调用 refresh_subscription()",
+        "检查异常是否被 catch",
+        "检查主循环是否继续运行",
+        "使 restart_singbox 失败",
+        "再次检查异常处理"
+      ],
+      "expected_results": [
+        "parse_subscription.py 失败时不抛出未捕获异常",
+        "错误日志被记录",
+        "主循环不受影响继续运行（daemon 不崩溃）",
+        "restart_singbox 失败时同样 catch 异常记录日志"
+      ],
+      "setup": "使订阅 URL 不可达或注入 parse_subscription.py 执行失败条件",
+      "teardown": "恢复订阅 URL"
+    },
+    {
+      "test_point_id": "T-050",
+      "steps": [
+        "同时发送 5 个并发 HTTP 请求到 proxy-global.js，目标均为返回 429 的 mock 服务器",
+        "每个请求各自经历 retry 序列",
+        "检查请求 A 的第 2 次 attempt 是否独立于请求 B 的第 2 次 attempt",
+        "检查各个请求的 _headersOnError 和 bodyChunks 是否独立"
+      ],
+      "expected_results": [
+        "每个并发请求有独立的 attempt 计数器",
+        "请求 A 重试 3 次时不影响请求 B 的重试计数",
+        "各自的 response headers 和 body chunks 隔离",
+        "所有请求最终都返回 502（重试耗尽）"
+      ],
+      "setup": "配置 mock 服务器持续返回 429",
+      "teardown": "恢复 mock 服务器"
+    },
+    {
+      "test_point_id": "T-051",
+      "steps": [
+        "daemon 主循环和 proxy-global.js 同时向 sing-box Clash API 发送 PUT /proxies/proxy 请求",
+        "模拟两种场景：daemon 切换 + proxy-js 切换时间点接近",
+        "检查 Clash API 的 PUT 响应状态码"
+      ],
+      "expected_results": [
+        "并发 PUT 请求到 Clash API 不返回 4xx/5xx",
+        "最后一个 PUT 请求覆盖了前一个的节点选择（幂等操作）",
+        "Clash API 不会因为并发修改而处于不一致状态",
+        "没有冲突导致的错误响应"
+      ],
+      "setup": "准备两个可以同时发起 PUT 请求的测试脚本",
+      "teardown": "恢复 sing-box 节点选择"
+    },
+    {
+      "test_point_id": "T-052",
+      "steps": [
+        "检查 init_node_info_db 是否使用 RLock(threading.RLock) 而非 Lock",
+        "模拟 _get_db 内部嵌套调用 _get_db 的场景",
+        "验证不会发生死锁"
+      ],
+      "expected_results": [
+        "init_node_info_db 使用 RLock（可重入锁）",
+        "嵌套调用 _get_db 时 RLock 允许同一线程重入",
+        "不产生死锁",
+        "100 次嵌套调用测试通过"
+      ],
+      "setup": "直接检查代码中的锁类型；编写嵌套调用测试",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-053",
+      "steps": [
+        "启动 daemon，确认 _health_pool 和 _io_pool 运行中",
+        "发送 SIGTERM 信号到 daemon 进程",
+        "检查 _cleanup_atexit 是否被调用",
+        "检查线程池是否正确 shutdown(wait=True)",
+        "检查 SQLite 连接是否关闭"
+      ],
+      "expected_results": [
+        "SIGTERM 触发 _cleanup_atexit",
+        "_health_pool.shutdown(wait=True) 和 _io_pool.shutdown(wait=True) 被调用",
+        "等待线程完成任务后退出（wait=True）",
+        "SQLite 连接正常关闭",
+        "进程在 5s 内退出"
+      ],
+      "setup": "启动 daemon 进程；配置信号处理",
+      "teardown": "确认 daemon 已停止"
+    },
+    {
+      "test_point_id": "T-054",
+      "steps": [
+        "构造 error_rate=0.35 (35%)，total=5 的场景",
+        "当前 _strategy_mode='normal'",
+        "执行策略模式判断逻辑",
+        "检查 _strategy_mode 是否切换为 'pressure'"
+      ],
+      "expected_results": [
+        "error_rate(0.35) >= pressure_error_rate(0.3) 且 total(5) >= 3",
+        "_strategy_mode 从 'normal' 切换为 'pressure'",
+        "P2C 选择逻辑切换为 pressure 模式（按 (-calls, ds) 排序）"
+      ],
+      "setup": "设置 _strategy_mode='normal'；注入错误率数据",
+      "teardown": "恢复 _strategy_mode='normal'"
+    },
+    {
+      "test_point_id": "T-055",
+      "steps": [
+        "设置 _strategy_mode='pressure'",
+        "构造 error_rate=0.05 (5%)，total=5 的场景",
+        "执行策略模式判断逻辑",
+        "检查 _strategy_mode 是否切回 'normal'",
+        "构造 error_rate=0.15 (15%) 在回滞区间 (10%, 30%) 内",
+        "检查模式是否保持 'pressure'（不回切到 normal）"
+      ],
+      "expected_results": [
+        "error_rate(0.05) <= normal_error_rate(0.1) 或 total(5) >= 3",
+        "_strategy_mode 从 'pressure' 切回 'normal'",
+        "error_rate=0.15 在回滞区间 (10%, 30%) 内时保持 'pressure'",
+        "不会在 pressure/normal 之间频繁抖动"
+      ],
+      "setup": "设置 _strategy_mode='pressure'；注入错误率数据",
+      "teardown": "恢复 _strategy_mode='normal'"
+    },
+    {
+      "test_point_id": "T-056",
+      "steps": [
+        "当 _strategy_mode='pressure' 时，检查 _NODE_CALL_COUNTS 清理逻辑",
+        "验证 pressure 模式下跳过清理",
+        "当 _strategy_mode='normal' 时，验证每 20min 清空调用计数"
+      ],
+      "expected_results": [
+        "pressure 模式下 _NODE_CALL_COUNTS 不清零",
+        "normal 模式下每 20min _NODE_CALL_COUNTS 被清空",
+        "pressure 模式保持调用历史以支持分散选择"
+      ],
+      "setup": "设置 _strategy_mode 值；添加 _NODE_CALL_COUNTS 数据",
+      "teardown": "恢复 _strategy_mode 和 _NODE_CALL_COUNTS"
+    },
+    {
+      "test_point_id": "T-057",
+      "steps": [
+        "确认 sing-box 运行正常且 daemon watchdog 在监控",
+        "使用 pkill -9 sing-box 或 kill -9 <sing-box-pid> 模拟崩溃",
+        "等待 daemon 的 is_singbox_alive 检测到 Clash API 不通（最多 4s 超时）",
+        "检查 daemon 是否调用 restart_singbox",
+        "检查 sing-box 是否被重启并恢复正常"
+      ],
+      "expected_results": [
+        "is_singbox_alive 检测到 Clash API 不通后返回 False",
+        "watchdog 逻辑触发（可配置的失败次数检测后）",
+        "restart_singbox 被调用",
+        "新 sing-box 进程启动成功",
+        "Clash API 恢复可用",
+        "7890 端口恢复监听"
+      ],
+      "setup": "确认 sing-box 运行中；记录当前 PID",
+      "teardown": "确认 sing-box 运行正常"
+    },
+    {
+      "test_point_id": "T-058",
+      "steps": [
+        "模拟 56 个 anytls 节点全部不可达（如设置 iptables DROP 到 anytls 节点的流量）",
+        "运行 daemon 主循环",
+        "检查 pick_next_node 是否反复返回 None",
+        "检查 check_and_handle_fallback 是否被触发",
+        "检查 outboundProxyUrl 是否切换到 okz:6696"
+      ],
+      "expected_results": [
+        "所有 anytls 节点测试超时/失败",
+        "pick_next_node 返回 None（无可用候选）",
+        "check_and_handle_fallback 触发降级到 okz:6696",
+        "outboundProxyUrl 指向 okz:6696",
+        "日志记录'all nodes dead fallback'"
+      ],
+      "setup": "使用 iptables/nftables 阻断到 anytls 节点的流量；或配置所有节点返回超时",
+      "teardown": "清除 iptables 规则；恢复节点可达"
+    },
+    {
+      "test_point_id": "T-059",
+      "steps": [
+        "模拟 9router data.sqlite 被锁定（如启动一个长期 SQLite 事务）",
+        "或模拟 data.sqlite 文件不存在",
+        "调用 get_9router_error_rate",
+        "验证返回值",
+        "模拟文件不可读（权限错误）"
+      ],
+      "expected_results": [
+        "SQLite 锁定时 get_9router_error_rate 返回 (0, 0, [], 0)",
+        "SQLite 文件不存在时返回 (0, 0, [], 0)",
+        "权限错误时返回 (0, 0, [], 0)",
+        "不抛出未捕获异常",
+        "主循环继续运行"
+      ],
+      "setup": "准备锁定/移除/改变 data.sqlite 的权限",
+      "teardown": "恢复 data.sqlite 正常状态"
+    },
+    {
+      "test_point_id": "T-060",
+      "steps": [
+        "使 bad_nodes.json 的写入路径不可写（如 chmod 444 目录）",
+        "调用 cleanup_dead_ttl 或 _ban_node",
+        "验证异常被 except 捕获",
+        "检查主循环是否继续运行"
+      ],
+      "expected_results": [
+        "文件写入异常被 except 捕获（不抛到上层）",
+        "主循环继续运行不受影响",
+        "日志记录文件写入失败"
+      ],
+      "setup": "修改 bad_nodes.json 所在目录权限为只读",
+      "teardown": "恢复目录权限"
+    },
+    {
+      "test_point_id": "T-061",
+      "steps": [
+        "将 .bad_nodes.json 内容写为 '{invalid json'",
+        "调用 loadBadNodes()",
+        "验证 try-catch 捕获 JSON.parse 异常",
+        "验证返回空对象",
+        "调用 _load_shared_bad_nodes",
+        "验证同样不抛异常"
+      ],
+      "expected_results": [
+        "loadBadNodes 返回 {} 或等效空对象",
+        "_load_shared_bad_nodes 不抛出异常",
+        "日志记录 JSON 解析失败",
+        "不导致 proxy-global.js 或 daemon 崩溃"
+      ],
+      "setup": "写入非法 JSON 到 .bad_nodes.json",
+      "teardown": "恢复合法的 .bad_nodes.json"
+    },
+    {
+      "test_point_id": "T-062",
+      "steps": [
+        "配置所有节点的延迟测试目标不可达（全部超时）",
+        "调用 batch_test_nodes",
+        "检查是否所有节点被标记为 dead",
+        "检查是否触发 check_and_handle_fallback",
+        "验证降级到 okz:6696"
+      ],
+      "expected_results": [
+        "所有节点测试超时",
+        "所有节点被加入 _DEAD_NODES",
+        "alive 节点数为 0",
+        "check_and_handle_fallback 触发降级",
+        "outboundProxyUrl 切换到 okz:6696"
+      ],
+      "setup": "阻断所有节点可达性（iptables/网络隔离）",
+      "teardown": "恢复节点可达性；清理 _DEAD_NODES"
+    },
+    {
+      "test_point_id": "T-063",
+      "steps": [
+        "设置 SQLite journal_mode=WAL",
+        "触发 _last_wal_checkpoint 逻辑",
+        "执行 PRAGMA wal_checkpoint(PASSIVE)",
+        "模拟 checkpoint 失败",
+        "检查异常处理"
+      ],
+      "expected_results": [
+        "PRAGMA wal_checkpoint(PASSIVE) 正常执行",
+        "失败时记录日志不中断主循环",
+        "每 5min 执行一次 checkpoint"
+      ],
+      "setup": "准备 WAL 模式的 SQLite",
+      "teardown": "恢复 journal_mode"
+    },
+    {
+      "test_point_id": "T-064",
+      "steps": [
+        "检查 makeRetryableFetch 是否正确包裹 globalThis.fetch",
+        "验证 __pg_fetch_patched 标记防止重复包装",
+        "对每个 retry 条件（SSE 空流、error chunk、空 200 body、429、5xx）分别触发",
+        "验证每个条件都触发节点切换+重试"
+      ],
+      "expected_results": [
+        "makeRetryableFetch 替换 globalThis.fetch",
+        "__pg_fetch_patched 标记已设置",
+        "重复调用不重复包装",
+        "所有 5 种错误条件均触发 triggerNodeSwitch + retry"
+      ],
+      "setup": "确保 proxy-global.js 已 patched fetch",
+      "teardown": "恢复原始 globalThis.fetch"
+    },
+    {
+      "test_point_id": "T-065",
+      "steps": [
+        "配置 SSE 流在 3s 后才发送第一个数据",
+        "调用 _peekSseStream",
+        "检查 AbortSignal.timeout(2000) 是否设置",
+        "检查 2s 超时后 hasData 是否为 false"
+      ],
+      "expected_results": [
+        "_peekSseStream 使用 AbortSignal.timeout(2000)",
+        "2s 内无数据触发超时",
+        "hasData=false",
+        "触发 retry 逻辑"
+      ],
+      "setup": "配置延迟发送的 SSE mock 服务器",
+      "teardown": "恢复 SSE mock 服务器"
+    },
+    {
+      "test_point_id": "T-066",
+      "steps": [
+        "创建一个含 dispatcher 的 init 对象",
+        "通过 makeRetryableFetch 发送请求",
+        "返回 429 响应",
+        "检查 fetch retry 是否绕过 getReader 直接检查 response.status",
+        "验证 _shouldRetryFetch 基于 status 触发重试"
+      ],
+      "expected_results": [
+        "init 中含 dispatcher 时跳过 getReader 路径",
+        "直接使用 response.status 检查",
+        "429 触发 _shouldRetryFetch 重试",
+        "5xx 同样触发重试"
+      ],
+      "setup": "准备含 dispatcher 的 init 对象；mock 返回 429",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-067",
+      "steps": [
+        "构造 total=1, error=1 的场景（1 条记录，1 条失败）",
+        "计算 error_rate=1.0 (100%)",
+        "检查 should_error 判断逻辑",
+        "验证虽然错误率 100% > 10%，但 total(1) < 2 不应触发切换"
+      ],
+      "expected_results": [
+        "total < 2 不应触发 should_error",
+        "不触发轮换",
+        "日志记录样本不足"
+      ],
+      "setup": "注入单条错误记录",
+      "teardown": "清理测试数据"
+    },
+    {
+      "test_point_id": "T-068",
+      "steps": [
+        "构造所有节点延迟均为 0 的场景",
+        "调用 _precompute_delay_stats",
+        "验证 median=min=max=0",
+        "调用 _delay_score",
+        "验证 median==0 时返回 1.0",
+        "验证不触发除零错误 (ZeroDivisionError)"
+      ],
+      "expected_results": [
+        "_precompute_delay_stats 正确返回 median=0, min=0, max=0",
+        "_delay_score 因 median==0 guard 返回 1.0",
+        "任何节点都不会因延迟被惩罚",
+        "不抛出 ZeroDivisionError"
+      ],
+      "setup": "构造全零延迟数据集",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-069",
+      "steps": [
+        "准备 error.type = 'invalid_request_error' 的 body",
+        "调用 _shouldRetryFetch(200, body)",
+        "准备 error.type = 'authentication_error' 的 body",
+        "调用 _shouldRetryFetch(200, body)",
+        "确认正则表达式不匹配这些非瞬态错误"
+      ],
+      "expected_results": [
+        "_shouldRetryFetch(200, body_with_invalid_request_error) 返回 false",
+        "_shouldRetryFetch(200, body_with_authentication_error) 返回 false",
+        "error regex 模式排除非瞬态错误",
+        "不触发无限重试"
+      ],
+      "setup": "准备含非瞬态 error.type 的 mock body",
+      "teardown": "无"
+    },
+    {
+      "test_point_id": "T-070",
+      "steps": [
+        "创建空的 .singbox_secret 文件",
+        "调用 _readSingboxSecret",
+        "验证 _singboxSecret=''",
+        "调用 triggerNodeSwitch",
+        "验证 !secret 检查返回 false"
+      ],
+      "expected_results": [
+        "_readSingboxSecret 处理空文件后 _singboxSecret 为 ''",
+        "triggerNodeSwitch 检测 !secret 为 true",
+        "triggerNodeSwitch 返回 false（不走切换）",
+        "日志记录 secret 为空"
+      ],
+      "setup": "清空 .singbox_secret 文件",
+      "teardown": "恢复 .singbox_secret 内容"
+    },
+    {
+      "test_point_id": "T-071",
+      "steps": [
+        "确保 Clash API 可用且返回正确的节点数",
+        "调用 _initNodeCount",
+        "检查返回的节点数是否等于 Clash API 返回的真实节点数",
+        "模拟 Clash API 不可用（停止 sing-box）",
+        "再次调用 _initNodeCount",
+        "检查是否回退到 fallback 值 56"
+      ],
+      "expected_results": [
+        "Clash API 可用时返回真实节点数（非 fallback）",
+        "Clash API 不可用时保留/使用 fallback 值（如 56）",
+        "不抛出异常"
+      ],
+      "setup": "确认 Clash API 可用",
+      "teardown": "恢复 sing-box"
+    },
+    {
+      "test_point_id": "T-072",
+      "steps": [
+        "初始化 _readSingboxSecret 读取 .singbox_secret 并记录 mtime",
+        "修改 .singbox_secret 文件内容并更新 mtime（touch）",
+        "再次调用 _readSingboxSecret",
+        "检查 _singboxSecret 是否更新为新内容",
+        "不修改文件时再次调用，验证使用缓存（mtime 未变）"
+      ],
+      "expected_results": [
+        "文件 mtime 变化时 _readSingboxSecret 重新读取",
+        "_singboxSecret 更新为新的文件内容",
+        "mtime 未变时使用缓存（不读文件）",
+        "进程生命周期内 secret 自动保持最新"
+      ],
+      "setup": "准备 .singbox_secret 测试文件",
+      "teardown": "恢复原始 .singbox_secret"
+    }
+  ],
+  "test_category_summary": {
+    "proxy_chain": {"total": 7, "p0_count": 3, "p0_ids": ["T-001", "T-002", "T-003"], "p1_count": 2, "p2_count": 2},
+    "error_detection": {"total": 6, "p0_count": 3, "p0_ids": ["T-007", "T-008", "T-009"], "p1_count": 3, "p2_count": 0},
+    "node_rotation": {"total": 5, "p0_count": 1, "p0_ids": ["T-013"], "p1_count": 3, "p2_count": 1},
+    "retry_mechanism": {"total": 9, "p0_count": 4, "p0_ids": ["T-018", "T-019", "T-020", "T-021"], "p1_count": 5, "p2_count": 0},
+    "shared_state": {"total": 5, "p0_count": 2, "p0_ids": ["T-027", "T-028"], "p1_count": 1, "p2_count": 2},
+    "node_health": {"total": 6, "p0_count": 2, "p0_ids": ["T-032", "T-033"], "p1_count": 3, "p2_count": 1},
+    "singbox_watchdog": {"total": 5, "p0_count": 2, "p0_ids": ["T-038", "T-039"], "p1_count": 2, "p2_count": 1},
+    "bypass": {"total": 3, "p0_count": 2, "p0_ids": ["T-043", "T-044"], "p1_count": 1, "p2_count": 0},
+    "fallback": {"total": 4, "p0_count": 2, "p0_ids": ["T-046", "T-047"], "p1_count": 2, "p2_count": 0},
+    "concurrency": {"total": 4, "p0_count": 0, "p1_count": 4, "p2_count": 0},
+    "strategy": {"total": 3, "p0_count": 0, "p1_count": 3, "p2_count": 0},
+    "anomaly": {"total": 7, "p0_count": 3, "p0_ids": ["T-057", "T-058", "T-059"], "p1_count": 3, "p2_count": 1},
+    "fetch_retry": {"total": 3, "p0_count": 0, "p1_count": 2, "p2_count": 1},
+    "edge_case": {"total": 6, "p0_count": 0, "p1_count": 0, "p2_count": 6}
+  },
+  "failure_injection_scenarios": [
+    {
+      "id": "FI-001",
+      "name": "nodes_all_unreachable",
+      "description": "使用 iptables DROP 规则阻断到所有 anytls 节点 ip:port 的流量",
+      "verification_targets": ["T-058", "T-062", "T-046"],
+      "recovery": "iptables -F, iptables -X"
+    },
+    {
+      "id": "FI-002",
+      "name": "singbox_process_kill",
+      "description": "kill -9 <sing-box-pid> 模拟进程崩溃",
+      "verification_targets": ["T-057", "T-039", "T-040"],
+      "recovery": "确认 daemon 自动重启 sing-box"
+    },
+    {
+      "id": "FI-003",
+      "name": "http_429_lod",
+      "description": "mock http server 持续返回 429 Too Many Requests",
+      "verification_targets": ["T-018", "T-024", "T-025", "T-050"],
+      "recovery": "切回 mock server 正常响应"
+    },
+    {
+      "id": "FI-004",
+      "name": "http_empty_200",
+      "description": "mock http server 返回 200 OK 但 body 为空 (Content-Length: 0)",
+      "verification_targets": ["T-019"],
+      "recovery": "切回 mock server 正常响应"
+    },
+    {
+      "id": "FI-005",
+      "name": "sse_delay_3s",
+      "description": "mock sse server 建立连接后延迟 3s 开始发送数据",
+      "verification_targets": ["T-020", "T-065"],
+      "recovery": "恢复 sse server 立即发送"
+    },
+    {
+      "id": "FI-006",
+      "name": "sse_error_chunk",
+      "description": "mock sse server 在 chunk 中发送含 error 字段的数据",
+      "verification_targets": ["T-021"],
+      "recovery": "恢复 sse server 正常数据"
+    },
+    {
+      "id": "FI-007",
+      "name": "network_partition",
+      "description": "iptables 阻断 proxy-global.js 到 sing-box:7890 的 TCP 连接",
+      "verification_targets": ["T-022", "T-043", "T-044"],
+      "recovery": "iptables -F"
+    },
+    {
+      "id": "FI-008",
+      "name": "concurrent_429_flood",
+      "description": "同时 20 个并发请求到 proxy-global.js，目标均为 429",
+      "verification_targets": ["T-025", "T-026", "T-050"],
+      "recovery": "停止并发客户端"
+    },
+    {
+      "id": "FI-009",
+      "name": "badnodes_write_failure",
+      "description": "chmod 444 .bad_nodes.json 所在目录，使写入失败",
+      "verification_targets": ["T-060", "T-061"],
+      "recovery": "chmod 755 目录"
+    },
+    {
+      "id": "FI-010",
+      "name": "sqlite_locked",
+      "description": "启动 sqlite3 data.sqlite 'BEGIN EXCLUSIVE;' 并保持事务打开",
+      "verification_targets": ["T-059"],
+      "recovery": "ROLLBACK; 释放锁"
+    },
+    {
+      "id": "FI-011",
+      "name": "clash_api_concurrent_put",
+      "description": "同时从 daemon 和 proxy-global 发送 PUT /proxies/proxy 到 Clash API",
+      "verification_targets": ["T-051"],
+      "recovery": "无（自动恢复）"
+    },
+    {
+      "id": "FI-012",
+      "name": "subscription_url_down",
+      "description": "使 parse_subscription.py 的订阅 URL DNS 解析失败或返回 HTTP 500",
+      "verification_targets": ["T-049"],
+      "recovery": "恢复订阅 URL"
+    }
+  ],
+  "notes": {
+    "environment_requirements": "所有 E2E 测试需要 sing-box、9router、daemon、proxy-global.js 全部正常运行；单元测试可独立 mock",
+    "mock_server_ports": "使用端口 18443 (HTTPS), 18888 (HTTP), 19999 (SSE) 避免与生产服务冲突",
+    "safety": "测试 daemon 前备份 data.sqlite；测试 proxy-global.js 前备份 current outboundProxyUrl",
+    "timing_sensitive": "T-013（60s 轮换）、T-020（2s SSE 超时）、T-039（重启序列）对时间敏感，需考虑 CI 环境的时间差异"
+  }
+}

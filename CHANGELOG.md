@@ -1,3 +1,8 @@
+# Unreleased
+
+## Fixes
+- **Proxy**: add opt-in `?dns=local` for SOCKS5 gateways with domain-target routing issues; preserve remote DNS by default, original TLS/Host identity and proxy rotation. Share the DNS-mode-aware dispatcher with dashboard proxy tests. Local DNS uses the system resolver; see `docs/socks-dns.md` for privacy implications (#4983).
+
 # v0.5.104 (2026-10-15)
 
 ## Features

@@ -97,6 +97,8 @@ Claude Code/Codex/OpenClaw/Cursor/Cline Settings:
 
 **That's it!** Start coding with FREE AI models.
 
+Using a SOCKS5 proxy? See [optional local/remote DNS resolution](./docs/socks-dns.md) for gateways that route domain targets differently from numeric targets. Remote DNS remains the default.
+
 **Alternative: run from source (this repository):**
 
 This repository package is private (`9router-app`), so source/Docker execution is the expected local development path.

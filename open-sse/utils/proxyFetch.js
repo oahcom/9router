@@ -1,6 +1,7 @@
 import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
+import { createProxyDispatcher } from "./proxyDispatcher.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -240,10 +241,10 @@ async function getDispatcher(proxyUrl, insecure = false) {
     if (proxyDispatchers.size >= MEMORY_CONFIG.proxyDispatchersMaxSize) {
       proxyDispatchers.delete(proxyDispatchers.keys().next().value);
     }
-    const { Agent, ProxyAgent } = await import("undici");
+    const { Agent } = await import("undici");
     const connect = insecure ? { rejectUnauthorized: false } : undefined;
     const dispatcher = normalized
-      ? new ProxyAgent({ uri: normalized, ...(insecure ? { requestTls: connect } : {}) })
+      ? await createProxyDispatcher({ uri: normalized, ...(insecure ? { requestTls: connect } : {}) })
       : new Agent({ connect });
     proxyDispatchers.set(key, dispatcher);
   }
@@ -358,6 +359,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       try {
         return await fetchWithTlsFallback(url, options, proxyUrl);
       } catch (proxyError) {
+        if (proxyError?.code === "ERR_PROXY_DNS_MODE") throw proxyError;
         if (proxyOptions?.strictProxy === true) {
           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
         }
@@ -378,6 +380,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     try {
       return await fetchWithTlsFallback(url, options, proxyUrl);
     } catch (proxyError) {
+      if (proxyError?.code === "ERR_PROXY_DNS_MODE") throw proxyError;
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);

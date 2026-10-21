@@ -259,7 +259,11 @@ export function openaiToClaudeResponse(chunk, state) {
   }
 
   // Finish
-  if (choice.finish_reason) {
+  // 幂等：上游会连发 finish_reason（如 tool_calls 后再 stop），第二次再走一遍就把
+  // 整段 buffered args 重发一次 → 客户端收 '{"a":1}{"a":1}' → InputValidationError。
+  // 这是残余解析失败的真实根因（前两修只处理分片重复与跨调用撞桶）。
+  if (choice.finish_reason && !state.finished) {
+    state.finished = true;
     stopThinkingBlock(state, results);
     stopTextBlock(state, results);
 

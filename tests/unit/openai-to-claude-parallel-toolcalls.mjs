@@ -71,4 +71,15 @@ const deltas = (ev) => ev.filter((e) => e.type === "content_block_delta" && e.de
   assert.deepEqual(JSON.parse(deltas(ev)[0].delta.partial_json), { command: "ls" });
 }
 
+// 6) 上游连发两个 finish_reason：buffered args 只能发一次
+{
+  const s = createState();
+  const a6 = openaiToClaudeResponse({ id: "c6", model: "m", choices: [{ delta: { tool_calls: [{ index: 0, id: "toolu_h", function: { name: "Bash", arguments: '{"command":"ls"}' } }] } }] }, s);
+  const f1 = openaiToClaudeResponse({ id: "c6", model: "m", choices: [{ delta: {}, finish_reason: "tool_calls" }] }, s);
+  const f2 = openaiToClaudeResponse({ id: "c6", model: "m", choices: [{ delta: {}, finish_reason: "stop" }] }, s);
+  const all = [...(a6 ?? []), ...(f1 ?? []), ...(f2 ?? [])];
+  assert.equal(deltas(all).length, 1, "两个 finish_reason 只允许发一次 args");
+  assert.deepEqual(JSON.parse(deltas(all)[0].delta.partial_json), { command: "ls" });
+}
+
 console.log("ok — parallel tool calls bucketed per id");

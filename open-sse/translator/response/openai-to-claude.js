@@ -183,14 +183,21 @@ export function openaiToClaudeResponse(chunk, state) {
   if (delta?.tool_calls) {
     for (const tc of delta.tool_calls) {
       const idx = tc.index ?? 0;
+      // 上游会省略或重复 index（两个并行调用都落 0）：只按 index 分桶时，第二个调用的
+      // arguments 被追加进第一块 → 客户端收到 '{"a":1}{"b":2}'，整条 tool call 作废
+      // （实测 coordinator 32 次/日 InputValidationError）。同 index 撞到新 id 时改用
+      // id 作桶键；同一调用的后续分片 id 不变，仍落回原桶，不会多开块。
+      const key = tc.id && state.toolCalls.get(idx)?.id !== tc.id && state.toolCalls.has(idx)
+        ? `id:${tc.id}`
+        : idx;
 
-      // GLM/fireworks repeats id+null-name on every arg chunk; open block once per idx
-      if (tc.id && !state.toolCalls.has(idx)) {
+      // GLM/fireworks repeats id+null-name on every arg chunk; open block once per key
+      if (tc.id && !state.toolCalls.has(key)) {
         stopThinkingBlock(state, results);
         stopTextBlock(state, results);
 
         const toolBlockIndex = state.nextBlockIndex++;
-        state.toolCalls.set(idx, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
+        state.toolCalls.set(key, { id: tc.id, name: tc.function?.name || "", blockIndex: toolBlockIndex });
 
         // Strip prefix from tool name for response
         let toolName = tc.function?.name || "";
@@ -211,11 +218,11 @@ export function openaiToClaudeResponse(chunk, state) {
       }
 
       if (tc.function?.arguments) {
-        const toolInfo = state.toolCalls.get(idx);
+        const toolInfo = state.toolCalls.get(key);
         if (toolInfo) {
           // Buffer args instead of streaming — sanitize at finish to fix bad params
           if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+          state.toolArgBuffers.set(key, (state.toolArgBuffers.get(key) || "") + tc.function.arguments);
         }
       }
     }

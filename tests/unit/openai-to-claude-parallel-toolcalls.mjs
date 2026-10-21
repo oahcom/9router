@@ -50,4 +50,15 @@ const deltas = (ev) => ev.filter((e) => e.type === "content_block_delta" && e.de
   assert.deepEqual(JSON.parse(deltas(ev)[0].delta.partial_json), { command: "ls" });
 }
 
+// 4) 上游把同一调用的完整参数重复下发：不得拼成两个对象
+{
+  const s = createState();
+  const args = '{"command":"ls"}';
+  const a4 = openaiToClaudeResponse({ id: "c4", model: "m", choices: [{ delta: { tool_calls: [{ index: 0, id: "toolu_f", function: { name: "Bash", arguments: args } }] } }] }, s);
+  const b4 = openaiToClaudeResponse({ id: "c4", model: "m", choices: [{ delta: { tool_calls: [{ index: 0, id: "toolu_f", function: { arguments: args } }] } }] }, s);
+  const ev = [...(a4 ?? []), ...(b4 ?? []), ...openaiToClaudeResponse({ id: "c4", model: "m", choices: [{ delta: {}, finish_reason: "tool_calls" }] }, s)];
+  assert.equal(starts(ev).length, 1, "重复下发不得多开块");
+  assert.deepEqual(JSON.parse(deltas(ev)[0].delta.partial_json), { command: "ls" }, "重复下发不得拼成两个对象");
+}
+
 console.log("ok — parallel tool calls bucketed per id");

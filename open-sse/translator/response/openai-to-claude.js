@@ -222,7 +222,13 @@ export function openaiToClaudeResponse(chunk, state) {
         if (toolInfo) {
           // Buffer args instead of streaming — sanitize at finish to fix bad params
           if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(key, (state.toolArgBuffers.get(key) || "") + tc.function.arguments);
+          const prev = state.toolArgBuffers.get(key) || "";
+          // 上游会把同一调用的完整参数重复下发一次（实测 16 例残例中 14 例逐字相同）。
+          // 直接拼接得到 '{"a":1}{"a":1}' → 客户端 InputValidationError，整条调用作废。
+          // 只有与已累积内容逐字相同才丢弃；正常分片不可能等于整个 buffer。
+          if (tc.function.arguments !== prev) {
+            state.toolArgBuffers.set(key, prev + tc.function.arguments);
+          }
         }
       }
     }

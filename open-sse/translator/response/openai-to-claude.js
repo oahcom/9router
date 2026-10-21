@@ -10,8 +10,32 @@ import { extractReasoningText } from "../concerns/reasoning.js";
 // is then a no-op. Kept intentionally; do NOT couple to request's empty prefix.
 const CLAUDE_OAUTH_TOOL_PREFIX = "proxy_";
 
+/** 返回第一个括号配平的 JSON 对象结束位置（跳过字符串内的括号），找不到返回 -1。 */
+function firstJsonEnd(s) {
+  let depth = 0, inStr = false, esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") { if (--depth === 0) return i + 1; }
+  }
+  return -1;
+}
+
 // Sanitize tool call arguments to fix bad params from non-Anthropic models
 function sanitizeToolArgs(toolName, argsJson) {
+  // 上游偶发把同一份参数在**一个分片里**发两遍（'{"a":1}{"a":1}'）：JSON.parse 报
+  // Extra data，整条调用作废。逐字相同的两段只可能是重复，取第一段。
+  const end = firstJsonEnd(argsJson);
+  if (end > 0 && argsJson.slice(0, end) === argsJson.slice(end).trim()) {
+    argsJson = argsJson.slice(0, end);
+  }
   try {
     const args = JSON.parse(argsJson);
     const name = toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)

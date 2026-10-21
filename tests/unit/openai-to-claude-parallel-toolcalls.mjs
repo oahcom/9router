@@ -61,4 +61,14 @@ const deltas = (ev) => ev.filter((e) => e.type === "content_block_delta" && e.de
   assert.deepEqual(JSON.parse(deltas(ev)[0].delta.partial_json), { command: "ls" }, "重复下发不得拼成两个对象");
 }
 
+// 5) 同一份参数在**一个分片里**发两遍：只能输出一个对象
+{
+  const s = createState();
+  const one = '{"command":"ls"}';
+  const a5 = openaiToClaudeResponse({ id: "c5", model: "m", choices: [{ delta: { tool_calls: [{ index: 0, id: "toolu_g", function: { name: "Bash", arguments: one + one } }] } }] }, s);
+  const ev = [...(a5 ?? []), ...openaiToClaudeResponse({ id: "c5", model: "m", choices: [{ delta: {}, finish_reason: "tool_calls" }] }, s)];
+  assert.equal(starts(ev).length, 1);
+  assert.deepEqual(JSON.parse(deltas(ev)[0].delta.partial_json), { command: "ls" });
+}
+
 console.log("ok — parallel tool calls bucketed per id");

@@ -3,6 +3,7 @@ import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { getModelTargetFormat } from "../config/providerModels.js";
 import { FORMATS } from "../translator/formats.js";
+import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -147,11 +148,19 @@ export class OpenCodeGoExecutor extends DefaultExecutor {
     const prepared = credentials?.[SESSION_FIELD];
     if (prepared) {
       headers[SESSION_HEADER] = prepared;
+      applyOpencodeTransportHeaders(headers, {
+        rawHeaders: credentials?.rawHeaders,
+        identity: prepared,
+      });
       return headers;
     }
 
     const fallback = this.prepareRequestCredentials({ credentials });
     headers[SESSION_HEADER] = fallback[SESSION_FIELD];
+    applyOpencodeTransportHeaders(headers, {
+      rawHeaders: credentials?.rawHeaders,
+      identity: fallback[SESSION_FIELD],
+    });
     return headers;
   }
 

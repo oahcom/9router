@@ -7,6 +7,7 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
+import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
@@ -422,6 +423,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       "Accept": stream ? "text/event-stream" : "*/*",
     };
     if (url.endsWith("/messages")) headers["anthropic-version"] = ANTHROPIC_API_VERSION;
+    // Stable per-conversation project attribution + W3C trace context.
+    applyOpencodeTransportHeaders(headers, { rawHeaders: raw, identity: session });
     return headers;
   }
 }

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel, isOpencodeFreeTierModel } from "../providers/models/helpers.js";
+import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -282,6 +283,10 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
       const fallback = this.prepareRequestCredentials({ credentials });
       headers[SESSION_HEADER] = fallback[SESSION_FIELD];
     }
+    applyOpencodeTransportHeaders(headers, {
+      rawHeaders: raw,
+      identity: headers[SESSION_HEADER],
+    });
     if (isOpencodeFreeTierModel(model)) {
       // Free-tier models are gated behind the attested free-tier identity even
       // on the keyed lane: a real oc_sk_* key answers 403 FreeTierError, while

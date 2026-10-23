@@ -101,3 +101,19 @@ graphify-out/*
 .start-dev.ps1
 start-dev-silent.cjs
 debug.log
+=======
+# 运行时文件
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+runtime/
+proxy-global.disabled
+
+# Node
+node_modules/
+
+# 系统
+.DS_Store
+*.swp
+*~

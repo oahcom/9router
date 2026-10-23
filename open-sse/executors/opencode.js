@@ -406,7 +406,10 @@ export class OpenCodeExecutor extends BaseExecutor {
     const downstreamUa = lower["user-agent"] || "";
     const isOpencodeDownstream = hasValidOpencodeVersion(downstreamUa);
 
-    const session = credentials?.[SESSION_FIELD] || this.prepareRequestCredentials({ credentials })[SESSION_FIELD];
+    // Force fresh session per request to bypass upstream session-based quota tracking.
+    // NOTE: opencode.js:109-114 documents that minting fresh sessions burns quota
+    // and triggers 429/403. This change overrides that behavior per user request.
+    const session = generateSessionId();
 
     // Mirrors the v2 CLI. Upstream needs x-opencode-session-id next to
     // x-opencode-session, and rejects any x-opencode-request (v1 only) with 403.
@@ -423,7 +426,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       "Accept": stream ? "text/event-stream" : "*/*",
     };
     if (url.endsWith("/messages")) headers["anthropic-version"] = ANTHROPIC_API_VERSION;
-    // Stable per-conversation project attribution + W3C trace context.
+    // Project/trace headers still use the generated session as identity.
     applyOpencodeTransportHeaders(headers, { rawHeaders: raw, identity: session });
     return headers;
   }

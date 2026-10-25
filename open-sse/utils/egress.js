@@ -228,6 +228,15 @@ function sanitizeIp(value) {
 export function markEgressCooling(egress, retryAfterMs) {
   if (!egress?.id || egress.confirmed !== true) return null;
 
+  // Retrying on a collided proxy egress must not happen here: the fixed proxy
+  // URL is an opaque downstream for an external rotation manager (sing-box),
+  // whose upstream IP rotates underneath without changing the proxyUrl — the
+  // egress-or-id key does not follow that IP. Cooling the same 7890 URL for
+  // hours after a 429 deadlocks the lane even though the real exit IP is
+  // brand-new. The rotation manager owns per-IP Retry-After compliance; cool
+  // only egresses whose exit IP 9router itself controls (direct / relay).
+  if (egress.kind === "proxy") return null;
+
   const requested = Number(retryAfterMs);
   const hasHint = retryAfterMs !== null && retryAfterMs !== undefined && Number.isFinite(requested) && requested >= 0;
   const ms = Math.min(

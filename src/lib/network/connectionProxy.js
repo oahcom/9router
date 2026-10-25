@@ -55,6 +55,31 @@ function normalizeLegacyProxy(providerSpecificData = {}) {
   };
 }
 
+export function proxyConfigFromPool(proxyPool) {
+  if (!proxyPool || proxyPool.isActive !== true) return null;
+
+  const proxyUrl = normalizeString(proxyPool.proxyUrl);
+  if (!proxyUrl) return null;
+
+  const noProxy = normalizeString(proxyPool.noProxy);
+  const isRelay = ["vercel", "cloudflare", "deno", "netlify"].includes(proxyPool.type);
+
+  return {
+    source: isRelay ? proxyPool.type : "pool",
+
+    proxyPoolId: proxyPool.id || null,
+    proxyPool,
+
+    connectionProxyEnabled: !isRelay,
+    connectionProxyUrl: isRelay ? "" : proxyUrl,
+    connectionNoProxy: noProxy,
+
+    strictProxy: proxyPool.strictProxy === true,
+
+    vercelRelayUrl: isRelay ? proxyUrl : "",
+  };
+}
+
 /**
  * Resolve final proxy configuration.
  *
@@ -92,7 +117,6 @@ export async function resolveConnectionProxyConfig(
       const proxyPool = await getProxyPoolById(proxyPoolId);
 
       const proxyUrl = normalizeString(proxyPool?.proxyUrl);
-      const noProxy = normalizeString(proxyPool?.noProxy);
 
       const isValidPool =
         proxyPool &&
@@ -102,42 +126,7 @@ export async function resolveConnectionProxyConfig(
       poolStrictProxy = proxyPool?.strictProxy === true;
 
       if (isValidPool) {
-        /**
-         * Vercel/Cloudflare/Deno/Netlify relay proxies use base URL rewriting
-         * instead of HTTP_PROXY environment variables.
-         */
-        if (proxyPool.type === "vercel" || proxyPool.type === "cloudflare" || proxyPool.type === "deno" || proxyPool.type === "netlify") {
-          return {
-            source: proxyPool.type,
-
-            proxyPoolId,
-            proxyPool,
-
-            connectionProxyEnabled: false,
-            connectionProxyUrl: "",
-            connectionNoProxy: noProxy,
-
-            strictProxy: proxyPool.strictProxy === true,
-
-            vercelRelayUrl: proxyUrl, // Still mapped to vercelRelayUrl in the unified payload since they use the exact same header spec
-          };
-        }
-
-        /**
-         * Standard proxy pool
-         */
-        return {
-          source: "pool",
-
-          proxyPoolId,
-          proxyPool,
-
-          connectionProxyEnabled: true,
-          connectionProxyUrl: proxyUrl,
-          connectionNoProxy: noProxy,
-
-          strictProxy: proxyPool.strictProxy === true,
-        };
+        return proxyConfigFromPool(proxyPool);
       }
     }
 

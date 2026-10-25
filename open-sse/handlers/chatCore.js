@@ -359,6 +359,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
     proxyPoolId: credentials?.providerSpecificData?.connectionProxyPoolId || null,
     strictProxy: credentials?.providerSpecificData?.strictProxy === true,
+    connectionProxyAlternates: Array.isArray(credentials?.providerSpecificData?.connectionProxyAlternates)
+      ? credentials.providerSpecificData.connectionProxyAlternates
+      : [],
   };
 
   if (proxyOptions.vercelRelayUrl) {

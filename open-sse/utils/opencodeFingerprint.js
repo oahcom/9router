@@ -268,6 +268,83 @@ export function takeRenamedToolNames(body) {
   return renamedToolNames.get(body) || null;
 }
 
+export const OPENCODE_ENV_MARKER =
+  "<env>\n  Working directory: /workspace\n  Workspace root folder: /workspace\n</env>";
+
+const ENV_BLOCK_RE = /<env>([\s\S]*?)<\/env>/;
+const ENV_MARKER_RE = /<env>[\s\S]*?Working directory:[\s\S]*?Workspace root folder:[\s\S]*?<\/env>/;
+const ENV_WORKDIR_RE = /Working directory:[^\n]*/;
+const ENV_ROOT_RE = /Workspace root folder:/;
+
+function hasEnvMarker(value) {
+  return typeof value === "string" && ENV_MARKER_RE.test(value);
+}
+
+function upgradeEnvBlock(text) {
+  return text.replace(ENV_BLOCK_RE, (block, inner) => {
+    if (ENV_ROOT_RE.test(inner)) return block;
+    const root = "  Workspace root folder: /workspace";
+    const upgraded = ENV_WORKDIR_RE.test(inner)
+      ? inner.replace(ENV_WORKDIR_RE, (line) => `${line}\n${root}`)
+      : `${inner.replace(/\s*$/, "")}\n${root}\n`;
+    return `<env>${upgraded}</env>`;
+  });
+}
+
+function withEnvMarker(value) {
+  const text = typeof value === "string" ? value : "";
+  if (hasEnvMarker(text)) return text;
+  if (ENV_BLOCK_RE.test(text)) return upgradeEnvBlock(text);
+  return text.trim() ? `${text}\n\n${OPENCODE_ENV_MARKER}` : OPENCODE_ENV_MARKER;
+}
+
+export function applyFingerprintSystemPrompt(body) {
+  if (!body || typeof body !== "object") return;
+
+  if (body.system !== undefined) {
+    if (typeof body.system === "string") {
+      body.system = withEnvMarker(body.system);
+    } else if (Array.isArray(body.system)) {
+      const marked = body.system.some((block) =>
+        hasEnvMarker(typeof block === "string" ? block : block?.text));
+      if (!marked) body.system = [...body.system, { type: "text", text: OPENCODE_ENV_MARKER }];
+    }
+    return;
+  }
+
+  if (body.instructions !== undefined) {
+    if (typeof body.instructions === "string") body.instructions = withEnvMarker(body.instructions);
+    return;
+  }
+
+  if (Array.isArray(body.input) && !Array.isArray(body.messages)) {
+    body.instructions = OPENCODE_ENV_MARKER;
+    return;
+  }
+
+  if (!Array.isArray(body.messages)) return;
+
+  const first = body.messages[0];
+  if (first?.role === "system") {
+    if (typeof first.content === "string") {
+      body.messages = [{ ...first, content: withEnvMarker(first.content) }, ...body.messages.slice(1)];
+      return;
+    }
+    if (Array.isArray(first.content)) {
+      const marked = first.content.some((part) => hasEnvMarker(part?.text));
+      if (!marked) {
+        body.messages = [
+          { ...first, content: [...first.content, { type: "text", text: OPENCODE_ENV_MARKER }] },
+          ...body.messages.slice(1),
+        ];
+      }
+      return;
+    }
+  }
+
+  body.messages = [{ role: "system", content: OPENCODE_ENV_MARKER }, ...body.messages];
+}
+
 // Response side -------------------------------------------------------------
 
 /** Restore caller tool spellings in supported response/event shapes. */

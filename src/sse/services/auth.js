@@ -1,5 +1,5 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
-import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
+import { resolveConnectionProxyConfig, pickProxyPoolId, proxyConfigFromPool } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
@@ -48,13 +48,33 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       const settings = await getSettings();
       const override = (settings.providerStrategies || {})[providerId] || {};
       const strategy = override.rotateStrategy || "none";
+      const isOpencode = providerId === "opencode";
       let pickedId = override.proxyPoolId || null;
+      let allPools = [];
       if (strategy !== "none") {
-        const allPools = await getProxyPools({ isActive: true });
+        allPools = await getProxyPools({ isActive: true });
         const poolIds = allPools.filter(p => p.proxyUrl).map(p => p.id);
         pickedId = pickProxyPoolId(poolIds, strategy, providerId);
+      } else if (isOpencode && pickedId && pickedId !== "__none__") {
+        allPools = await getProxyPools({ isActive: true });
       }
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });
+
+      const connectionProxyAlternates = isOpencode
+        ? allPools
+          .filter(p => p.id !== resolvedProxy.proxyPoolId)
+          .map(proxyConfigFromPool)
+          .filter(Boolean)
+          .map(cfg => ({
+            proxyPoolId: cfg.proxyPoolId,
+            connectionProxyEnabled: cfg.connectionProxyEnabled,
+            connectionProxyUrl: cfg.connectionProxyUrl,
+            connectionNoProxy: cfg.connectionNoProxy,
+            vercelRelayUrl: cfg.vercelRelayUrl || "",
+            strictProxy: cfg.strictProxy === true,
+          }))
+        : [];
+
       return {
         id: "noauth",
         connectionName: "Public",
@@ -67,6 +87,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
           connectionProxyPoolId: resolvedProxy.proxyPoolId || null,
           vercelRelayUrl: resolvedProxy.vercelRelayUrl || "",
           strictProxy: resolvedProxy.strictProxy === true,
+          ...(isOpencode ? { connectionProxyAlternates } : {}),
         },
       };
     }

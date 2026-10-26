@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
-import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
+import { MEMORY_CONFIG, OPENCODE_TRANSPORT_CONFIG } from "../config/runtimeConfig.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
@@ -258,6 +258,42 @@ function isMessagesModel(model) {
   return MESSAGES_MODELS.has(baseModelId(model));
 }
 
+function firstUserText(body) {
+  const arr = Array.isArray(body?.messages)
+    ? body.messages
+    : Array.isArray(body?.input)
+      ? body.input
+      : null;
+  if (!arr) return "";
+  for (const msg of arr) {
+    if (msg?.role !== "user") continue;
+    const content = msg.content;
+    let text = "";
+    if (typeof content === "string") text = content;
+    else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part === "string") text += part;
+        else if (typeof part?.text === "string") text += part.text;
+      }
+    }
+    if (text.trim()) return text.trim();
+  }
+  return "";
+}
+
+// A per-connection fallback session id is not a conversation id. Key fresh
+// conversations by their first user message so distinct chats do not share
+// one upstream session, while retries and later turns of the same chat do.
+function conversationFingerprint(body) {
+  const text = firstUserText(body);
+  if (!text) return "";
+  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 24);
+}
+
+function conversationSessionId(credentials, fingerprint) {
+  return `${identityKey(credentials)}:conv:${fingerprint}`;
+}
+
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool, egressId = "") {
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
@@ -277,6 +313,8 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   const hinted = incoming || normalizeSession(seed);
   if (hinted) return translateSessionId(hinted, clientTool, egressId, sessionEpoch(credentials, egressId));
 
+  const fingerprint = conversationFingerprint(body);
+
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
     try {
@@ -289,7 +327,24 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     } catch {
       viaManager = null;
     }
-    if (viaManager) return translateSessionId(viaManager, clientTool, egressId, sessionEpoch(credentials, egressId));
+    if (viaManager) {
+      // The manager's last resort is a per-connection synthetic id, so every
+      // fresh conversation on a connection would collapse onto one session.
+      const connectionScoped = SYNTHETIC_SESSION_SEED_RE.test(String(viaManager).trim());
+      const hint = connectionScoped && fingerprint
+        ? conversationSessionId(credentials, fingerprint)
+        : viaManager;
+      return translateSessionId(hint, clientTool, egressId, sessionEpoch(credentials, egressId));
+    }
+  }
+
+  if (fingerprint) {
+    return translateSessionId(
+      conversationSessionId(credentials, fingerprint),
+      clientTool,
+      egressId,
+      sessionEpoch(credentials, egressId)
+    );
   }
 
   return stableSessionId(credentials, egressId);
@@ -527,11 +582,39 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
 
+    // 传输层悬挂（出口隧道中途重连 → 无首字节 → 上层超时合成为 503）时，
+    // 换另一条出口透明重试一次。与 429 路径不同，这里**不标记任何冷却**：
+    // 503 不是出口限流/信誉证据，标记会误烧正常 IP（INC-008/INC-009）。
+    if (result?.response?.status === 503 && retryBody) {
+      const failureText = await result.response.clone().text().catch(() => "");
+      if (/UpstreamTransportError/.test(failureText)) {
+        const failover = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
+        if (failover.alternate) {
+          const failoverCredentials = this.prepareRequestCredentials({
+            ...args,
+            body: retryBody,
+            egressId: failover.alternate.egress.id,
+          });
+          log?.warn?.(
+            "EGRESS",
+            `transport failure on ${describeEgress(egress)} → retry once on ${describeEgress(failover.alternate.egress)}`
+          );
+          result = await super.execute({
+            ...args,
+            body: retryBody,
+            credentials: failoverCredentials,
+            proxyOptions: failover.alternate.proxyOptions,
+          });
+        }
+      }
+    }
+
     if (!result?.response || result.response.status !== 429) return result;
 
     const bodyText = await readResponseText(result.response);
     const retryAfterMs = parseRetryAfterMs(result.response.headers, bodyText);
-    const rotated = rotateSession(prepared, egress.id);
+    const ipScoped = /FreeUsageLimitError/.test(bodyText);
+    const rotated = ipScoped ? false : rotateSession(prepared, egress.id);
 
     if (egress.kind === "direct" && !egress.confirmed) {
       try {
@@ -566,8 +649,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       }
     }
 
-    const retryEgress = selection.alternate?.egress || egress;
-    const retryProxyOptions = selection.alternate?.proxyOptions ?? proxyOptions;
+    const retryEgress = retrySameEgress ? egress : (selection.alternate?.egress || egress);
+    const retryProxyOptions = retrySameEgress ? proxyOptions : (selection.alternate?.proxyOptions ?? proxyOptions);
     const retryCredentials = this.prepareRequestCredentials({
       ...args,
       body: retryBody || args.body,
@@ -593,10 +676,36 @@ export class OpenCodeExecutor extends BaseExecutor {
     return retryResult;
   }
 
+  // In-process retries of a synthetic transport failure only burn time; the
+  // caller (combo/ASIP) owns egress rotation.
+  async computeRetryDelay(response) {
+    if (response.status !== 503) return null;
+    const text = await response.clone().text().catch(() => "");
+    return /UpstreamTransportError/.test(text) ? false : null;
+  }
+
   async fetchUpstream(url, options, proxyOptions = null) {
     const response = await fetchViaTransport(url, options, proxyOptions);
     if (response) return response;
-    return proxyAwareFetch(url, options, proxyOptions);
+    if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
+      return proxyAwareFetch(url, options, proxyOptions);
+    }
+    // Never downgrade to Node here. OpenCode fingerprints the client TLS/HTTP
+    // stack: Bun (the sidecar) is served, while Node/undici is answered with a
+    // quota-shaped 429 that is not a real quota. A silent downgrade therefore
+    // burns egress health and sessions. Fail retryably so the caller can wait
+    // for ASIP to rotate the IP.
+    console.warn(`[OpenCode] Bun transport unavailable for ${url}; refusing Node fallback`);
+    return new Response(JSON.stringify({
+      type: "error",
+      error: {
+        type: "UpstreamTransportError",
+        message: "OpenCode free lane requires the Bun transport; sidecar unavailable.",
+      },
+    }), {
+      status: 503,
+      headers: { "content-type": "application/json", "retry-after": "1" },
+    });
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

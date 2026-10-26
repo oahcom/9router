@@ -2,6 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { fetchMock } = vi.hoisted(() => {
   process.env.EGRESS_PROBE_MODE = "off";
+  // These tests exercise session resolution, so keep the Node path mocked.
+  process.env.OPENCODE_TRANSPORT = "off";
+  // Egress must resolve to direct for the same-egress 429 retry assertions.
+  for (const key of ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"]) {
+    delete process.env[key];
+  }
   return { fetchMock: vi.fn() };
 });
 
@@ -299,7 +305,21 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
 
     expect(first).toMatch(OPENCODE_SESSION_RE);
     expect(second).toBe(first);
-    expect(first).toBe(stableSessionId(credentials));
+  });
+
+  it("scopes fresh conversations on one connection by their first user message", () => {
+    const executor = getExecutor("opencode");
+    const credentials = anonymousCredentials("app-default-key");
+    const call = (text) => executor.prepareRequestCredentials({
+      body: { messages: [{ role: "user", content: text }] },
+      credentials,
+      providerSessionId: "3f1c9f8e-1a2b-4c3d-8e4f-5a6b7c8d9e0f1792940000000",
+      clientTool: "generic",
+    })._opencodeSession;
+
+    const first = call("explain the retry path");
+    expect(call("explain the retry path")).toBe(first);
+    expect(call("write a different question")).not.toBe(first);
   });
 
   it("keeps a synthetic-seeded multi-turn conversation on one current-dated session", () => {
@@ -341,14 +361,37 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(second).toBe(first);
   });
 
-  it("rotates the stable session after a 429 and retries the request once", async () => {
+  it("keeps the stable session on an IP-scoped 429", async () => {
     const executor = getExecutor("opencode");
     const credentials = { connectionId: "rotate-conn", rawHeaders: {} };
+    const limited = () => new Response(JSON.stringify({
+      type: "error",
+      error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
+    }), { status: 429, headers: { "content-type": "application/json", "retry-after": "36000" } });
+    fetchMock.mockResolvedValueOnce(limited());
+
+    const result = await executor.execute({
+      model: "deepseek-v4.1-flash-free",
+      body: { messages: [{ role: "user", content: "hello" }] },
+      stream: false,
+      credentials,
+    });
+
+    // Free-pool quota is IP/short-window scoped; a fresh session does not help.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const session = fetchMock.mock.calls[0][1].headers["x-opencode-session"];
+    expect(session).toMatch(OPENCODE_SESSION_RE);
+    expect(result.response.status).toBe(429);
+  });
+
+  it("rotates and retries once on a session-scoped 429", async () => {
+    const executor = getExecutor("opencode");
+    const credentials = { connectionId: "rate-conn", rawHeaders: {} };
     fetchMock
       .mockResolvedValueOnce(new Response(JSON.stringify({
         type: "error",
-        error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
-      }), { status: 429, headers: { "content-type": "application/json", "retry-after": "36000" } }))
+        error: { type: "RateLimitError", message: "Too many requests." },
+      }), { status: 429, headers: { "content-type": "application/json" } }))
       .mockResolvedValueOnce(new Response("{}", { status: 200, headers: { "content-type": "application/json" } }));
 
     const result = await executor.execute({
@@ -373,7 +416,7 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     fetchMock
       .mockResolvedValueOnce(new Response(JSON.stringify({
         type: "error",
-        error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
+        error: { type: "RateLimitError", message: "Too many requests." },
       }), { status: 429, headers: { "content-type": "application/json" } }))
       .mockResolvedValueOnce(new Response("{}", { status: 200, headers: { "content-type": "application/json" } }));
 
@@ -394,26 +437,6 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(result.response.status).toBe(200);
   });
 
-  it("keeps a native client session after a 429", async () => {
-    const executor = getExecutor("opencode");
-    const native = generateSessionId();
-    const credentials = { connectionId: "native-conn", rawHeaders: { "x-opencode-session": native } };
-    fetchMock.mockResolvedValue(new Response(JSON.stringify({
-      type: "error",
-      error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
-    }), { status: 429, headers: { "content-type": "application/json" } }));
-
-    const result = await executor.execute({
-      model: "deepseek-v4.1-flash-free",
-      body: { messages: [{ role: "user", content: "hello" }] },
-      stream: false,
-      credentials,
-    });
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0][1].headers["x-opencode-session"]).toBe(native);
-    expect(result.response.status).toBe(429);
-  });
 
   it("applies the read/shell free-tier fingerprint on Chat Completions", () => {
     const executor = getExecutor("opencode");

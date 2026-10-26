@@ -20,6 +20,23 @@ describe("getCapabilitiesForModel", () => {
     // the superseded text-only Flash id stays text-only
     expect(getCapabilitiesForModel("opencode-go", "deepseek-v4-flash").vision).toBe(false);
   });
+
+  it("caps the free DeepSeek V4.1-Flash lane at the backend's 330k prompt limit (#5097)", () => {
+    const free = {
+      vision: true,
+      reasoning: true,
+      thinkingFormat: "deepseek",
+      contextWindow: 330000,
+      maxOutput: 384000,
+    };
+    expect(getCapabilitiesForModel("opencode", "deepseek-v4.1-flash-free")).toMatchObject(free);
+    // hyphenated alias used by some providers must not fall back to the 1M pattern
+    expect(getCapabilitiesForModel("opencode", "deepseek-v4-1-flash-free")).toMatchObject(free);
+    // the paid lane keeps 1M — the cap is a property of the free backend only
+    expect(getCapabilitiesForModel("opencode-go", "deepseek-v4.1-flash").contextWindow).toBe(1000000);
+    // provider path form (oc/) must resolve to the same capped entry
+    expect(getCapabilitiesForModel("opencode", "oc/deepseek-v4.1-flash-free").contextWindow).toBe(330000);
+  });
   const claudeSonnet5Expected = {
     contextWindow: 1000000,
     maxOutput: 128000,

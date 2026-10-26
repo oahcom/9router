@@ -102,9 +102,10 @@ function headerObject(headers) {
   return { ...headers };
 }
 
-function forward(port, token, payload, signal) {
+function forward(port, token, payload, signal, headerTimeoutMs = 0) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
+    let headerTimer = null;
     const request = http.request({
       host: "127.0.0.1",
       port,
@@ -116,6 +117,7 @@ function forward(port, token, payload, signal) {
         "x-transport-token": token,
       },
     }, (response) => {
+      if (headerTimer) clearTimeout(headerTimer);
       const headers = new Headers();
       for (const [key, value] of Object.entries(response.headers)) {
         if (Array.isArray(value)) value.forEach((item) => headers.append(key, item));
@@ -127,7 +129,18 @@ function forward(port, token, payload, signal) {
         headers,
       }));
     });
-    request.on("error", reject);
+    request.on("error", (error) => {
+      if (headerTimer) clearTimeout(headerTimer);
+      reject(error);
+    });
+    if (headerTimeoutMs > 0) {
+      headerTimer = setTimeout(() => {
+        const timeout = new Error(`upstream header timeout (${headerTimeoutMs}ms)`);
+        timeout.transportTimeout = true;
+        request.destroy(timeout);
+      }, headerTimeoutMs);
+      headerTimer.unref?.();
+    }
     if (signal) {
       if (signal.aborted) {
         request.destroy(new Error("aborted"));
@@ -147,27 +160,64 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
   const target = typeof url === "string" ? url : url.toString();
   const { url: proxyUrl } = resolveEffectiveProxyUrl(target, proxyOptions);
   if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return null;
+  const streamBody = typeof options.body === "string" && /"stream"\s*:\s*true/.test(options.body);
+  const headerTimeoutMs = streamBody ? OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs : 0;
 
-  const transport = await ensure();
-  if (!transport) return null;
+  // A sidecar whose upstream fetch failed may hold a stale pooled socket or a
+  // proxy that just reset. Restarting Bun is cheap and clears both; retry the
+  // same payload once before declaring the transport unavailable.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const transport = await ensure();
+    if (!transport) return null;
 
-  try {
-    const response = await forward(transport.port, transport.token, {
-      url: target,
-      method: options.method || "POST",
-      headers: headerObject(options.headers),
-      body: options.body,
-      proxy: proxyUrl || null,
-    }, options.signal);
-    if (response.headers.get("x-transport-error") === "1") {
-      try { await response.body?.cancel(); } catch { }
+    try {
+      const response = await forward(transport.port, transport.token, {
+        url: target,
+        method: options.method || "POST",
+        headers: headerObject(options.headers),
+        body: options.body,
+        proxy: proxyUrl || null,
+      }, options.signal, headerTimeoutMs);
+      if (response.headers.get("x-transport-error") === "1") {
+        const detail = await response.text().catch(() => "");
+        console.warn(
+          `[OpenCodeTransport] upstream fetch failed (attempt ${attempt + 1}/2): ${detail.slice(0, 300)}`
+        );
+        if (attempt === 0) {
+          stop();
+          continue;
+        }
+        return null;
+      }
+      return response;
+    } catch (error) {
+      if (options.signal?.aborted || error.name === "AbortError") return null;
+      // 响应头超时 = 出口路径死了（sidecar 本身活着）。不重启 sidecar 再试一次
+      // （同一代理必然再挂），直接交给上层换另一条出口，把 60s 白等压到 20s。
+      if (error.transportTimeout) {
+        console.warn(`[OpenCodeTransport] ${error.message}; skipping sidecar restart, upstream failover owns the retry`);
+        return null;
+      }
+      console.warn(`[OpenCodeTransport] forward failed (attempt ${attempt + 1}/2): ${error.message}`);
+      if (attempt === 0) {
+        stop();
+        continue;
+      }
       return null;
     }
-    return response;
-  } catch (error) {
-    if (options.signal?.aborted || error.name === "AbortError") return null;
-    block(new Error(`forward failed: ${error.message}`));
-    return null;
+  }
+  return null;
+}
+
+const EXIT_HOOK = Symbol.for("ninerouter.opencodeTransport.exitHook");
+if (!globalThis[EXIT_HOOK]) {
+  globalThis[EXIT_HOOK] = true;
+  process.once("exit", stop);
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.once(signal, () => {
+      stop();
+      process.exit(0);
+    });
   }
 }
 

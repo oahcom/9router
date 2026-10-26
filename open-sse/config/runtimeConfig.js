@@ -70,6 +70,10 @@ export const OPENCODE_TRANSPORT_CONFIG = {
   bunBin: envUrl("OPENCODE_BUN_BIN", "bun"),
   readyTimeoutMs: envMs("OPENCODE_TRANSPORT_READY_TIMEOUT_MS", 8000),
   failureBackoffMs: envMs("OPENCODE_TRANSPORT_BACKOFF_MS", 5 * 60 * 1000),
+  // 流式请求等待上游响应头的上限：出口隧道中途重连时 forward 会挂到调用方
+  // 中止（实测 60s），期间没有首字节。超时即判定该出口不可用，交给上层换线。
+  // 非流式不设限：长生成在响应头返回前就可能超过该值，会误杀。
+  headerTimeoutMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS", 20 * 1000),
 };
 
 // SearXNG endpoint used by the unauthenticated web-search provider.

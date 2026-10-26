@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+
+vi.hoisted(() => {
+  process.env.EGRESS_PROBE_MODE = "off";
+  process.env.OPENCODE_TRANSPORT = "off";
+});
 import { PROVIDERS } from "../../open-sse/config/providers.js";
 import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
 import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";

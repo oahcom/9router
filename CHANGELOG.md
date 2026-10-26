@@ -2,6 +2,9 @@
 
 ## Fixes
 - **Proxy**: add opt-in `?dns=local` for SOCKS5 gateways with domain-target routing issues; preserve remote DNS by default, original TLS/Host identity and proxy rotation. Share the DNS-mode-aware dispatcher with dashboard proxy tests. Local DNS uses the system resolver; see `docs/socks-dns.md` for privacy implications (#4983).
+- **CLI Tools**: stop the Pi card from resetting every `contextWindow`/`maxTokens` in `~/.pi/agent/models.json` on Apply, add per-model context-window and max-output selectors, and sanitize corrupt cap values instead of writing them back
+- **Codex Image**: drive the `image_generation` tool call from `gpt-6-sol` instead of the legacy `gpt-5.6-terra` host, and add `cx/gpt-6-sol-image`; drop the `gpt-5.6-{sol,terra,luna}-image` aliases they supersede
+- **Capabilities**: match `*gpt-6*image*` before the generic `gpt-6` family pattern so `gpt-6-sol-image` resolves as an image model instead of inheriting the chat caps (vision/reasoning/1.05M window) and losing `imageOutput`
 
 # v0.5.109 (2026-10-23)
 

@@ -9,6 +9,7 @@ import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { fetchViaTransport } from "../utils/opencodeTransport.js";
+import { opencodeTlsFetch, OpencodeTlsUnavailableError } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { rotateEgress } from "../utils/asipRotate.js";
@@ -576,12 +577,17 @@ export class OpenCodeExecutor extends BaseExecutor {
       applyFingerprintTools(body, true);
     } else if (body && typeof body === "object") {
       dropAdaptiveReasoningEffort(body);
-      applyFingerprintTools(body, false);
+      applyFingerprintTools(body, false, { claude: isMessagesModel(model || body?.model) });
     }
     applyFingerprintSystemPrompt(body);
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
+  // The free gate keys on the TLS ClientHello, so a native Node fetch is refused
+  // no matter how faithful the body is. Route through the impersonating client
+  // and keep proxy handling on the existing path (proxyAwareFetch delegates to
+  // `directFetch` when no proxy is configured). Fail-open: without wreq-js the
+  // request still goes out on native fetch instead of erroring here.
   async execute(args) {
     const { model, stream, credentials, log } = args;
     let proxyOptions = args.proxyOptions || null;
@@ -854,6 +860,21 @@ export class OpenCodeExecutor extends BaseExecutor {
     // quota-shaped 429 that is not a real quota. A silent downgrade therefore
     // burns egress health and sessions. Fail retryably so the caller can wait
     // for ASIP to rotate the IP.
+    // 上游 ce060c79：undici 的 OpenSSL ClientHello 会被拒成 quota 形状的 429，
+    // 但 wreq-js 送同一份 cipher 列表能过。所以 sidecar 不可用、又没有配代理时，
+    // 这里退到它；没装 wreq-js 就照旧回可重试的 503（仍然不降级到 undici）。
+    if (!configuredProxy) {
+      try {
+        return await proxyAwareFetch(url, {
+          ...options,
+          directFetch: (target, init) =>
+            opencodeTlsFetch(target, { method: init.method, headers: init.headers, body: init.body }, { signal: init.signal }),
+        });
+      } catch (error) {
+        if (!(error instanceof OpencodeTlsUnavailableError)) throw error;
+        console.warn("[OpenCode] wreq-js unavailable; not downgrading to undici");
+      }
+    }
     console.warn(`[OpenCode] Bun transport unavailable for ${url}; refusing Node fallback`);
     return new Response(JSON.stringify({
       type: "error",

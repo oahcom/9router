@@ -17,6 +17,8 @@
  *
  * Transport is a third gate and lives in services/opencodeTlsClient.js.
  */
+import os from "node:os";
+import path from "node:path";
 
 /** Names required by the upstream free-tier gate. */
 export const OPENCODE_FINGERPRINT_TOOLS = ["read", "shell"];
@@ -261,7 +263,7 @@ export function aliasHistoryToolCalls(body, map) {
 // in the system prompt instead. Upstream does not gate on the prompt text.
 // Wording matters: "not available" made the model also refuse the caller's own
 // Read/Bash; "placeholders ... use the other tools" kept those working.
-function noteUnavailableTools(body, flat, names) {
+function noteUnavailableTools(body, flat, names, claude = false) {
   const list = names.map((name) => `\`${name}\``).join(" or ");
   const note = names.length > 1
     ? `Do not call the ${list} tools; they are placeholders that do nothing. Use the other tools you have been given instead.`
@@ -272,13 +274,108 @@ function noteUnavailableTools(body, flat, names) {
       : note;
     return;
   }
-  // OpenAI chat shape only; Claude-shaped bodies carry `system` instead.
-  if (!Array.isArray(body.messages) || body.system !== undefined) return;
+  // Claude-shaped bodies carry `system` instead; /messages rejects role:"system".
+  if (claude || body.system !== undefined) {
+    body.system = appendSystemText(body.system, note);
+    return;
+  }
+  if (!Array.isArray(body.messages)) return;
   const first = body.messages[0];
   if (first?.role === "system" && typeof first.content === "string") {
     body.messages = [{ ...first, content: `${first.content}\n\n${note}` }, ...body.messages.slice(1)];
   } else {
     body.messages = [{ role: "system", content: note }, ...body.messages];
+  }
+}
+
+// The marker gate reads text only: a foreign system prompt plus this exact block
+// passes, so the marker is appended to the caller's own prompt rather than
+// replacing it. Values mirror a real CLI instance on this host.
+const ENV_TAG = "<env>";
+const ENV_HEADING = "Here is some useful information about the environment you are running in:";
+const ENV_TMP_DIR = path.join(os.tmpdir(), "opencode");
+const ENV_WORKING_DIR = process.cwd();
+const ENV_FINGERPRINT_PROMPT = [
+  ENV_HEADING,
+  ENV_TAG,
+  `  Working directory: ${ENV_WORKING_DIR}`,
+  `  Workspace root folder: ${ENV_WORKING_DIR}`,
+  "  Is directory a git repo: no",
+  `  Platform: ${process.platform}`,
+  `  Prefer ${ENV_TMP_DIR} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.`,
+  "</env>",
+].join("\n");
+
+/** True when the marker is already present; a genuine opencode client is passthrough. */
+function systemCarriesEnv(system) {
+  if (typeof system === "string") return system.includes(ENV_TAG);
+  if (Array.isArray(system)) {
+    return system.some((block) => typeof block?.text === "string" && block.text.includes(ENV_TAG));
+  }
+  return false;
+}
+
+/** Append `text` to a system prompt held as a string, text blocks, or unset. */
+function appendSystemText(system, text) {
+  if (typeof system === "string") {
+    return system.trim() ? `${system}\n\n${text}` : text;
+  }
+  const blocks = Array.isArray(system) ? [...system] : [];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    if (typeof block?.text === "string") {
+      const existing = block.text.trim();
+      blocks[i] = { ...block, text: existing ? `${block.text}\n\n${text}` : text };
+      return blocks;
+    }
+  }
+  return [...blocks, { type: "text", text }];
+}
+
+/**
+ * Append the CLI's environment marker without replacing the caller's content,
+ * covering all three request shapes: Responses (`instructions`), chat
+ * (`messages[]` system) and claude-top-level (`system`). Fail-open — the marker
+ * is an enhancement, so a surprising body is left untouched.
+ *
+ * @param {object} body
+ * @param {boolean} flat - true for Responses instructions, false for chat/claude
+ * @param {object} [options]
+ * @param {boolean} [options.claude] - body posts to /messages (claude shape)
+ * @returns {boolean} true when the marker was added
+ */
+export function applyEnvFingerprint(body, flat, { claude = false } = {}) {
+  try {
+    if (!body || typeof body !== "object") return false;
+
+    if (flat) {
+      if (body.instructions !== undefined && typeof body.instructions !== "string") return false;
+      if (systemCarriesEnv(body.instructions)) return false;
+      body.instructions = (typeof body.instructions === "string" && body.instructions.trim())
+        ? `${body.instructions}\n\n${ENV_FINGERPRINT_PROMPT}`
+        : ENV_FINGERPRINT_PROMPT;
+      return true;
+    }
+
+    if (claude || body.system !== undefined) {
+      if (systemCarriesEnv(body.system)) return false;
+      body.system = appendSystemText(body.system, ENV_FINGERPRINT_PROMPT);
+      return true;
+    }
+
+    if (!Array.isArray(body.messages)) return false;
+    const idx = body.messages.findIndex((msg) => msg?.role === "system");
+    if (idx >= 0) {
+      const target = body.messages[idx];
+      if (systemCarriesEnv(target.content)) return false;
+      const content = appendSystemText(target.content, ENV_FINGERPRINT_PROMPT);
+      body.messages = body.messages.map((msg, i) => (i === idx ? { ...msg, content } : msg));
+      return true;
+    }
+    body.messages = [{ role: "system", content: ENV_FINGERPRINT_PROMPT }, ...body.messages];
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -291,7 +388,7 @@ function noteUnavailableTools(body, flat, names) {
  * @param {boolean} flat - true for Responses tools ({name}), false for chat tools
  * @returns {Map<string,string>} map: sent name -> original name
  */
-export function applyFingerprintTools(body, flat) {
+export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   if (!body || typeof body !== "object") return new Map();
 
   const { tools, map } = concealFingerprintToolNames(body.tools);
@@ -299,7 +396,10 @@ export function applyFingerprintTools(body, flat) {
   const appended = appendMissingFingerprintTools(body.tools, flat);
   retargetToolChoice(body, map);
   aliasHistoryToolCalls(body, map);
-  if (appended.length) noteUnavailableTools(body, flat, appended);
+  if (appended.length) noteUnavailableTools(body, flat, appended, claude);
+
+  // The `<env>` marker is required on every free-lane request, with or without tools.
+  applyEnvFingerprint(body, flat, { claude });
 
   // Responses keeps its explicit auto default. Never default to "none": upstream
   // answers tool_choice "none" with 403 FreeTierError.

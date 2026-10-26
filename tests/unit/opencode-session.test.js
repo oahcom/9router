@@ -120,6 +120,24 @@ describe("OpenCode Free Session ID Format", () => {
     }
   });
 
+  // 上游 ce060c79 的同类断言：前缀里的时间是铸造成时刻，不是摘要出来的。
+  it("mints translated sessions at the current time instead of from a digest", () => {
+    const TIME_MASK = (1n << 36n) - 1n;
+    const timeOf = (id) => Number((~BigInt(`0x${id.slice(4, 16)}`) & ((1n << 48n) - 1n)) >> 12n);
+    const before = Date.now();
+    const translated = translateSessionId(`fresh-${before}`, "claude");
+    const after = Date.now();
+
+    expect(timeOf(translated)).toBeGreaterThanOrEqual(Number(BigInt(before) & TIME_MASK));
+    expect(timeOf(translated)).toBeLessThanOrEqual(Number(BigInt(after) & TIME_MASK));
+  });
+
+  it("reuses the memoized session for one conversation", () => {
+    const raw = "claude:memoized-conversation";
+    const first = translateSessionId(raw, "claude");
+    expect(translateSessionId(raw, "claude")).toBe(first);
+    expect(translateSessionId(`${raw}-other`, "claude")).not.toBe(first);
+  });
   it("preserves already-valid OpenCode sessions without re-hashing", () => {
     const valid = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
     expect(translateSessionId(valid)).toBe(valid);

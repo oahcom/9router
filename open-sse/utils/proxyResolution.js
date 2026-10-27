@@ -26,10 +26,86 @@ export function shouldBypassByNoProxy(targetUrl, noProxyValue) {
 // so a LAN peer (192.168.1.97:20127) rode that env proxy and burned 235s per
 // attempt to a connect timeout, 108 failures / 0 successes in 30 minutes.
 // NO_PROXY cannot carry this: it matches exact hosts or suffixes, never CIDR.
-const PRIVATE_HOST_RE = /^(?:localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|\[?::1\]?$|\[?f[cd])/i;
+//
+// Prefix matching on the raw string was wrong in both directions: "10." marked
+// 10.example.com private (leaking the real exit IP for a public host) and the
+// literal forms Node/WHATWG URL can emit — "[::ffff:c0a8:161]" for an
+// IPv4-mapped address, "[fe80::1]" link-local, CGNAT 100.64/10, "0.0.0.0" —
+// were all treated as public (routed to the pool). Ranges below are compared
+// numerically and only ever applied to real IP literals.
+const PRIVATE_HOSTNAMES = new Set(["localhost", "ip6-localhost", "ip6-loopback", "metadata.google.internal"]);
+const PRIVATE_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa"];
+
+const PRIVATE_V4_RANGES = [
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10], // CGNAT, also used by tailnets and some metadata proxies
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.168.0.0", 16],
+].map(([base, bits]) => [ipv4ToInt(base), bits]);
+
+function ipv4ToInt(host) {
+  const parts = host.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = value * 256 + octet;
+  }
+  return value >>> 0;
+}
+
+function isPrivateV4Int(ip) {
+  return PRIVATE_V4_RANGES.some(([base, bits]) => {
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    return (ip & mask) === (base & mask);
+  });
+}
+
+// "[::ffff:192.168.1.97]" and the hex form URL parsing produces for the same
+// address ("[::ffff:c0a8:161]") must resolve to the same integer.
+function mappedV4ToInt(host) {
+  const match = /^::ffff:(.+)$/.exec(host);
+  if (!match) return null;
+  return ipv4ToInt(match[1]) ?? (() => {
+    const hextets = match[1].split(":");
+    if (hextets.length !== 2 || !hextets.every((h) => /^[0-9a-f]{1,4}$/.test(h))) return null;
+    return ((parseInt(hextets[0], 16) << 16) | parseInt(hextets[1], 16)) >>> 0;
+  })();
+}
+
+function canonicalHost(hostname) {
+  let host = normalizeString(hostname).toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  if (!host.includes(":") && host.endsWith(".")) host = host.slice(0, -1);
+  return host;
+}
 
 export function isPrivateHost(hostname) {
-  return PRIVATE_HOST_RE.test(normalizeString(hostname));
+  const host = canonicalHost(hostname);
+  if (!host) return false;
+  if (PRIVATE_HOSTNAMES.has(host)) return true;
+  if (PRIVATE_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return true;
+
+  const v4 = ipv4ToInt(host);
+  if (v4 !== null) return isPrivateV4Int(v4);
+
+  if (!host.includes(":")) return false;
+
+  const mapped = mappedV4ToInt(host);
+  if (mapped !== null) return isPrivateV4Int(mapped);
+
+  if (host === "::" || host === "::1") return true;
+  const first = parseInt(host.split(":")[0] || "0", 16);
+  if (!Number.isFinite(first)) return false;
+  if ((first & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
+  if ((first & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((first & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated)
+  return false;
 }
 
 export function getEnvProxyUrl(targetUrl) {
@@ -75,6 +151,11 @@ export function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
 
   const noProxy = normalizeString(proxyOptions?.noProxy ?? proxyOptions?.connectionNoProxy);
   if (noProxy && shouldBypassByNoProxy(targetUrl, noProxy)) return null;
+
+  // 连接级代理与 env 代理同罪：把 LAN peer 交给远端出口必然不可达。
+  try {
+    if (isPrivateHost(new URL(targetUrl).hostname)) return null;
+  } catch { /* 非 URL 目标交给调用方处理 */ }
 
   return normalizeProxyUrl(proxyUrlRaw);
 }

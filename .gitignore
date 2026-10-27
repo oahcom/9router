@@ -117,3 +117,13 @@ node_modules/
 *.swp
 *~
 .scratch/
+
+# Runtime state: written on every request, must not live in git history
+/db/*.sqlite
+/db/*.sqlite-shm
+/db/*.sqlite-wal
+/db/*.bak-*
+/model-catalog.json
+/model-catalog-raw.json
+/.next.stale-*/
+/build-*.log

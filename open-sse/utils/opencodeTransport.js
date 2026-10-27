@@ -68,9 +68,18 @@ function start() {
   console.log(`[OpenCodeTransport] starting sidecar: ${OPENCODE_TRANSPORT_CONFIG.bunBin} ${sidecarPath()}`);
   starting = new Promise((resolve, reject) => {
     const token = randomBytes(24).toString("hex");
+    // 父进程已经决定这条请求走哪条出口（payload.proxy 为 null 即直连）。
+    // 若把 HTTP(S)_PROXY 继承给 Bun，sidecar 会在 proxy:null 时回退到 env 代理，
+    // 把父进程判定的 direct 请求重新推进公共出口池——私有地址绕行在真正发请求的
+    // 进程里失效。sidecar 内的出口只允许由 payload.proxy 决定。
+    const childEnv = { ...process.env, OPENCODE_TRANSPORT_TOKEN: token, OPENCODE_TRANSPORT_PORT: "0" };
+    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "all_proxy", "no_proxy"]) {
+      delete childEnv[name];
+    }
     const child = spawn(OPENCODE_TRANSPORT_CONFIG.bunBin, [sidecarPath()], {
       cwd: process.cwd(),
-      env: { ...process.env, OPENCODE_TRANSPORT_TOKEN: token, OPENCODE_TRANSPORT_PORT: "0" },
+      env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let settled = false;
@@ -148,30 +157,39 @@ function forward(transport, payload, signal, headerTimeoutMs = 0) {
       transport.inflight--;
       if (transport.retired && transport.inflight === 0) killChild(transport);
     };
-    const request = http.request({
-      host: "127.0.0.1",
-      port: transport.port,
-      path: TRANSPORT_PATH,
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-length": Buffer.byteLength(body),
-        "x-transport-token": transport.token,
-      },
-    }, (response) => {
-      if (headerTimer) clearTimeout(headerTimer);
-      response.on("close", done);
-      const headers = new Headers();
-      for (const [key, value] of Object.entries(response.headers)) {
-        if (Array.isArray(value)) value.forEach((item) => headers.append(key, item));
-        else if (value != null) headers.set(key, value);
-      }
-      resolve(new Response(Readable.toWeb(response), {
-        status: response.statusCode || 502,
-        statusText: response.statusMessage || "",
-        headers,
-      }));
-    });
+    let request;
+    try {
+      request = http.request({
+        host: "127.0.0.1",
+        port: transport.port,
+        path: TRANSPORT_PATH,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "x-transport-token": transport.token,
+        },
+      }, (response) => {
+        if (headerTimer) clearTimeout(headerTimer);
+        response.on("close", done);
+        const headers = new Headers();
+        for (const [key, value] of Object.entries(response.headers)) {
+          if (Array.isArray(value)) value.forEach((item) => headers.append(key, item));
+          else if (value != null) headers.set(key, value);
+        }
+        resolve(new Response(Readable.toWeb(response), {
+          status: response.statusCode || 502,
+          statusText: response.statusMessage || "",
+          headers,
+        }));
+      });
+    } catch (error) {
+      // http.request 同步抛错（header 非法、fd 耗尽）时不会有 error 事件，
+      // 不在这里归还计数会让 retire() 等到 30s 兜底才回收进程。
+      done();
+      reject(error);
+      return;
+    }
     request.on("error", (error) => {
       if (headerTimer) clearTimeout(headerTimer);
       done();
@@ -203,7 +221,6 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
 
   const target = typeof url === "string" ? url : url.toString();
   const { url: proxyUrl } = resolveEffectiveProxyUrl(target, proxyOptions);
-  if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return null;
   const streamBody = typeof options.body === "string" && /"stream"\s*:\s*true/.test(options.body);
   const headerTimeoutMs = streamBody ? OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs : 0;
 
@@ -221,6 +238,8 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
         headers: headerObject(options.headers),
         body: options.body,
         proxy: proxyUrl || null,
+        // 0 = 不设上限（非流式：长生成可能在响应头返回前就超过 19s）
+        timeoutMs: headerTimeoutMs,
       }, options.signal, headerTimeoutMs);
       if (response.headers.get("x-transport-error") === "1") {
         const detail = await response.text().catch(() => "");
@@ -233,18 +252,23 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
           `[OpenCodeTransport] upstream fetch failed (attempt ${attempt + 1}/2)${upstreamTimeout ? " [timeout]" : ""}: ${detail.slice(0, 300)}`
         );
         if (upstreamTimeout) {
-          if (attempt === 0 && Date.now() - lastResetAt >= 30000) {
+          // 同一出口（同一 proxyUrl）重试必然再等满一次超时：attempt 1 只是把
+          // 20s 变成 40s。这里只负责清掉可能僵死的池化 socket，请求本身直接
+          // 交回上层换出口；30s 冷却避免大批量超时时把 sidecar 反复杀穿。
+          if (Date.now() - lastResetAt >= 30000) {
             lastResetAt = Date.now();
             console.warn("[OpenCodeTransport] sidecar reported upstream timeout; restarting sidecar to drop stale socket");
             retire();
-            continue;
+          } else {
+            console.warn("[OpenCodeTransport] sidecar reported upstream timeout; reset throttled, fail fast");
           }
-          console.warn("[OpenCodeTransport] sidecar reported upstream timeout; reset throttled, fail fast");
           return null;
         }
-        if (attempt === 0) {
+        // sidecar 报的是上游 fetch 失败（非超时）。非流式没有 cleanup 需求，
+        // 重试同一出口只会重复失败；只在 30s 冷却外重启一次以清池。
+        if (Date.now() - lastResetAt >= 30000) {
+          lastResetAt = Date.now();
           retire();
-          continue;
         }
         return null;
       }
@@ -257,13 +281,13 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
         // 超时的常见成因是 Bun 的池化 socket 已死（隧道静默断开、本地仍 ESTAB），
         // 同一 sidecar 会一直复用它 → 后续每条请求都白等满超时。重启 sidecar 才
         // 能清池；30s 冷却避免大批量超时时把 sidecar 反复杀穿。
-        if (attempt === 0 && Date.now() - lastResetAt >= 30000) {
+        if (Date.now() - lastResetAt >= 30000) {
           lastResetAt = Date.now();
           console.warn(`[OpenCodeTransport] ${error.message}; restarting sidecar to drop stale socket`);
           retire();
-          continue;
+        } else {
+          console.warn(`[OpenCodeTransport] ${error.message}; sidecar reset throttled, fail fast`);
         }
-        console.warn(`[OpenCodeTransport] ${error.message}; sidecar reset throttled, fail fast`);
         return null;
       }
       console.warn(`[OpenCodeTransport] forward failed (attempt ${attempt + 1}/2): ${error.message}`);
@@ -286,13 +310,10 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
 const EXIT_HOOK = Symbol.for("ninerouter.opencodeTransport.exitHook");
 if (!globalThis[EXIT_HOOK]) {
   globalThis[EXIT_HOOK] = true;
+  // 只挂 exit：SIGINT/SIGTERM 上主动 process.exit(0) 会与 db 层同期注册的
+  // 冲洗处理器竞争（先注册先执行），把 WAL 里未落盘的请求详情一起带走。
+  // 信号路径交给 db/gateway 自己收尾，sidecar 由 ppid 看门狗 2s 内自退。
   process.once("exit", stop);
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.once(signal, () => {
-      stop();
-      process.exit(0);
-    });
-  }
 }
 
 export function resetTransport() {

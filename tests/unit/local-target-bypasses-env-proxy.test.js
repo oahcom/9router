@@ -12,7 +12,8 @@
 // has to live in the resolver.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getEnvProxyUrl, isPrivateHost } from "../../open-sse/utils/proxyResolution.js";
+import { getEnvProxyUrl, isPrivateHost, resolveConnectionProxyUrl } from "../../open-sse/utils/proxyResolution.js";
+import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 
 const PROXY = "http://127.0.0.1:7890";
 let saved;
@@ -54,6 +55,34 @@ describe("private hosts are not proxied", () => {
   });
 });
 
+describe("regression guard: the fetch path, not just the resolver", () => {
+  it("does not build a proxy dispatcher for a private target", async () => {
+    // 2026-10-28 的真实故障：proxyFetch.js 曾自带一份 getEnvProxyUrl 副本，
+    // 规则只加在 proxyResolution 上，于是 proxyAwareFetch 仍把 LAN peer 交给
+    // 127.0.0.1:7890。这里从调用方入口断言，副本再出现时测试会红。
+    const calls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), dispatcher: init?.dispatcher ?? null });
+      return new Response("ok", { status: 200 });
+    };
+    try {
+      const response = await proxyAwareFetch("http://192.168.1.97:20127/v1/models", { method: "GET" });
+      expect(response.status).toBe(200);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].dispatcher).toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("skips a connection-level proxy for private targets too", () => {
+    const proxyOptions = { connectionProxyEnabled: true, connectionProxyUrl: PROXY };
+    expect(resolveConnectionProxyUrl("http://192.168.1.97:20127/v1", proxyOptions)).toBeNull();
+    expect(resolveConnectionProxyUrl("https://api.github.com/zen", proxyOptions)).toBe(PROXY);
+  });
+});
+
 describe("isPrivateHost covers RFC1918 + loopback only", () => {
   it.each([
     ["192.168.1.97", true],
@@ -65,13 +94,26 @@ describe("isPrivateHost covers RFC1918 + loopback only", () => {
     ["169.254.1.1", true],
     ["::1", true],
     ["fd00::1", true],
+    ["[::1]", true],
+    ["[::ffff:192.168.1.97]", true],  // WHATWG URL normalizes this to ::ffff:c0a8:161
+    ["[::ffff:c0a8:161]", true],
+    ["[fe80::1]", true],
+    ["[fd12:3456::1]", true],
+    ["100.64.0.1", true],             // CGNAT
+    ["0.0.0.0", true],
+    ["metadata.google.internal", true],
   ])("treats %s as private", (host, expected) => {
     expect(isPrivateHost(host)).toBe(expected);
   });
 
   it.each([
     ["172.32.0.5", false],   // one octet past the RFC1918 172.16/12 range
+    ["100.128.0.1", false],  // one octet past CGNAT 100.64/10
     ["8.8.8.8", false],
+    ["10.example.com", false], // 前缀匹配会把公网域名误判成私有（泄漏真实出口 IP）
+    ["127.example.com", false],
+    ["[::ffff:8.8.8.8]", false],
+    ["[2001:4860:4860::8888]", false],
     ["opencode.ai", false],
   ])("treats %s as public", (host, expected) => {
     expect(isPrivateHost(host)).toBe(expected);

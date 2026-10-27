@@ -9,6 +9,7 @@ import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { fetchViaTransport } from "../utils/opencodeTransport.js";
+import { normalizeString } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import {
   resolveEgress,
@@ -284,10 +285,14 @@ function firstUserText(body) {
 // A per-connection fallback session id is not a conversation id. Key fresh
 // conversations by their first user message so distinct chats do not share
 // one upstream session, while retries and later turns of the same chat do.
-function conversationFingerprint(body) {
+function conversationFingerprint(body, clientTool = "") {
   const text = firstUserText(body);
   if (!text) return "";
-  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 24);
+  // 只 hash 首条 user 文本：纳入整段历史会让每一轮都变成新会话。
+  return crypto.createHash("sha256")
+    .update(`${normalizeString(clientTool)}\n${text}`)
+    .digest("hex")
+    .slice(0, 24);
 }
 
 function conversationSessionId(credentials, fingerprint) {
@@ -313,7 +318,7 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   const hinted = incoming || normalizeSession(seed);
   if (hinted) return translateSessionId(hinted, clientTool, egressId, sessionEpoch(credentials, egressId));
 
-  const fingerprint = conversationFingerprint(body);
+  const fingerprint = conversationFingerprint(body, clientTool);
 
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
@@ -458,6 +463,32 @@ function cloneRequestBody(body) {
   }
 }
 
+const ERROR_TEXT_LIMIT = 8 * 1024;
+
+// 503 的错误体可能是 SSE：.text() 会等到流结束才返回，把一次失败拖成分钟级。
+// 合成 503 走 header 判定，真实上游 503 只读前 8KB 就取消。
+async function readResponsePrefixText(response, limit = ERROR_TEXT_LIMIT) {
+  try {
+    const body = response.body;
+    if (!body) return "";
+    const reader = body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (received < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value?.byteLength) {
+        chunks.push(Buffer.from(value));
+        received += value.byteLength;
+      }
+    }
+    try { await reader.cancel(); } catch { }
+    return Buffer.concat(chunks).subarray(0, limit).toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
 async function readResponseText(response) {
   try {
     return await response.clone().text();
@@ -586,7 +617,8 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 换另一条出口透明重试一次。与 429 路径不同，这里**不标记任何冷却**：
     // 503 不是出口限流/信誉证据，标记会误烧正常 IP（INC-008/INC-009）。
     if (result?.response?.status === 503 && retryBody) {
-      const failureText = await result.response.clone().text().catch(() => "");
+      const synthetic = result.response.headers.get("x-transport-error-type") === "synthetic";
+      const failureText = synthetic ? "UpstreamTransportError" : await readResponsePrefixText(result.response.clone());
       if (/UpstreamTransportError/.test(failureText)) {
         const failover = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
         if (failover.alternate) {
@@ -693,7 +725,8 @@ export class OpenCodeExecutor extends BaseExecutor {
   // caller (combo/ASIP) owns egress rotation.
   async computeRetryDelay(response) {
     if (response.status !== 503) return null;
-    const text = await response.clone().text().catch(() => "");
+    if (response.headers.get("x-transport-error-type") === "synthetic") return false;
+    const text = await readResponsePrefixText(response.clone());
     return /UpstreamTransportError/.test(text) ? false : null;
   }
 
@@ -717,7 +750,11 @@ export class OpenCodeExecutor extends BaseExecutor {
       },
     }), {
       status: 503,
-      headers: { "content-type": "application/json", "retry-after": "1" },
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "1",
+        "x-transport-error-type": "synthetic",
+      },
     });
   }
 

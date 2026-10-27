@@ -1,6 +1,13 @@
 const token = process.env.OPENCODE_TRANSPORT_TOKEN || "";
 const port = Number(process.env.OPENCODE_TRANSPORT_PORT || 0);
 
+// 出口只由 payload.proxy 决定。父进程即使没清干净环境变量，这里也不允许
+// Bun 的 fetch 把「直连」偷偷换成 env 里配置的代理。
+for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "http_proxy", "https_proxy", "all_proxy", "no_proxy"]) {
+  delete process.env[name];
+}
+
 function forwardableHeaders(input) {
   const headers = {};
   for (const [key, value] of Object.entries(input || {})) {
@@ -24,8 +31,9 @@ function responseHeaders(input) {
   return headers;
 }
 
-const UPSTREAM_TIMEOUT_MS = 19000; // 19s 上游请求超时，必须小于 9router 的 headerTimeoutMs (20s)，避免 9router 先超时杀 sidecar；留 1s 缓冲给 sidecar 响应
-const CONNECT_TIMEOUT_MS = 8000;   // 8s 连接超时，防止僵死隧道连接卡死
+// 响应头超时由父进程按请求类型下发（payload.timeoutMs）：流式给 19s（小于
+// 9router 的 20s，留 1s 让 sidecar 先回错误），非流式给 0 = 不设限，因为长
+// 生成可能在响应头返回前就超过 19s。
 // Bun 的全局 fetch 池会在隧道静默失效后继续复用半开连接，直到内置 ~5min 上限
 // （oven-sh/bun#31894）；`keepalive:false` 与裸 Connection: close 都拦不住
 // （#14538、#46027）。FetchSession 的 idleTimeout 是唯一有文档的淘汰口：
@@ -77,13 +85,13 @@ const server = Bun.serve({
       headers: forwardableHeaders(payload.headers),
       body: payload.body ?? undefined,
       redirect: "manual",
-      connectTimeout: CONNECT_TIMEOUT_MS,
     };
     options.headers["accept-encoding"] = "identity";
 
     // 添加上游请求超时，防止连接卡死导致 9router 侧超时杀掉 sidecar
+    const timeoutMs = Number(payload.timeoutMs) || 0;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+    const timeoutId = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
     options.signal = controller.signal;
 
     let upstream;
@@ -92,8 +100,11 @@ const server = Bun.serve({
     } catch (error) {
       clearTimeout(timeoutId);
       const msg = String(error?.message || error);
-      // 超时或连接错误返回可重试标记
-      const isTimeout = error?.name === "AbortError" || msg.includes("timeout") || msg.includes("Timeout");
+      // 超时或连接错误返回可重试标记。Bun 的 connectTimeout 抛的是
+      // TimeoutError("The operation timed out.")，既不是 AbortError 也不含
+      // "timeout" 子串——之前落到 502 分支，走的是无节流的 retire()。
+      const isTimeout = error?.name === "AbortError" || error?.name === "TimeoutError"
+        || /timeout|timed out/i.test(msg);
       return Response.json(
         { error: msg, timeout: isTimeout },
         { status: isTimeout ? 504 : 502, headers: { "x-transport-error": "1" } }

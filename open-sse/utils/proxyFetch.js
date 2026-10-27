@@ -4,7 +4,13 @@ import { dbg } from "./debugLog.js";
 import { createProxyDispatcher } from "./proxyDispatcher.js";
 // 单一定义在 proxyResolution：这里曾有一份同名副本，私有地址的绕行规则
 // 只加到了那一份上，于是 LAN peer 继续被推进公共出口池（502 连接超时）。
-import { getEnvProxyUrl } from "./proxyResolution.js";
+import {
+  getEnvProxyUrl,
+  shouldBypassByNoProxy,
+  normalizeProxyUrl,
+  normalizeString,
+  resolveConnectionProxyUrl,
+} from "./proxyResolution.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -130,11 +136,6 @@ const HTTPS_PORT = 443;
 const HTTP_SUCCESS_MIN = 200;
 const HTTP_SUCCESS_MAX = 300;
 
-function normalizeString(value) {
-  if (value === undefined || value === null) return "";
-  return String(value).trim();
-}
-
 /**
  * Resolve real IP using Google DNS (bypass system DNS)
  */
@@ -165,51 +166,6 @@ function shouldBypassMitmDns(url) {
     const hostname = new URL(url).hostname;
     return MITM_BYPASS_HOSTS.some(host => hostname.includes(host));
   } catch { return false; }
-}
-
-function shouldBypassByNoProxy(targetUrl, noProxyValue) {
-  const noProxy = normalizeString(noProxyValue);
-  if (!noProxy) return false;
-
-  let hostname;
-  try { hostname = new URL(targetUrl).hostname.toLowerCase(); } catch { return false; }
-  const patterns = noProxy.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
-
-  return patterns.some((pattern) => {
-    if (pattern === "*") return true;
-    if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
-    return hostname === pattern || hostname.endsWith(`.${pattern}`);
-  });
-}
-
-/**
- * Normalize proxy URL (allow host:port)
- */
-function normalizeProxyUrl(proxyUrl) {
-  const normalizedInput = normalizeString(proxyUrl);
-  if (!normalizedInput) return null;
-
-  try {
-
-    new URL(normalizedInput);
-    return normalizedInput;
-  } catch {
-    // Allow "127.0.0.1:7890" style values
-    return `http://${normalizedInput}`;
-  }
-}
-
-function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
-  const enabled = proxyOptions?.enabled === true || proxyOptions?.connectionProxyEnabled === true;
-  if (!enabled) return null;
-
-  const proxyUrlRaw = normalizeString(proxyOptions?.url ?? proxyOptions?.connectionProxyUrl);
-  if (!proxyUrlRaw) return null;
-
-  const noProxy = normalizeString(proxyOptions?.noProxy ?? proxyOptions?.connectionNoProxy);
-  if (noProxy && shouldBypassByNoProxy(targetUrl, noProxy)) return null;
-
-  return normalizeProxyUrl(proxyUrlRaw);
 }
 
 /**

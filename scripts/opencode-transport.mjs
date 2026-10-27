@@ -112,3 +112,11 @@ const server = Bun.serve({
 });
 
 console.log(`READY ${server.port}`);
+
+// 父进程死了就自我了断。spawn 它的 node 被 SIGKILL 时（systemd 重启、EADDRINUSE
+// 抢端口崩溃）子进程不会跟着走，会被 /init 收养成孤儿，各占一个端口与 ~26MB，
+// 且不再被任何 retire/inflight 逻辑管理。实测一个存活 6+ 分钟。
+const parentPid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== parentPid) process.exit(0);
+}, 2000).unref();

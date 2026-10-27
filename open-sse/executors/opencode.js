@@ -635,6 +635,19 @@ export class OpenCodeExecutor extends BaseExecutor {
           "EGRESS",
           `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
         );
+      } else {
+        // Fixed proxy egresses are never cooled (sing-box rotates the real exit IP
+        // beneath one proxyUrl), so the branch above stays silent for them and the
+        // whole switch path logs nothing. That makes "no alternate exists" read
+        // exactly like "switched and failed" — three pools sharing one proxyUrl
+        // produce that blind spot permanently. Name the condition instead.
+        const configured = Array.isArray(proxyOptions?.connectionProxyAlternates)
+          ? proxyOptions.connectionProxyAlternates.length
+          : 0;
+        log?.warn?.(
+          "EGRESS",
+          `${describeEgress(egress)} 429, no alternate egress (${configured} configured, all excluded as this url or cooling)`
+        );
       }
       return result;
     }

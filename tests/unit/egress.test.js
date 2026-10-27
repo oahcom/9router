@@ -25,6 +25,21 @@ function pool(id, url, extra = {}) {
   };
 }
 
+// Cooldown assertions must use a relay egress: 7debf178 deliberately made fixed
+// proxy egresses un-coolable (sing-box rotates the exit IP under one proxyUrl, so
+// cooling the URL would deadlock the lane after the IP already changed).
+function relay(url, extra = {}) {
+  return {
+    proxyPoolId: null,
+    connectionProxyEnabled: false,
+    connectionProxyUrl: "",
+    connectionNoProxy: "",
+    vercelRelayUrl: url,
+    strictProxy: false,
+    ...extra,
+  };
+}
+
 let savedEnv;
 
 beforeEach(() => {
@@ -116,7 +131,7 @@ describe("egress identity", () => {
 
 describe("egress cooldowns", () => {
   it("records and expires a cooldown for a confirmed egress", () => {
-    const egress = identifyFixedEgress(TARGET, pool("a", "http://proxy.example:8080"));
+    const egress = identifyFixedEgress(TARGET, relay("https://relay.example/"));
     const entry = markEgressCooling(egress, 120_000);
 
     expect(entry.retryAfterMs).toBe(120_000);
@@ -125,10 +140,18 @@ describe("egress cooldowns", () => {
   });
 
   it("clamps cooldowns to the configured bounds", () => {
-    const egress = identifyFixedEgress(TARGET, pool("a", "http://proxy.example:8080"));
+    const egress = identifyFixedEgress(TARGET, relay("https://relay.example/"));
 
     expect(markEgressCooling(egress, 1).retryAfterMs).toBeGreaterThanOrEqual(1000);
     expect(markEgressCooling(egress, 10 * 24 * 60 * 60 * 1000).retryAfterMs).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("never cools a fixed proxy egress", () => {
+    // sing-box rotates the real exit IP beneath one proxyUrl, so a proxy-level
+    // cooldown would outlive the IP it was meant to punish and deadlock the lane.
+    const proxy = identifyFixedEgress(TARGET, pool("a", "http://proxy.example:8080"));
+    expect(markEgressCooling(proxy, 120_000)).toBeNull();
+    expect(getEgressCooldown(proxy)).toBeNull();
   });
 
   it("never cools an unconfirmed direct egress", () => {
@@ -145,9 +168,9 @@ describe("egress cooldowns", () => {
 
 describe("alternate egress selection", () => {
   it("skips the current egress and cooling alternates, and clears stale aliases", () => {
-    const current = pool("a", "http://proxy-a.example:8080");
-    const b = pool("b", "http://proxy-b.example:8080");
-    const c = pool("c", "http://proxy-c.example:8080");
+    const current = relay("https://relay-a.example/");
+    const b = relay("https://relay-b.example/");
+    const c = relay("https://relay-c.example/");
     const proxyOptions = { ...current, connectionProxyAlternates: [b, c] };
 
     const idA = identifyFixedEgress(TARGET, current).id;
@@ -157,14 +180,33 @@ describe("alternate egress selection", () => {
 
     const selection = selectAlternateProxy(proxyOptions, TARGET, new Set([idA]));
     expect(selection.alternate?.egress.id).toBe(identifyFixedEgress(TARGET, c).id);
-    expect(selection.alternate?.proxyOptions.url).toBe("http://proxy-c.example:8080");
-    expect(selection.alternate?.proxyOptions.connectionProxyUrl).toBe("http://proxy-c.example:8080");
-    expect(selection.alternate?.proxyOptions.vercelRelayUrl).toBe("");
+    expect(selection.alternate?.proxyOptions.vercelRelayUrl).toBe("https://relay-c.example/");
 
     markEgressCooling(identifyFixedEgress(TARGET, c), 1_000);
     const allCooling = selectAlternateProxy(proxyOptions, TARGET, new Set([idA, idB]));
     expect(allCooling.alternate).toBeNull();
     expect(allCooling.earliestCooldownMs).toBeGreaterThan(0);
+  });
+
+  it("treats pools sharing one proxyUrl as a single physical egress", () => {
+    // Three active pools all point at the same sing-box mixed listener, so a
+    // "switch" between them changes nothing upstream. They must not alternate.
+    const current = pool("a", "http://127.0.0.1:7890");
+    const b = pool("b", "http://127.0.0.1:7890");
+    const c = pool("c", "http://127.0.0.1:7890");
+    const proxyOptions = { ...current, connectionProxyAlternates: [b, c] };
+
+    const selection = selectAlternateProxy(
+      proxyOptions, TARGET, new Set([identifyFixedEgress(TARGET, current).id]));
+
+    expect(selection.alternate).toBeNull();
+
+    // A pool on a genuinely different url is still a valid alternate.
+    const other = pool("d", "http://127.0.0.1:7000");
+    const withOther = { ...current, connectionProxyAlternates: [b, other] };
+    const picked = selectAlternateProxy(
+      withOther, TARGET, new Set([identifyFixedEgress(TARGET, current).id]));
+    expect(picked.alternate?.egress.proxyUrl).toBe("http://127.0.0.1:7000");
   });
 
   it("replaces every proxy alias when switching from a relay to a standard pool", () => {
@@ -175,7 +217,6 @@ describe("alternate egress selection", () => {
       vercelRelayUrl: "https://old-relay.example",
       connectionProxyEnabled: false,
     }, pool("b", "http://new-proxy.example:8080"));
-
     expect(merged.url).toBe("http://new-proxy.example:8080");
     expect(merged.connectionProxyUrl).toBe("http://new-proxy.example:8080");
     expect(merged.noProxy).toBe("");

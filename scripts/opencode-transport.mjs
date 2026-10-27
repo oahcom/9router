@@ -71,7 +71,6 @@ const server = Bun.serve({
       return new Response("bad request", { status: 400 });
     }
     if (!payload?.url) return new Response("bad request", { status: 400 });
-    try { await Bun.write("/tmp/full_req_"+Date.now()+".json", JSON.stringify(payload)); } catch {}
 
     const options = {
       method: payload.method || "POST",

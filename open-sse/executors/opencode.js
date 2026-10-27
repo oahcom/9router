@@ -9,7 +9,7 @@ import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { fetchViaTransport } from "../utils/opencodeTransport.js";
-import { normalizeString } from "../utils/proxyResolution.js";
+import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import {
   resolveEgress,
@@ -735,6 +735,27 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
       return proxyAwareFetch(url, options, proxyOptions);
+    }
+    // 结构性不支持（socks5 等 Bun 无法承载的出口）与"sidecar 暂时不可用"是
+    // 两件事：前者重试一万次也是同一个结果，必须快速失败且不带 retry-after，
+    // 否则每条请求都要等一次 19s 超时 + 一次重启。
+    const configuredProxy = resolveEffectiveProxyUrl(url, proxyOptions).url;
+    if (configuredProxy && !/^https?:\/\//i.test(configuredProxy)) {
+      const scheme = configuredProxy.split(":")[0];
+      console.warn(`[OpenCode] ${scheme} 出口不受 Bun 传输支持；请改用 http(s) 代理或设置 OPENCODE_TRANSPORT=off`);
+      return new Response(JSON.stringify({
+        type: "error",
+        error: {
+          type: "UpstreamTransportError",
+          message: `OpenCode lane does not support ${scheme} proxies; use an http(s) proxy or OPENCODE_TRANSPORT=off.`,
+        },
+      }), {
+        status: 503,
+        headers: {
+          "content-type": "application/json",
+          "x-transport-error-type": "unsupported-proxy",
+        },
+      });
     }
     // Never downgrade to Node here. OpenCode fingerprints the client TLS/HTTP
     // stack: Bun (the sidecar) is served, while Node/undici is answered with a

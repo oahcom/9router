@@ -221,6 +221,11 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
 
   const target = typeof url === "string" ? url : url.toString();
   const { url: proxyUrl } = resolveEffectiveProxyUrl(target, proxyOptions);
+  // Bun 1.4.4 的 FetchSession 只接受 http(s) 代理：给 socks5:// 会抛
+  // TypeError UnsupportedProxyProtocol（2026-10-28 实测，http 目标会被当成
+  // 直连所以旧测试没暴露）。这里返回 null 让调用方给出"配置不支持"的明确
+  // 结果，而不是让它进 attempt 循环把 19s 超时重放两遍。
+  if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return null;
   const streamBody = typeof options.body === "string" && /"stream"\s*:\s*true/.test(options.body);
   const headerTimeoutMs = streamBody ? OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs : 0;
 

@@ -224,9 +224,24 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
       }, options.signal, headerTimeoutMs);
       if (response.headers.get("x-transport-error") === "1") {
         const detail = await response.text().catch(() => "");
+        // sidecar 自己在 19s 处中止并回 504（timeout:true）：语义等同
+        // forward 的 headerTimeout，必须走同一套 30s 冷却。否则每条撞上死
+        // 出口的请求都会 retire 一次 sidecar，退化成 spawn 风暴。
+        let upstreamTimeout = false;
+        try { upstreamTimeout = JSON.parse(detail)?.timeout === true; } catch { }
         console.warn(
-          `[OpenCodeTransport] upstream fetch failed (attempt ${attempt + 1}/2): ${detail.slice(0, 300)}`
+          `[OpenCodeTransport] upstream fetch failed (attempt ${attempt + 1}/2)${upstreamTimeout ? " [timeout]" : ""}: ${detail.slice(0, 300)}`
         );
+        if (upstreamTimeout) {
+          if (attempt === 0 && Date.now() - lastResetAt >= 30000) {
+            lastResetAt = Date.now();
+            console.warn("[OpenCodeTransport] sidecar reported upstream timeout; restarting sidecar to drop stale socket");
+            retire();
+            continue;
+          }
+          console.warn("[OpenCodeTransport] sidecar reported upstream timeout; reset throttled, fail fast");
+          return null;
+        }
         if (attempt === 0) {
           retire();
           continue;

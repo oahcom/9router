@@ -24,6 +24,32 @@ function responseHeaders(input) {
   return headers;
 }
 
+const UPSTREAM_TIMEOUT_MS = 19000; // 19s 上游请求超时，必须小于 9router 的 headerTimeoutMs (20s)，避免 9router 先超时杀 sidecar；留 1s 缓冲给 sidecar 响应
+const CONNECT_TIMEOUT_MS = 8000;   // 8s 连接超时，防止僵死隧道连接卡死
+// Bun 的全局 fetch 池会在隧道静默失效后继续复用半开连接，直到内置 ~5min 上限
+// （oven-sh/bun#31894）；`keepalive:false` 与裸 Connection: close 都拦不住
+// （#14538、#46027）。FetchSession 的 idleTimeout 是唯一有文档的淘汰口：
+// 10s 后未用的 socket 被丢弃，下一次请求重建，僵尸池最多影响 10s。
+const SESSION_IDLE_TIMEOUT_SEC = 10;
+const SESSION_MAX_IDLE_SOCKETS = 8;
+const sessions = new Map();
+
+function sessionFor(proxy) {
+  const key = proxy || "direct";
+  let session = sessions.get(key);
+  if (!session) {
+    session = new Bun.FetchSession({
+      ...(proxy ? { proxy } : {}),
+      keepAlive: {
+        idleTimeout: SESSION_IDLE_TIMEOUT_SEC,
+        maxIdleSockets: SESSION_MAX_IDLE_SOCKETS,
+      },
+    });
+    sessions.set(key, session);
+  }
+  return session;
+}
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
@@ -45,24 +71,36 @@ const server = Bun.serve({
       return new Response("bad request", { status: 400 });
     }
     if (!payload?.url) return new Response("bad request", { status: 400 });
+    try { await Bun.write("/tmp/full_req_"+Date.now()+".json", JSON.stringify(payload)); } catch {}
 
     const options = {
       method: payload.method || "POST",
       headers: forwardableHeaders(payload.headers),
       body: payload.body ?? undefined,
       redirect: "manual",
+      connectTimeout: CONNECT_TIMEOUT_MS,
     };
     options.headers["accept-encoding"] = "identity";
-    if (payload.proxy) options.proxy = payload.proxy;
+
+    // 添加上游请求超时，防止连接卡死导致 9router 侧超时杀掉 sidecar
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+    options.signal = controller.signal;
 
     let upstream;
     try {
-      upstream = await fetch(payload.url, options);
+      upstream = await sessionFor(payload.proxy).fetch(payload.url, options);
     } catch (error) {
+      clearTimeout(timeoutId);
+      const msg = String(error?.message || error);
+      // 超时或连接错误返回可重试标记
+      const isTimeout = error?.name === "AbortError" || msg.includes("timeout") || msg.includes("Timeout");
       return Response.json(
-        { error: String(error?.message || error) },
-        { status: 502, headers: { "x-transport-error": "1" } }
+        { error: msg, timeout: isTimeout },
+        { status: isTimeout ? 504 : 502, headers: { "x-transport-error": "1" } }
       );
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     return new Response(upstream.body, {

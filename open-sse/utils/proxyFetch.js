@@ -2,6 +2,9 @@ import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
 import { createProxyDispatcher } from "./proxyDispatcher.js";
+// 单一定义在 proxyResolution：这里曾有一份同名副本，私有地址的绕行规则
+// 只加到了那一份上，于是 LAN peer 继续被推进公共出口池（502 连接超时）。
+import { getEnvProxyUrl } from "./proxyResolution.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -177,25 +180,6 @@ function shouldBypassByNoProxy(targetUrl, noProxyValue) {
     if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
     return hostname === pattern || hostname.endsWith(`.${pattern}`);
   });
-}
-
-/**
- * Get proxy URL from environment
- */
-function getEnvProxyUrl(targetUrl) {
-  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
-  if (shouldBypassByNoProxy(targetUrl, noProxy)) return null;
-
-  let protocol;
-  try { protocol = new URL(targetUrl).protocol; } catch { return null; }
-
-  if (protocol === "https:") {
-    return process.env.HTTPS_PROXY || process.env.https_proxy ||
-      process.env.ALL_PROXY || process.env.all_proxy;
-  }
-
-  return process.env.HTTP_PROXY || process.env.http_proxy ||
-    process.env.ALL_PROXY || process.env.all_proxy;
 }
 
 /**

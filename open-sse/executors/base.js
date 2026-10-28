@@ -97,6 +97,12 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
+  // 出口可以按协议换：默认走 proxyAwareFetch，子类（opencode）覆盖它去接 Bun
+  // sidecar / wreq-js。上游 ce060c79 只加了 directFetch 形参，方法本体在我们这边。
+  fetchUpstream(url, options, proxyOptions = null) {
+    return proxyAwareFetch(url, options, proxyOptions);
+  }
+
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null, directFetch = null }) {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;

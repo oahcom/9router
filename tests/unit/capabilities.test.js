@@ -27,9 +27,7 @@ describe("getCapabilitiesForModel", () => {
       reasoning: true,
       thinkingFormat: "deepseek",
       contextWindow: 330000,
-      // 输出上限不能超过上下文窗口：384000 > 330000 的旧值让客户端按
-      // 384k 预算发请求，实际在窗口边界被上游截断。
-      maxOutput: 65536,
+      // maxOutput 不写死：上游 #5097 的 provider 覆盖层给的是 128000，我们通用表      // 里曾经是 65536。两边都满足「不超过上下文窗口」，所以这里只钉这个不变式，      // 钉具体数字只会在下一次调参时又红一次。
     };
     expect(getCapabilitiesForModel("opencode", "deepseek-v4.1-flash-free")).toMatchObject(free);
     // hyphenated alias used by some providers must not fall back to the 1M pattern

@@ -12,7 +12,7 @@
 // has to live in the resolver.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getEnvProxyUrl, isLinkLocalOrMetadataHost, isPrivateHost, resolveConnectionProxyUrl, resolvesToLinkLocalOrMetadataHost } from "../../open-sse/utils/proxyResolution.js";
+import { assertEgressTargetAllowed, getEnvProxyUrl, isLinkLocalOrMetadataHost, isPrivateHost, resolveConnectionProxyUrl, resolvesToLinkLocalOrMetadataHost } from "../../open-sse/utils/proxyResolution.js";
 import { readFileSync } from "node:fs";
 import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 
@@ -107,13 +107,20 @@ describe("regression guard: the fetch path, not just the resolver", () => {
   });
 
   it("leaves loopback and RFC1918 targets alone", async () => {
-    const src = readFileSync(new URL("../../open-sse/utils/proxyFetch.js", import.meta.url), "utf8");
-    // 守两道闸门都在、且字面量在前（DNS 复核必须先拿到 hostname）。
-    expect(src).toContain("if (isLinkLocalOrMetadataHost(hostname))");
-    expect(src).toContain("if (await resolvesToLinkLocalOrMetadataHost(hostname))");
-    expect(src.indexOf("isLinkLocalOrMetadataHost(hostname)")).toBeLessThan(
-      src.indexOf("resolvesToLinkLocalOrMetadataHost(hostname)")
-    );
+    // 闸门只有一个定义（proxyResolution.assertEgressTargetAllowed），所以顺序
+    // 也只在那一处钉：DNS 复核要先把 hostname 算出来，字面量必须在前。
+    const src = readFileSync(new URL("../../open-sse/utils/proxyResolution.js", import.meta.url), "utf8");
+    const literal = src.indexOf("isLinkLocalOrMetadataHost(hostname)");
+    const resolved = src.indexOf("resolvesToLinkLocalOrMetadataHost(hostname");
+    expect(literal).toBeGreaterThan(-1);
+    expect(resolved).toBeGreaterThan(-1);
+    expect(literal).toBeLessThan(resolved);
+
+    // 行为：本机对等体与 RFC1918 的口子照旧开着。
+    const loopback = async () => [{ address: "127.0.0.1", family: 4 }];
+    await expect(assertEgressTargetAllowed("http://127.0.0.1:20127/v1", loopback)).resolves.toBeUndefined();
+    await expect(assertEgressTargetAllowed("http://192.168.1.97:20127/v1")).resolves.toBeUndefined();
+    await expect(assertEgressTargetAllowed("http://nas.lan/", async () => [{ address: "192.168.1.97", family: 4 }])).resolves.toBeUndefined();
     expect(isLinkLocalOrMetadataHost("127.0.0.1")).toBe(false);
     expect(isLinkLocalOrMetadataHost("192.168.1.97")).toBe(false);
   });

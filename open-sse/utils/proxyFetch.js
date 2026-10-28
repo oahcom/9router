@@ -6,12 +6,11 @@ import { createProxyDispatcher } from "./proxyDispatcher.js";
 // 只加到了那一份上，于是 LAN peer 继续被推进公共出口池（502 连接超时）。
 import {
   getEnvProxyUrl,
-  isLinkLocalOrMetadataHost,
+  assertEgressTargetAllowed,
   shouldBypassByNoProxy,
   normalizeProxyUrl,
   normalizeString,
   resolveConnectionProxyUrl,
-  resolvesToLinkLocalOrMetadataHost,
 } from "./proxyResolution.js";
 
 const originalFetch = globalThis.fetch;
@@ -332,14 +331,6 @@ async function replayFreeTierRejectionDirect(url, options, proxied) {
   }
 }
 
-function hostnameOf(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return "";
-  }
-}
-
 function targetHost(url) {
   try {
     return new URL(typeof url === "string" ? url : url.toString()).host;
@@ -360,13 +351,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   // / `100.100.100.200.nip.io` 这类域名一个字都不匹配，实测拿到 200 SECRET-METADATA。
   // 解析到 loopback / RFC1918 的名字照旧放行——与字面量同行为，边界见
   // proxyResolution.js 里 resolvesToLinkLocalOrMetadataHost 的注释。
-  const hostname = hostnameOf(targetUrl);
-  if (isLinkLocalOrMetadataHost(hostname)) {
-    throw new Error(`[ProxyFetch] refused link-local/metadata target: ${targetHost(targetUrl)}`);
-  }
-  if (await resolvesToLinkLocalOrMetadataHost(hostname)) {
-    throw new Error(`[ProxyFetch] refused host resolving to link-local/metadata: ${targetHost(targetUrl)}`);
-  }
+  await assertEgressTargetAllowed(targetUrl);
 
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);

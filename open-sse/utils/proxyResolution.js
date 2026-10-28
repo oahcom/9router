@@ -277,3 +277,30 @@ export function resolveEffectiveProxyUrl(targetUrl, proxyOptions = null) {
 
   return { url: null, source: "direct" };
 }
+
+
+// 出口闸的单一实现。两个真正发请求的路口都必须过这一道：
+//   - proxyFetch.proxyAwareFetch（undici / node 侧）
+//   - opencodeTransport.fetchViaTransport（Bun sidecar 侧）
+// 只装在其中一个等于没装：OPENCODE_TRANSPORT=auto 时 executor 先问 sidecar，
+// proxyAwareFetch 根本不会被调用，panel 把 baseUrl 指到 169.254.169.254
+// （或解析到它的域名）照样读得到。
+//
+// 解析不出主机名的目标直接拒 —— 闸不能因为看不懂就放行。
+export async function assertEgressTargetAllowed(url, lookupImpl) {
+  let hostname = "";
+  let host = String(url);
+  try {
+    const parsed = new URL(String(url));
+    hostname = parsed.hostname;
+    host = parsed.host;
+  } catch {
+    throw new Error(`[EgressGuard] refused unparseable target; ${host}`);
+  }
+  if (isLinkLocalOrMetadataHost(hostname)) {
+    throw new Error(`[EgressGuard] refused link-local/metadata target; ${host}`);
+  }
+  if (await resolvesToLinkLocalOrMetadataHost(hostname, lookupImpl)) {
+    throw new Error(`[EgressGuard] refused host resolving to link-local/metadata; ${host}`);
+  }
+}

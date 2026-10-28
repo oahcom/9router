@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { Readable } from "node:stream";
 import path from "node:path";
 import { OPENCODE_TRANSPORT_CONFIG } from "../config/runtimeConfig.js";
-import { normalizeString, resolveEffectiveProxyUrl } from "./proxyResolution.js";
+import { assertEgressTargetAllowed, normalizeString, resolveEffectiveProxyUrl } from "./proxyResolution.js";
 
 const TRANSPORT_PATH = "/forward";
 const SIDECAR = path.join("scripts", "opencode-transport.mjs");
@@ -215,6 +215,9 @@ function forward(transport, payload, signal, headerTimeoutMs = 0) {
 }
 
 export async function fetchViaTransport(url, options = {}, proxyOptions = null) {
+  // 闸在 available() 之前：能不能发请求是配置问题，许不许发给这个目标不是。
+  // 只装在 proxyFetch 里等于没装 —— auto 模式下 executor 先问 sidecar。
+  await assertEgressTargetAllowed(typeof url === "string" ? url : url.toString());
   if (!available()) return null;
   if (normalizeString(proxyOptions?.vercelRelayUrl)) return null;
   if (typeof options.body !== "string" || !options.body) return null;

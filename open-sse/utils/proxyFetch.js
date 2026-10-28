@@ -344,8 +344,10 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   // 再连一次，于是 169.254.169.254 反而变得可读（探测器日志见报告 §0）。
   // 这类地址只有本机可达，路由没有正当用途，直接报错最快也最明确。
   //
-  // 字面量检查之后必须再复核 DNS：闸门看的是 hostname 字符串，`127.0.0.1.nip.io`
-  // / `169.254.169.254.nip.io` 这类域名一个字都不匹配，实测拿到 200 SECRET-METADATA。
+  // 字面量检查之后必须再复核 DNS：闸门看的是 hostname 字符串，`169.254.169.254.nip.io`
+  // / `100.100.100.200.nip.io` 这类域名一个字都不匹配，实测拿到 200 SECRET-METADATA。
+  // 解析到 loopback / RFC1918 的名字照旧放行——与字面量同行为，边界见
+  // proxyResolution.js 里 resolvesToLinkLocalOrMetadataHost 的注释。
   const hostname = hostnameOf(targetUrl);
   if (isLinkLocalOrMetadataHost(hostname)) {
     throw new Error(`[ProxyFetch] refused link-local/metadata target: ${targetHost(targetUrl)}`);

@@ -257,6 +257,16 @@ describe("hostnames that resolve to metadata are refused", () => {
     expect(await resolvesToLinkLocalOrMetadataHost("peer.example", lookup)).toBe(false);
   });
 
+  // 边界记录：解析到 loopback 的通配域名与字面量 127.0.0.1 行为必须一致（都放行）。
+  // 2026-10-28 复核按提交注释里的旧例子复现出 200，判定为「漏 loopback」——
+  // 实际是刻意边界（拒它等于新增一条字面量不存在的规则，攻击者写 127.0.0.1 即绕过）。
+  // 锚在这里，防同一个问题被再开一次单。
+  it("treats a wildcard-DNS name pointing at loopback exactly like the literal", async () => {
+    const lookup = fakeLookup({ "127.0.0.1.nip.io": [{ address: "127.0.0.1" }] });
+    expect(await resolvesToLinkLocalOrMetadataHost("127.0.0.1.nip.io", lookup)).toBe(false);
+    expect(isLinkLocalOrMetadataHost("127.0.0.1")).toBe(false);
+  });
+
   // 解析失败不等于安全结论，也不能把请求打死：原错误路径照常走。
   it("treats an unresolvable name as not-metadata", async () => {
     const lookup = fakeLookup({});

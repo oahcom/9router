@@ -130,3 +130,10 @@ node_modules/
 /model-catalog-raw.json
 /.next.stale-*/
 /build-*.log
+
+# Generated on first run with mode 0600 — never belongs in git.
+# jwt-secret signs the dashboard session cookie; cli-secret is the salt for the
+# x-9r-cli-token derivation (sha256(machine-id + '9r-cli-auth' + cli-secret)).
+jwt-secret
+auth/cli-secret
+machine-id

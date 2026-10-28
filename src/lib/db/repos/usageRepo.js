@@ -696,7 +696,20 @@ export async function getUsageStats(period = "all") {
   // 就是原始 key，各条聚合路径也曾经这么写，所以这里再统一过一遍。
   const sanitizedApiKeyBuckets = {};
   for (const [bucketKey, bucketValue] of Object.entries(stats.byApiKey || {})) {
-    sanitizedApiKeyBuckets[sanitizeByApiKeyKey(bucketKey)] = bucketValue;
+    const safeBucketKey = sanitizeByApiKeyKey(bucketKey);
+    const existing = sanitizedApiKeyBuckets[safeBucketKey];
+    if (!existing) {
+      sanitizedApiKeyBuckets[safeBucketKey] = bucketValue;
+      continue;
+    }
+    // 同一个 key 会同时有「历史桶（原始 key 当键）」和「新桶（哈希当键）」：
+    // 归一之后撞在一起就得相加，不能覆盖 —— 覆盖等于把今天一半的量吃掉。
+    existing.requests = (existing.requests || 0) + (bucketValue.requests || 0);
+    existing.promptTokens = (existing.promptTokens || 0) + (bucketValue.promptTokens || 0);
+    existing.completionTokens = (existing.completionTokens || 0) + (bucketValue.completionTokens || 0);
+    existing.cachedTokens = (existing.cachedTokens || 0) + (bucketValue.cachedTokens || 0);
+    existing.cost = (existing.cost || 0) + (bucketValue.cost || 0);
+    if (String(bucketValue.lastUsed || "") > String(existing.lastUsed || "")) existing.lastUsed = bucketValue.lastUsed;
   }
   stats.byApiKey = sanitizedApiKeyBuckets;
 

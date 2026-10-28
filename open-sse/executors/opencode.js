@@ -26,6 +26,7 @@ import {
 const MAX_LOCAL_COOLDOWN_MS = 60_000;
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import { rotateEgress } from "../utils/asipRotate.js";
+import { classifyRotateReason } from "../utils/egressClassify.js";
 import { clearProxyDispatchers } from "../utils/proxyFetch.js";
 import {
   normalizeResponsesInput,
@@ -567,14 +568,13 @@ export class OpenCodeExecutor extends BaseExecutor {
     const upstreamStatus = result.response.status;
     if (upstreamStatus !== 429 && upstreamStatus !== 403) return result;
 
-    // 只有「按出口 IP 判定」的两类才值得换出口：403 abusive traffic 与配额类 429。
-    // 其余 403 是 FreeTierError（请求指纹/请求形状被拒），换 IP 无效，白换一次还会
-    // 把另一条线拖进惩罚期。判据与 daemon 的 _classify_egress_error 保持一致。
-    let rotateReason = upstreamStatus === 429 ? "rate429" : null;
-    if (upstreamStatus === 403) {
-      const peek = (await readResponseText(result.response));
-      if (/abusive traffic/i.test(peek)) rotateReason = "abuse403";
-    }
+    // 判据在 egressClassify.js 里（纯函数，单测覆盖）：429 一律换；403 只有
+    // abusive traffic 才换。FreeTierError 是请求指纹被拒，换 IP 无效。
+    // 403 才需要读正文 —— 429 不必为分类克隆一次响应体。
+    const rotateReason = classifyRotateReason(
+      upstreamStatus,
+      upstreamStatus === 403 ? await readResponseText(result.response) : ""
+    );
     if (!rotateReason) return result;
 
     // asip sync rotate: 9router 的两个 proxy pool 内容完全相同（都指向 127.0.0.1:7890），

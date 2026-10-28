@@ -698,6 +698,9 @@ export class OpenCodeExecutor extends BaseExecutor {
     const retryBody = hasAlternateEgresses(proxyOptions) ? cloneRequestBody(args.body) : null;
 
     let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
+    // 这条响应实际来自哪条出口：503 failover 会把 result 换成另一条出口的结果，
+    // 所以下面那句诊断日志要跟着 attempt 走，不能拿第一条出口的对象去猜。
+    let attemptEgress = egress;
 
     // 传输层悬挂（出口隧道中途重连 → 无首字节 → 上层超时合成为 503）时，
     // 换另一条出口透明重试一次。与 429 路径不同，这里**不标记任何冷却**：
@@ -723,6 +726,7 @@ export class OpenCodeExecutor extends BaseExecutor {
             credentials: failoverCredentials,
             proxyOptions: failover.alternate.proxyOptions,
           });
+          attemptEgress = failover.alternate.egress;
         }
       }
     }
@@ -746,10 +750,12 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 主机把流量交给 sing-box（TUN）时有效，纯粹本机直出时无效。两种情况都可能，
     // 所以这里不跳过重试，只补一句说明 —— 免得日志把「重试后还是 429」说成
     // 「换了出口就好了」，让人去追一个不存在的因果。
-    if (!resolveEffectiveProxyUrl(targetUrl, proxyOptions).url) {
+    // 路径用 egress.kind 判（direct/proxy/relay 三态，resolveEgress 已经算好），
+    // 不拿 resolveEffectiveProxyUrl 的空值去猜：它不认识 vercel relay。
+    if (attemptEgress?.kind === "direct") {
       log?.warn?.(
         "EGRESS",
-        `${upstreamStatus} on a direct egress (${rotateReason}); rotation only helps when the host routes through sing-box`
+        `${upstreamStatus} on ${describeEgress(attemptEgress)} (${rotateReason}); rotation only helps when the host routes through sing-box`
       );
     }
     if (retryBody || typeof args.body === "string") {

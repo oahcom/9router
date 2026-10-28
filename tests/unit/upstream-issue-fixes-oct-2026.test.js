@@ -135,7 +135,9 @@ describe("Upstream open issue fixes (Oct 2026)", () => {
       body: { messages: [] },
     });
 
-    const reader = source.pipeThrough(stream).getReader();
+    // createSSEStream returns a Web TransformStream; a Node Readable has no
+    // pipeThrough, so bridge it first.
+    const reader = Readable.toWeb(source).pipeThrough(stream).getReader();
     const allChunks = [];
     while (true) {
       const { done, value } = await reader.read();

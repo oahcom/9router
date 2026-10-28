@@ -35,3 +35,23 @@ tests/unit/mimo-free.live.test.js :: MiMo Free anti-abuse gate (live) chat WITH 
 # which is not part of this repository.
 tests/unit/db-benchmark.test.js :: <suite failed to load>
 tests/unit/embeddings.cloud.test.js :: <suite failed to load>
+
+# Upstream test file (39de422c on zeusire/master) that asserts five behaviors the code
+# does not implement yet. Kept red rather than deleted so a future merge does not
+# silently re-add it. Remove an entry once the behavior lands.
+#   #5139 applyJsonSchemaFallback gates on provider.startsWith("openai-compatible-"),
+#         so the registered "deepseek" provider never reaches it.
+#   #5125 getContentBlocksFromMessage returns role:tool content verbatim and never
+#         translates image_url parts inside a tool result.
+#   #5108 deepseek resolves to thinkingFormat "openai", which rewrites an explicit
+#         budget_tokens into reasoning_effort and drops the budget.
+#   #5126 detectRequiredCapabilities only scans the trailing user turn, so an image in
+#         function_call_output is invisible; openaiResponsesToOpenAIRequest flattens it.
+#   #5137 ollamaBodyToOpenAI reads only body.message.content, not the /api/generate
+#         shape's body.response. (#5149 was a test bug — fixed to bridge Readable via
+#         Readable.toWeb, the stream itself preserves the usage details correctly.)
+tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5139: DeepSeek executor converts response_format json_schema to json_object + system schema instruction
+tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5125: openaiToClaudeRequest converts image_url inside role:tool messages to Claude image blocks
+tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5108: applyThinking preserves explicit budget_tokens on deepseek thinkingFormat
+tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5126: detectRequiredCapabilities and openaiResponsesToOpenAIRequest handle images inside function_call_output
+tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5137: ollamaBodyToOpenAI handles body.response when message.content is missing

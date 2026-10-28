@@ -1,7 +1,10 @@
 import { resolveOllamaLocalHost } from "../../config/providers.js";
+import { PROVIDER_MEDIA } from "../../providers/index.js";
 import { responseToBase64, throwUpstreamError } from "./_base.js";
 
-const DEFAULT_MODEL = "phonon:multilingual";
+// 默认模型只认 registry 里那一处；这里只是它缺失时的兜底（phonon:multilingual 是
+// 带音色的那个 tag，裸 phonon 会被 Ollama 解析成 phonon:latest）。
+const DEFAULT_MODEL = PROVIDER_MEDIA["ollama-local"]?.ttsConfig?.defaultModel || "phonon:multilingual";
 const DEFAULT_VOICE = "default";
 
 export default {

@@ -41,7 +41,8 @@ export async function synthesizeViaConfig(provider, text, model, credentials) {
   if (cfg.authType !== "none" && !apiKey) throw new Error(`${provider} API key required`);
   const { PROVIDER_MODELS } = await import("open-sse/config/providerModels.js");
   const ttsModels = (PROVIDER_MODELS[provider] || []).filter(m => (m.kind || m.type) === "tts");
-  // ttsConfig.defaultModel 是唯一声明的默认值；models[0] 只是它缺失时的兜底。
+  // 仅通用路径：ttsConfig.defaultModel 优先，models[0] 只是它缺失时的兜底。
+  // （有 special adapter 的 provider 走 adapter 自己那一层，不经过这里。）
   const defaultModel = cfg.defaultModel || ttsModels[0]?.id || "";
   const { modelId, voiceId } = parseModelVoice(model, defaultModel, "", ttsModels);
   return handler({ baseUrl: cfg.baseUrl, apiKey, text, modelId, voiceId });

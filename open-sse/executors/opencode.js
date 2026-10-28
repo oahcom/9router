@@ -9,7 +9,7 @@ import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { fetchViaTransport } from "../utils/opencodeTransport.js";
-import { opencodeTlsFetch, OpencodeTlsUnavailableError } from "../services/opencodeTlsClient.js";
+import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { rotateEgress } from "../utils/asipRotate.js";
@@ -126,10 +126,6 @@ export function generateSessionId(timestamp = Date.now()) {
 // one session across turns instead of getting a fresh one every request.
 const translatedOpencodeSessions = new Map();
 const MAX_TRANSLATED_SESSIONS = 1000;
-
-// proxyAwareFetch 只在「没有 proxyUrl」时才走 directFetch，所以 env 代理也要算进来，
-// 否则 TLS 兜底会静默退回 undici（那条路的 429 和真配额耗尽分不出来）。
-const ENV_PROXY_KEYS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
 
 function syntheticTransportError(message, { retryable = true } = {}) {
   const headers = { "content-type": "application/json" };
@@ -605,7 +601,8 @@ export class OpenCodeExecutor extends BaseExecutor {
   // undici's OpenSSL ClientHello is answered with a quota-shaped 429. So the lane
   // always prefers the sidecar; when the sidecar is down and no proxy is
   // configured, OPENCODE_TLS_FALLBACK=on lets wreq-js send the same cipher list.
-  // Otherwise we answer a retryable 503 — never a silent undici downgrade.
+  // Otherwise we answer a retryable 503. 配了代理（含 vercel relay）时这条兜底不
+  // 参与：proxyAwareFetch 会先走代理/relay，那是调用方明确选的路。
   async execute(args) {
     const { model, stream, credentials, log } = args;
     let proxyOptions = args.proxyOptions || null;
@@ -880,11 +877,19 @@ export class OpenCodeExecutor extends BaseExecutor {
     // for ASIP to rotate the IP.
     // 上游 ce060c79：undici 的 OpenSSL ClientHello 会被拒成 quota 形状的 429，
     // 但 wreq-js 送同一份 cipher 列表能过。所以 sidecar 不可用、又没有配代理时，
-    // 这里退到它（要 OPENCODE_TLS_FALLBACK=1 才开）；没装 wreq-js 就照旧回可重试的 503。
-    // 环境变量代理（http_proxy 之类）也算「配了代理」：proxyAwareFetch 只在没有
-    // proxyUrl 时才用 directFetch，带着 env 代理进来会静默退回 undici。
-    const envProxy = ENV_PROXY_KEYS.some((key) => Boolean(process.env[key]));
-    if (!configuredProxy && !envProxy && TLS_FALLBACK_ENABLED) {
+    // 这里退到它（要 OPENCODE_TLS_FALLBACK=on 才开）；没装 wreq-js 就回可重试的 503。
+    // 代理判据只认 configuredProxy（= 连接代理 || 环境变量代理，NO_PROXY 已经算过），
+    // 不自己再读一遍 process.env —— 那会在 NO_PROXY 放行时把能直连的路挡掉。
+    if (!configuredProxy && TLS_FALLBACK_ENABLED) {
+      // wreq 的 timeout 是整请求超时（含正文），而 sidecar 只卡响应头。流式请求
+      // 一旦超过它会在流中间被 abort，所以只在非流式请求上传这个上限。
+      const streamingRequest = (() => {
+        try {
+          return JSON.parse(options.body || "{}").stream === true;
+        } catch {
+          return false;
+        }
+      })();
       try {
         return await proxyAwareFetch(url, {
           ...options,
@@ -892,12 +897,18 @@ export class OpenCodeExecutor extends BaseExecutor {
             opencodeTlsFetch(
               target,
               { method: init.method, headers: init.headers, body: init.body },
-              { signal: init.signal, timeoutMs: OPENCODE_TRANSPORT_CONFIG.tlsTimeoutMs },
+              {
+                signal: init.signal,
+                timeoutMs: streamingRequest ? undefined : OPENCODE_TRANSPORT_CONFIG.tlsTimeoutMs,
+              },
             ),
         }, proxyOptions);
       } catch (error) {
-        // 契约：fetchUpstream 永远回 Response。把异常抛给 base.execute 会被当成
-        // 网络错误走 502 重试，和 sidecar 路径的 503 synthetic 对不上。
+        // 客户端自己断了要原样往上抛：base.execute 靠 AbortError 区分取消和
+        // 连接超时，吞成 503 会让下游带着已 abort 的 signal 再打一次上游。
+        if (error?.name === "AbortError") throw error;
+        // 其余（wreq 不可用 / 真传输失败）回可重试的 503 synthetic，和 sidecar
+        // 路径同一个契约：fetchUpstream 永远回 Response，不抛给 base.execute。
         console.warn("[OpenCode] TLS fallback failed (" + error.message + "); answering a retryable 503");
         return syntheticTransportError("OpenCode free lane: TLS fallback failed; sidecar unavailable.");
       }

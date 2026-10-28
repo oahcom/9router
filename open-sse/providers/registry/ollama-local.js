@@ -169,7 +169,7 @@ export default {
   ttsConfig: {
     baseUrl: "http://localhost:11434/v1/audio/speech",
     path: "/v1/audio/speech",
-    defaultModel: "phonon",
+    defaultModel: "phonon:multilingual",
     authType: "apikey",
     format: "openai",
   },

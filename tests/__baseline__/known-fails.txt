@@ -47,11 +47,8 @@ tests/unit/combo-autoswitch.test.js :: reorderByCapabilities keeps order when no
 #   #5137 ollamaBodyToOpenAI reads body.message.content only. body.response belongs to
 #         /api/generate; this provider's transport is /api/chat, so it never arrives.
 #
+#   (#5125 已随 v0.5.111 落地：上游 95009651 把 role:"tool" 里的 image_url 提成 Claude 图片块。)
 # Real gaps (the test is right; remove the entry once the behavior lands):
-#   #5125 getContentBlocksFromMessage passes role:tool content through verbatim, so an
-#         image_url inside a tool result is dropped. The reverse direction
-#         (claude-to-openai.js:199) already lifts tool-result images into the next user
-#         turn — this side has no equivalent.
 #   #5126 two separate gaps. detectRequiredCapabilities reads it.content for Responses
 #         items, but function_call_output carries its parts in `output`, so images in a
 #         tool output are invisible to combo capability routing. Independently,
@@ -60,7 +57,6 @@ tests/unit/combo-autoswitch.test.js :: reorderByCapabilities keeps order when no
 # (#5149 was a test bug — bridged via Readable.toWeb; the stream already preserves the
 #  usage details correctly.)
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5139: DeepSeek executor converts response_format json_schema to json_object + system schema instruction
-tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5125: openaiToClaudeRequest converts image_url inside role:tool messages to Claude image blocks
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5108: applyThinking preserves explicit budget_tokens on deepseek thinkingFormat
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5126: detectRequiredCapabilities and openaiResponsesToOpenAIRequest handle images inside function_call_output
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5137: ollamaBodyToOpenAI handles body.response when message.content is missing

@@ -13,7 +13,9 @@
 //    attempt. When no proxy URL resolves there is nothing to try, so it
 //    reaches the trailing `return originalFetch(url, options)` and connects
 //    directly.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// 这台机器的 shell 里带着 http_proxy 一类的变量时，getEnvProxyUrl 会把它当成// 「配了代理」，strictProxy 于是有了可尝试的路径 —— 用例的前提「没有代理可试」// 就不成立，断言会拿 /strictProxy/ 去配一条「Proxy required but failed」的错。// 所以每条用例前先清掉，跑完原样还原。const PROXY_ENV_KEYS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];const savedProxyEnv = new Map();beforeEach(() => {  savedProxyEnv.clear();  for (const key of PROXY_ENV_KEYS) {    savedProxyEnv.set(key, process.env[key]);    delete process.env[key];  }});afterEach(() => {  for (const [key, value] of savedProxyEnv) {    if (value === undefined) delete process.env[key];    else process.env[key] = value;  }});
 
 vi.mock("@/models", () => ({
   getProxyPoolById: vi.fn(),
@@ -57,13 +59,13 @@ describe("strict pool keeps strictProxy when the pool is unusable (#4333)", () =
 describe("strictProxy refuses a direct connection (#4333)", () => {
   it("throws when a pool is assigned but no proxy url resolved", async () => {
     await expect(
-      proxyAwareFetch("https://api.example.com/v1/chat", {}, { proxyPoolId: "p1", strictProxy: true }),
+      proxyAwareFetch("http://127.0.0.1:1/v1/chat", {}, { proxyPoolId: "p1", strictProxy: true }),
     ).rejects.toThrow(/strictProxy/);
   });
 
   it("throws when the pool is enabled but carries an empty url", async () => {
     await expect(
-      proxyAwareFetch("https://api.example.com/v1/chat", {}, { enabled: true, url: "", strictProxy: true }),
+      proxyAwareFetch("http://127.0.0.1:1/v1/chat", {}, { enabled: true, url: "", strictProxy: true }),
     ).rejects.toThrow(/strictProxy/);
   });
 
@@ -72,7 +74,7 @@ describe("strictProxy refuses a direct connection (#4333)", () => {
     // request directly if the proxy fails" — a replayed COSY signature gets a
     // 403. With nothing configured it must still reach the network.
     await expect(
-      proxyAwareFetch("https://nonexistent.invalid/v1/chat", {}, { strictProxy: true }),
+      proxyAwareFetch("http://127.0.0.1:1/v1/chat", {}, { strictProxy: true }),
     ).rejects.not.toThrow(/strictProxy/);
   });
 
@@ -81,7 +83,7 @@ describe("strictProxy refuses a direct connection (#4333)", () => {
     // It fails on DNS here, which is fine — what matters is that the refusal
     // is NOT the strictProxy guard.
     await expect(
-      proxyAwareFetch("https://nonexistent.invalid/v1/chat", {}, { strictProxy: false }),
+      proxyAwareFetch("http://127.0.0.1:1/v1/chat", {}, { strictProxy: false }),
     ).rejects.not.toThrow(/strictProxy/);
   });
 });

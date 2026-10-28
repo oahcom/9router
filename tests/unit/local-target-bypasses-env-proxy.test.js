@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { getEnvProxyUrl, isLinkLocalOrMetadataHost, isPrivateHost, resolveConnectionProxyUrl } from "../../open-sse/utils/proxyResolution.js";
 import { readFileSync } from "node:fs";
+import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 
 const PROXY = "http://127.0.0.1:7890";
 let saved;
@@ -90,6 +91,26 @@ describe("regression guard: the fetch path, not just the resolver", () => {
       expect(resolveConnectionProxyUrl(target, proxyOptions)).toBe(PROXY);
       expect(getEnvProxyUrl(target)).toBe(PROXY);
     }
+  });
+
+  // 代理失败后 proxyFetch 会 `falling back to direct`（2026-10-28 在 aihub 连接上
+  // 把 baseUrl 指到 169.254.169.254 实测到该日志）。所以这类目标不能只靠
+  // 「保留代理」，必须在入口拒绝，否则一次失败重试就把元数据读出来了。
+  it.each([
+    "http://169.254.169.254/latest/meta-data/",
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://[fe80::1]/",
+  ])("refuses %s without attempting a direct fetch", async (target) => {
+    const started = Date.now();
+    await expect(proxyAwareFetch(target, { method: "GET" })).rejects.toThrow(/refused link-local\/metadata/);
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  it("leaves loopback and RFC1918 targets alone", async () => {
+    const src = readFileSync(new URL("../../open-sse/utils/proxyFetch.js", import.meta.url), "utf8");
+    expect(src).toContain("isLinkLocalOrMetadataHost(hostnameOf(targetUrl))");
+    expect(isLinkLocalOrMetadataHost("127.0.0.1")).toBe(false);
+    expect(isLinkLocalOrMetadataHost("192.168.1.97")).toBe(false);
   });
 
   it("still sends plain private peers direct when no connection proxy is set", () => {

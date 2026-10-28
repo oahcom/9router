@@ -6,6 +6,7 @@ import { createProxyDispatcher } from "./proxyDispatcher.js";
 // 只加到了那一份上，于是 LAN peer 继续被推进公共出口池（502 连接超时）。
 import {
   getEnvProxyUrl,
+  isLinkLocalOrMetadataHost,
   shouldBypassByNoProxy,
   normalizeProxyUrl,
   normalizeString,
@@ -318,6 +319,14 @@ async function replayFreeTierRejectionDirect(url, options, proxied) {
   }
 }
 
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
 function targetHost(url) {
   try {
     return new URL(typeof url === "string" ? url : url.toString()).host;
@@ -328,6 +337,14 @@ function targetHost(url) {
 
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
+
+  // 链路本地/元数据端点一律拒绝，不代理也不直连。
+  // 2026-10-28 实测：把它们交给代理后，下面的 catch 会 `falling back to direct`
+  // 再连一次，于是 169.254.169.254 反而变得可读（探测器日志见报告 §0）。
+  // 这类地址只有本机可达，路由没有正当用途，直接报错最快也最明确。
+  if (isLinkLocalOrMetadataHost(hostnameOf(targetUrl))) {
+    throw new Error(`[ProxyFetch] refused link-local/metadata target: ${targetHost(targetUrl)}`);
+  }
 
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);

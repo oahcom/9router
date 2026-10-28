@@ -27,11 +27,17 @@ describe("getCapabilitiesForModel", () => {
       reasoning: true,
       thinkingFormat: "deepseek",
       contextWindow: 330000,
-      maxOutput: 384000,
+      // 输出上限不能超过上下文窗口：384000 > 330000 的旧值让客户端按
+      // 384k 预算发请求，实际在窗口边界被上游截断。
+      maxOutput: 65536,
     };
     expect(getCapabilitiesForModel("opencode", "deepseek-v4.1-flash-free")).toMatchObject(free);
     // hyphenated alias used by some providers must not fall back to the 1M pattern
     expect(getCapabilitiesForModel("opencode", "deepseek-v4-1-flash-free")).toMatchObject(free);
+    for (const id of ["deepseek-v4.1-flash-free", "deepseek-v4-1-flash-free"]) {
+      const caps = getCapabilitiesForModel("opencode", id);
+      expect(caps.maxOutput).toBeLessThanOrEqual(caps.contextWindow);
+    }
     // the paid lane keeps 1M — the cap is a property of the free backend only
     expect(getCapabilitiesForModel("opencode-go", "deepseek-v4.1-flash").contextWindow).toBe(1000000);
     // provider path form (oc/) must resolve to the same capped entry

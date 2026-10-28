@@ -32,15 +32,21 @@ function spawnCount() {
 }
 
 describe("OpenCode transport upstream-timeout cooldown", () => {
-  it("treats a sidecar 504 timeout like a header timeout: one retry, then 30s cooldown", async () => {
+  it("fails fast on a sidecar 504 timeout without retrying the same egress", async () => {
     const body = JSON.stringify({ stream: true, messages: [] });
     const first = await transport.fetchViaTransport("https://upstream.invalid/v1/chat/completions", { body, headers: {} }, null);
     expect(first).toBeNull();
-    const afterFirst = spawnCount();
-    expect(afterFirst).toBe(2);
+    // 超时后 retire 一次、请求直接交回上层换出口；同一出口不再重试，
+    // 所以只 spawn 过一次（旧实现会 attempt 1 复用同出口，把 20s 拖成 40s）。
+    expect(spawnCount()).toBe(1);
 
     const second = await transport.fetchViaTransport("https://upstream.invalid/v1/chat/completions", { body, headers: {} }, null);
     expect(second).toBeNull();
-    expect(spawnCount()).toBe(afterFirst);
+    // 30s 冷却内允许开新 sidecar（清僵死 socket），但不允许再次 retire 造成 spawn 风暴。
+    expect(spawnCount()).toBe(2);
+
+    const third = await transport.fetchViaTransport("https://upstream.invalid/v1/chat/completions", { body, headers: {} }, null);
+    expect(third).toBeNull();
+    expect(spawnCount()).toBe(2);
   }, 15000);
 });

@@ -13,7 +13,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { getEnvProxyUrl, isPrivateHost, resolveConnectionProxyUrl } from "../../open-sse/utils/proxyResolution.js";
-import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
+import { readFileSync } from "node:fs";
 
 const PROXY = "http://127.0.0.1:7890";
 let saved;
@@ -56,24 +56,19 @@ describe("private hosts are not proxied", () => {
 });
 
 describe("regression guard: the fetch path, not just the resolver", () => {
-  it("does not build a proxy dispatcher for a private target", async () => {
-    // 2026-10-28 的真实故障：proxyFetch.js 曾自带一份 getEnvProxyUrl 副本，
-    // 规则只加在 proxyResolution 上，于是 proxyAwareFetch 仍把 LAN peer 交给
-    // 127.0.0.1:7890。这里从调用方入口断言，副本再出现时测试会红。
-    const calls = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (url, init) => {
-      calls.push({ url: String(url), dispatcher: init?.dispatcher ?? null });
-      return new Response("ok", { status: 200 });
-    };
-    try {
-      const response = await proxyAwareFetch("http://192.168.1.97:20127/v1/models", { method: "GET" });
-      expect(response.status).toBe(200);
-      expect(calls).toHaveLength(1);
-      expect(calls[0].dispatcher).toBeNull();
-    } finally {
-      globalThis.fetch = originalFetch;
+  // 2026-10-28 的真实故障：proxyFetch.js 曾自带一份 getEnvProxyUrl 副本，规则只
+  // 加在 proxyResolution 上，于是 proxyAwareFetch 仍把 LAN peer 交给 127.0.0.1:7890。
+  // proxyFetch 在模块加载时捕获 globalThis.fetch，无法用替换 fetch 观测调用路径，
+  // 所以直接守住"副本不得复活"这个不变量。
+  it("keeps a single definition of the proxy-rule helpers", () => {
+    const source = readFileSync(
+      new URL("../../open-sse/utils/proxyFetch.js", import.meta.url),
+      "utf8"
+    );
+    for (const helper of ["getEnvProxyUrl", "shouldBypassByNoProxy", "normalizeProxyUrl", "resolveConnectionProxyUrl"]) {
+      expect(source).not.toMatch(new RegExp(`function\\s+${helper}\\s*\\(`));
     }
+    expect(source).toContain('from "./proxyResolution.js"');
   });
 
   it("skips a connection-level proxy for private targets too", () => {

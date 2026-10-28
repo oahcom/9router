@@ -139,15 +139,6 @@ function syntheticTransportError(message) {
   }), { status: 503, headers });
 }
 
-// 这条车道只有流式（transformRequest 无条件把 body.stream 置 true），而 wreq 的
-// timeout 是整请求超时、到点会把流拦腰 abort —— 所以这条兜底不设 timeout，
-// 终止只靠调用方的 signal（客户端断开）。
-const tlsDirectFetch = (target, init) =>
-  opencodeTlsFetch(
-    target,
-    { method: init.method, headers: init.headers, body: init.body },
-    { signal: init.signal, timeoutMs: null },
-  );
 
 // 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
@@ -753,12 +744,11 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 切完必须丢掉复用连接，否则重试走的还是旧隧道。
     // wreq 兜底是从本机 IP 直出的：切 sing-box 选择器、丢 undici dispatcher 都改不了
     // 它，重试一次只会白烧一次请求，日志还会说「换了出口」把人带偏。
-    const onTlsFallbackPath =
-      TLS_FALLBACK_ENABLED && !resolveEffectiveProxyUrl(targetUrl, proxyOptions).url;
+    const onTlsFallbackPath = proxyOptions?.tlsFallbackUsed === true;
     if (onTlsFallbackPath) {
       log?.warn?.(
         "EGRESS",
-        `{upstreamStatus} on the wreq fallback path ({rotateReason}) — egress rotation cannot change the host IP; not retrying`
+        `${upstreamStatus} on the wreq fallback path (${rotateReason}) — egress rotation cannot change the host IP; not retrying`
       );
     } else if (retryBody || typeof args.body === "string") {
       const asip = await rotateEgress(rotateReason);
@@ -867,6 +857,20 @@ export class OpenCodeExecutor extends BaseExecutor {
 
   /** 兜底出口：把 wreq 的 ClientHello 递给 proxyAwareFetch 的 directFetch。 */
   async fetchViaTlsFallback(url, options, proxyOptions = null) {
+    // 这条车道只有流式（transformRequest 无条件把 body.stream 置 true），而 wreq 的
+    // timeout 是整请求超时、到点会把流拦腰 abort —— 所以这条兜底不设 timeout，
+    // 终止只靠调用方的 signal（客户端断开）。
+    //
+    // 顺便在「钩子真的被调用」时记一笔：429 分支据此决定不再换出口重试（切 sing-box
+    // 改不了本机 IP）。票据挂在本次请求自己的 proxyOptions 上，并发安全。
+    const tlsDirectFetch = (target, init) => {
+      if (proxyOptions && typeof proxyOptions === "object") proxyOptions.tlsFallbackUsed = true;
+      return opencodeTlsFetch(
+        target,
+        { method: init.method, headers: init.headers, body: init.body },
+        { signal: init.signal, timeoutMs: null },
+      );
+    };
     try {
       return await proxyAwareFetch(url, { ...options, directFetch: tlsDirectFetch }, proxyOptions);
     } catch (error) {

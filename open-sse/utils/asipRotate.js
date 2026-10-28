@@ -99,6 +99,4 @@ export async function rotateEgress(reason = "rate429") {
   };
 }
 
-export async function readAsipState() {
-  return callAsip("/debug/state", null);
 }

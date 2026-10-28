@@ -171,3 +171,51 @@ describe("isPrivateHost covers RFC1918 + loopback only", () => {
     expect(isLinkLocalOrMetadataHost(host)).toBe(expected);
   });
 });
+
+// 2026-10-28 reviewer P1：上面 45 条用例覆盖的形状恰好等于实现支持的范围，
+// 所以全绿不能证明「元数据端点已全部堵住」。缺的正是云厂商实际公布的那几个地址。
+// 判据是「是否被拒绝」，不是「是否被归为 private」——四类里前三类在 isPrivateHost
+// 眼里本来就是 private，走的是直连分支，从来没经过代理。
+describe("cloud metadata endpoints outside 169.254/16", () => {
+  // 100.64/10 内，但整段不能拒：同段还有 tailnet 与 CGNAT 对等体。
+  it.each([
+    "100.100.100.200", // Aliyun
+    "168.63.129.16", // Azure WireServer / IMDS
+    "192.0.0.192", // Oracle Cloud
+  ])("refuses %s", (host) => {
+    expect(isLinkLocalOrMetadataHost(host)).toBe(true);
+  });
+
+  // fc00::/7 内，同样只拒这一个：fd00::1 是普通局域网 IPv6。
+  it("refuses fd00:ec2::254 but keeps other ULA addresses direct", () => {
+    expect(isLinkLocalOrMetadataHost("[fd00:ec2::254]")).toBe(true);
+    expect(isLinkLocalOrMetadataHost("[fd00::1]")).toBe(false);
+  });
+
+  // `.internal` 整后缀不能拒：本仓自己的服务就用它（huggingface 适配器 fixture 是 tgi.internal）。
+  it.each([
+    ["metadata.azure.internal", true],
+    ["instance-data.internal", true],
+    ["instance-data.ec2.internal", true],
+    ["tgi.internal", false],
+  ])("classifies %s as metadata=%s", (host, expected) => {
+    expect(isLinkLocalOrMetadataHost(host)).toBe(expected);
+  });
+
+  // 段与名字都没放宽的旁证：CGNAT / ULA 里随便挑的地址仍是直连，不算被拒。
+  it.each(["100.64.0.1", "100.127.255.254", "[fd12:3456::1]"])("keeps %s direct", (host) => {
+    expect(isLinkLocalOrMetadataHost(host)).toBe(false);
+  });
+
+  // 拒绝必须发生在发出任何请求之前（否则一次代理失败回落直连就把它读出来了）。
+  it.each([
+    "http://100.100.100.200/latest/meta-data/",
+    "http://[fd00:ec2::254]/latest/meta-data/",
+    "http://metadata.azure.internal/metadata/instance",
+    "http://instance-data.internal/latest/meta-data/",
+    "http://192.0.0.192/opc/v2/instance/",
+    "http://168.63.129.16/machine?comp=acisettings",
+  ])("refuses %s without attempting a direct fetch", async (target) => {
+    await expect(proxyAwareFetch(target, { method: "GET" })).rejects.toThrow(/refused link-local\/metadata/);
+  });
+});

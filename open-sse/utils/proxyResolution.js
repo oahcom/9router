@@ -38,6 +38,23 @@ const PRIVATE_HOSTNAMES = new Set(["localhost", "ip6-localhost", "ip6-loopback",
 // public host can never end in it.
 const PRIVATE_HOST_SUFFIXES = [".localhost", ".local", ".lan", ".internal", ".home.arpa"];
 
+// 云元数据端点里，有几个地址无法靠「段」与普通内网对等体区分开：
+// 100.64/10 同时是 tailnet 与 CGNAT，fc00::/7 同时是局域网 IPv6，`.internal`
+// 是本机自己服务在用的后缀（本仓 test fixture 就有 tgi.internal）。
+// 整段拒绝会为了堵四个名字而掐断真实出口，所以按 provider 公布的**具体地址**列出。
+const METADATA_V4_HOSTS = [
+  "100.100.100.200", // Aliyun
+  "168.63.129.16", // Azure WireServer / IMDS 虚拟 IP
+  "192.0.0.192", // Oracle Cloud
+].map(ipv4ToInt);
+const METADATA_V6_HOSTS = new Set(["fd00:ec2::254"]); // AWS IMDS over IPv6
+const METADATA_HOSTNAMES = new Set([
+  "metadata.google.internal",
+  "metadata.azure.internal",
+  "instance-data.internal",
+  "instance-data.ec2.internal",
+]);
+
 const PRIVATE_V4_RANGES = [
   ["0.0.0.0", 8],
   ["10.0.0.0", 8],
@@ -97,10 +114,16 @@ function canonicalHost(hostname) {
 export function isLinkLocalOrMetadataHost(hostname) {
   const host = canonicalHost(hostname);
   if (!host) return false;
-  if (host === "metadata.google.internal") return true;
+  if (METADATA_HOSTNAMES.has(host)) return true;
   const v4 = ipv4ToInt(host) ?? mappedV4ToInt(host);
-  if (v4 !== null) return (v4 & 0xffff0000) >>> 0 === ipv4ToInt("169.254.0.0");
+  if (v4 !== null) {
+    return (v4 & 0xffff0000) >>> 0 === ipv4ToInt("169.254.0.0") || METADATA_V4_HOSTS.includes(v4);
+  }
   if (!host.includes(":")) return false;
+  // ponytail: 按字面比，不写 IPv6 展开器 —— 生产上唯一调用方传的是
+  // new URL(...).hostname，WHATWG 已把 fd00:0ec2:0::254 规约成 fd00:ec2::254。
+  // 若要接第三方传的非规约字符串，再补一个 hextet 展开。
+  if (METADATA_V6_HOSTS.has(host)) return true;
   const first = parseInt(host.split(":")[0] || "0", 16);
   return Number.isFinite(first) && (first & 0xffc0) === 0xfe80;
 }

@@ -20,8 +20,13 @@ import {
   syntheticRateLimitResponse,
   describeEgress,
   DIRECT_EGRESS_ID,
+  resetEgressState,
 } from "../utils/egress.js";
+
+const MAX_LOCAL_COOLDOWN_MS = 60_000;
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { rotateEgress } from "../utils/asipRotate.js";
+import { clearProxyDispatchers } from "../utils/proxyFetch.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -507,10 +512,41 @@ export class OpenCodeExecutor extends BaseExecutor {
         proxyOptions = selection.alternate.proxyOptions;
         egress = selection.alternate.egress;
       } else {
-        const retryAfterMs = Math.min(cooldown.retryAfterMs, selection.earliestCooldownMs ?? Infinity);
+        // 本地拒绝之前先换一次出口。9router 的两个 proxy pool 内容完全相同
+        // （都指向 127.0.0.1:7890），selectAlternateProxy 永远返回 null，这里
+        // 一旦拒绝就是「回带 retry-after 数十小时」的死锁 —— 后续请求全被本地
+        // 拦掉，根本走不到下面 429 重试分支。实测这就是服务不可用的直接原因。
+        const rotated = await rotateEgress("rate429");
+        // 判据不能只看 switched：no_warm_standby / too_frequent 时 asip 没换线，
+        // 但冷却已经过期、请求本来也发不出去，重试一次成本极低，而放弃必然 429。
+        // 唯一不该重试的是接口不可用（asip 没在跑），那种情况重试也是白重试。
+        const rotateHappened = rotated.reason !== "unavailable";
+        if (rotateHappened) {
+          clearProxyDispatchers();
+          resetEgressState();
+          log?.warn?.(
+            "EGRESS",
+            "asip rotated (" + rotated.reason + ") before local 429 -> retry on fresh egress"
+          );
+          const retryPrepared = this.prepareRequestCredentials({ ...args, egressId: "asip-rotated" });
+          const retried = await super.execute({
+            ...args,
+            credentials: retryPrepared,
+            proxyOptions,
+          });
+          if (retried?.response && retried.response.status !== 429) return retried;
+        }
+        // upstream 的 retry-after 可能是数万秒（实测见过 34842s = 9.7 小时）。
+        // 原样透传等于一次 429 就把服务锁死大半天，这才是服务不可用的直接原因。
+        // 封顶 60s：宁可让调用方多试几次，也不要静默挂死。
+        const retryAfterMs = Math.min(
+          cooldown.retryAfterMs,
+          selection.earliestCooldownMs ?? Infinity,
+          MAX_LOCAL_COOLDOWN_MS
+        );
         log?.warn?.(
           "EGRESS",
-          `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s; no alternate — local 429`
+          `${describeEgress(egress)} cooling ${Math.ceil(retryAfterMs / 1000)}s; no alternate — local 429`
         );
         return {
           response: syntheticRateLimitResponse(retryAfterMs),
@@ -522,11 +558,47 @@ export class OpenCodeExecutor extends BaseExecutor {
     }
 
     const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
+    const requestStartedAt = Date.now();
     const retryBody = hasAlternateEgresses(proxyOptions) ? cloneRequestBody(args.body) : null;
 
     let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
 
-    if (!result?.response || result.response.status !== 429) return result;
+    if (!result?.response) return result;
+    const upstreamStatus = result.response.status;
+    if (upstreamStatus !== 429 && upstreamStatus !== 403) return result;
+
+    // 只有「按出口 IP 判定」的两类才值得换出口：403 abusive traffic 与配额类 429。
+    // 其余 403 是 FreeTierError（请求指纹/请求形状被拒），换 IP 无效，白换一次还会
+    // 把另一条线拖进惩罚期。判据与 daemon 的 _classify_egress_error 保持一致。
+    let rotateReason = upstreamStatus === 429 ? "rate429" : null;
+    if (upstreamStatus === 403) {
+      const peek = (await readResponseText(result.response));
+      if (/abusive traffic/i.test(peek)) rotateReason = "abuse403";
+    }
+    if (!rotateReason) return result;
+
+    // asip sync rotate: 9router 的两个 proxy pool 内容完全相同（都指向 127.0.0.1:7890），
+    // selectAlternateProxy 换不出任何东西，这里的 429 只能靠 asip 切 sing-box 选择器解决。
+    // 切完必须丢掉复用连接，否则重试走的还是旧隧道。
+    if (retryBody || typeof args.body === "string") {
+      const asip = await rotateEgress(rotateReason);
+      if (asip.switchedAt >= requestStartedAt) {
+        clearProxyDispatchers();
+        log?.warn?.("EGRESS", "asip rotated egress (" + asip.reason + ") -> retry once on fresh connection");
+        const rotatedResult = await super.execute({
+          ...args,
+          credentials: prepared,
+          proxyOptions,
+          ...(retryBody ? { body: retryBody } : {}),
+        });
+        if (rotatedResult?.response
+            && rotatedResult.response.status !== 429
+            && !(upstreamStatus === 403 && rotatedResult.response.status === 403)) {
+          return rotatedResult;
+        }
+        result = rotatedResult ?? result;
+      }
+    }
 
     const bodyText = await readResponseText(result.response);
     const retryAfterMs = parseRetryAfterMs(result.response.headers, bodyText);

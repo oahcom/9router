@@ -183,6 +183,18 @@ async function getDispatcher(proxyUrl, insecure = false) {
   return proxyDispatchers.get(key);
 }
 
+
+/**
+ * 丢弃所有缓存的代理 dispatcher。
+ *
+ * WHY 需要：undici 的 ProxyAgent 会复用 TCP 连接，而「换出口」在 sing-box 那边
+ * 只改变选择器指向 —— 已有连接仍拴在旧隧道上。不丢缓存的话，切完再重试等于
+ * 拿新选择器走旧连接，429 照旧。代价是下一次请求要重建连接（几毫秒）。
+ */
+export function clearProxyDispatchers() {
+  proxyDispatchers.clear();
+}
+
 async function fetchWithTlsFallback(url, options, proxyUrl) {
   try {
     // Protocol adapters may need Node's HTTP/1 transport on the direct path.

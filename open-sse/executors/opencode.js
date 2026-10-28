@@ -25,6 +25,9 @@ function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
     return;
   }
   const suffix = state.suppressed > 0 ? ` (+${state.suppressed} suppressed)` : "";
+  if (!noAlternateLogState.has(key) && noAlternateLogState.size >= 64) {
+    noAlternateLogState.delete(noAlternateLogState.keys().next().value);
+  }
   noAlternateLogState.set(key, { at: now, suppressed: 0 });
   log?.warn?.(
     "EGRESS",

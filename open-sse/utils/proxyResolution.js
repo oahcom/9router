@@ -87,6 +87,24 @@ function canonicalHost(hostname) {
   return host;
 }
 
+// Link-local (169.254.0.0/16, fe80::/10) and cloud metadata names are reachable
+// only from the machine that owns them, so a configured proxy was already the
+// right answer for them. Treating them as "private ⇒ direct" would turn the
+// connection proxy setting into an SSRF path to 169.254.169.254: the panel can
+// point a connection's baseUrl anywhere, and before this split that request
+// rode the proxy and died. 192.168.x.x/10.x stay direct — those are the peers
+// this rule exists for.
+export function isLinkLocalOrMetadataHost(hostname) {
+  const host = canonicalHost(hostname);
+  if (!host) return false;
+  if (host === "metadata.google.internal") return true;
+  const v4 = ipv4ToInt(host) ?? mappedV4ToInt(host);
+  if (v4 !== null) return (v4 & 0xffff0000) >>> 0 === ipv4ToInt("169.254.0.0");
+  if (!host.includes(":")) return false;
+  const first = parseInt(host.split(":")[0] || "0", 16);
+  return Number.isFinite(first) && (first & 0xffc0) === 0xfe80;
+}
+
 export function isPrivateHost(hostname) {
   const host = canonicalHost(hostname);
   if (!host) return false;
@@ -121,7 +139,7 @@ export function getEnvProxyUrl(targetUrl) {
     protocol = parsed.protocol;
     hostname = parsed.hostname;
   } catch { return null; }
-  if (isPrivateHost(hostname)) return null;
+  if (isPrivateHost(hostname) && !isLinkLocalOrMetadataHost(hostname)) return null;
 
   if (protocol === "https:") {
     return process.env.HTTPS_PROXY || process.env.https_proxy ||
@@ -155,8 +173,11 @@ export function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
   if (noProxy && shouldBypassByNoProxy(targetUrl, noProxy)) return null;
 
   // 连接级代理与 env 代理同罪：把 LAN peer 交给远端出口必然不可达。
+  // 例外是链路本地/元数据端点（见 isLinkLocalOrMetadataHost）：它们本来就
+  // 只能靠代理挡住，直连等于把面板配置变成 SSRF。
   try {
-    if (isPrivateHost(new URL(targetUrl).hostname)) return null;
+    const host = new URL(targetUrl).hostname;
+    if (isPrivateHost(host) && !isLinkLocalOrMetadataHost(host)) return null;
   } catch { /* 非 URL 目标交给调用方处理 */ }
 
   return normalizeProxyUrl(proxyUrlRaw);

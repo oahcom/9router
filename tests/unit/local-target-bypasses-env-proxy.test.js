@@ -12,7 +12,7 @@
 // has to live in the resolver.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getEnvProxyUrl, isPrivateHost, resolveConnectionProxyUrl } from "../../open-sse/utils/proxyResolution.js";
+import { getEnvProxyUrl, isLinkLocalOrMetadataHost, isPrivateHost, resolveConnectionProxyUrl } from "../../open-sse/utils/proxyResolution.js";
 import { readFileSync } from "node:fs";
 
 const PROXY = "http://127.0.0.1:7890";
@@ -76,6 +76,28 @@ describe("regression guard: the fetch path, not just the resolver", () => {
     expect(resolveConnectionProxyUrl("http://192.168.1.97:20127/v1", proxyOptions)).toBeNull();
     expect(resolveConnectionProxyUrl("https://api.github.com/zen", proxyOptions)).toBe(PROXY);
   });
+
+  // 链路本地/元数据端点反过来：它们只能靠代理挡住。把面板里可自由填写的
+  // baseUrl 指向 169.254.169.254 时，直连就是一台无鉴权的云元数据读取器。
+  it("keeps link-local and metadata targets on the proxy", () => {
+    const proxyOptions = { connectionProxyEnabled: true, connectionProxyUrl: PROXY };
+    for (const target of [
+      "http://169.254.169.254/latest/meta-data/",
+      "http://metadata.google.internal/computeMetadata/v1/",
+      "http://[fe80::1]/",
+      "http://[::ffff:169.254.169.254]/",
+    ]) {
+      expect(resolveConnectionProxyUrl(target, proxyOptions)).toBe(PROXY);
+      expect(getEnvProxyUrl(target)).toBe(PROXY);
+    }
+  });
+
+  it("still sends plain private peers direct when no connection proxy is set", () => {
+    for (const target of ["http://192.168.1.97:20127/v1", "http://10.0.0.5/", "http://nas.lan/"]) {
+      expect(getEnvProxyUrl(target)).toBeNull();
+      expect(resolveConnectionProxyUrl(target, {})).toBeNull();
+    }
+  });
 });
 
 describe("isPrivateHost covers RFC1918 + loopback only", () => {
@@ -113,5 +135,18 @@ describe("isPrivateHost covers RFC1918 + loopback only", () => {
     ["opencode.ai", false],
   ])("treats %s as public", (host, expected) => {
     expect(isPrivateHost(host)).toBe(expected);
+  });
+
+  it.each([
+    ["169.254.169.254", true],
+    ["[::ffff:169.254.169.254]", true],
+    ["[fe80::1]", true],
+    ["metadata.google.internal", true],
+    ["192.168.1.97", false],
+    ["10.0.0.5", false],
+    ["127.0.0.1", false],
+    ["[fd00::1]", false],
+  ])("classifies %s as link-local/metadata=%s", (host, expected) => {
+    expect(isLinkLocalOrMetadataHost(host)).toBe(expected);
   });
 });

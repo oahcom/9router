@@ -12,7 +12,12 @@ const SOCKET_PATH =
   process.env.ASIP_SOCKET || "/home/administrator/auto-swicth-ip/run/rotate.sock";
 const TOKEN_PATH =
   process.env.ASIP_TOKEN_FILE || "/home/administrator/auto-swicth-ip/run/api-token";
-const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 1500);
+// 2000ms，不是随手取的上限：实测 10 次换线 min 774 / p50 1090 / p90 1314 /
+// max 1374 ms（16 条 WG 线 + 3 条 usque，探测器同时在跑）。800ms 会砍掉一半
+// 正常换线，1500ms 对 1374 的尾巴只剩 9% 余量。超时还有额外代价：请求被销毁，
+// 但 asip 那边的换线不会停，于是客户端在旧隧道上重试、出口却已经换了。
+// 宁可多等一次，也不要这种「换了但没等」的错位。
+const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 2000);
 
 let lastToken = null;
 

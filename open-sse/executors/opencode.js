@@ -841,7 +841,7 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     log?.warn?.(
       "EGRESS",
-      `429 on ${describeEgress(egress)} → retry once on ${describeEgress(retryEgress)}`
+      `${upstreamStatus} on ${describeEgress(egress)} → retry once on ${describeEgress(retryEgress)}`
     );
 
     const retryResult = await super.execute({

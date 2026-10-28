@@ -140,6 +140,43 @@ describe("OpenCode free-lane egress switching", () => {
     expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
   });
 
+
+  it("on a direct-egress FreeUsageLimitError: keeps the body, moves to the pool in one retry", async () => {
+    const executor = getExecutor("opencode");
+    const alternate = pool("b", "http://proxy-b.example:8080");
+    // Direct primary with a pool on standby: no connectionProxyUrl, alternates set.
+    const proxyOptions = {
+      proxyPoolId: null,
+      connectionProxyEnabled: false,
+      connectionProxyUrl: "",
+      connectionNoProxy: "",
+      vercelRelayUrl: "",
+      strictProxy: false,
+      connectionProxyAlternates: [alternate],
+    };
+    const body = makeBody("direct-quota");
+
+    fetchMock
+      .mockResolvedValueOnce(rateLimitedResponse())
+      .mockResolvedValueOnce(okResponse());
+
+    const result = await run(executor, { body, proxyOptions, providerSessionId: "conv-direct-quota" });
+
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const first = fetchMock.mock.calls[0];
+    const second = fetchMock.mock.calls[1];
+    // Attempt 1 left from the host directly, attempt 2 from the standby pool.
+    expect(first[2].connectionProxyUrl || "").toBe("");
+    expect(second[2].connectionProxyUrl).toBe("http://proxy-b.example:8080");
+    expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
+    // The retry carries a well-formed session; it differs from attempt 1 only
+    // because sessions are scoped to the egress (sessionScopeKey = identity +
+    // egressId), not because a quota 429 forces an epoch rotation. Measured
+    // 2026-10-28: reusing one session across egresses is accepted upstream, so
+    // neither shape matters to the quota — the exit IP does.
+    expect(second[1].headers["x-opencode-session"]).toMatch(OPENCODE_SESSION_RE);
+  });
   it("retries only once when the alternate is also rate-limited", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");

@@ -14,5 +14,7 @@ export default {
   test: {
     environment: "node",
     include: ["tests/**/*.test.js"],
+    // 全量测试不许碰真实出口：asip 的 /rotate 会真的切生产 sing-box 选择器。
+    setupFiles: ["./tests/setup.js"],
   },
 };

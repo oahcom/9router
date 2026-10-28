@@ -29,6 +29,7 @@ const { fetchMock } = vi.hoisted(() => {
 
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: fetchMock,
+  clearProxyDispatchers: vi.fn(),
   default: fetchMock,
 }));
 

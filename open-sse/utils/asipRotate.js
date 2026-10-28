@@ -19,6 +19,11 @@ const TOKEN_PATH =
 // 宁可多等一次，也不要这种「换了但没等」的错位。
 const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 2000);
 
+// 关掉之后连本地都不连，一律当「这次没换」。存在的理由很具体：跑全量测试时会
+// 走到 429 分支，asip 的 /rotate 是真的切生产 sing-box 选择器 —— 一次测试就把
+// 线上出口换掉，而且结果取决于当时网络。测试里由 tests/setup.js 置 1。
+const DISABLED = process.env.ASIP_DISABLED === "1";
+
 let lastToken = null;
 
 function readToken() {
@@ -34,6 +39,7 @@ function readToken() {
 
 function callAsip(path, payload) {
   return new Promise((resolve) => {
+    if (DISABLED) return resolve(null);
     const token = readToken();
     if (!token) return resolve(null);
     const body = payload ? JSON.stringify(payload) : "";

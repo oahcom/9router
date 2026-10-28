@@ -12,7 +12,7 @@
 // has to live in the resolver.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getEnvProxyUrl, isLinkLocalOrMetadataHost, isPrivateHost, resolveConnectionProxyUrl } from "../../open-sse/utils/proxyResolution.js";
+import { getEnvProxyUrl, isLinkLocalOrMetadataHost, isPrivateHost, resolveConnectionProxyUrl, resolvesToLinkLocalOrMetadataHost } from "../../open-sse/utils/proxyResolution.js";
 import { readFileSync } from "node:fs";
 import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 
@@ -108,7 +108,12 @@ describe("regression guard: the fetch path, not just the resolver", () => {
 
   it("leaves loopback and RFC1918 targets alone", async () => {
     const src = readFileSync(new URL("../../open-sse/utils/proxyFetch.js", import.meta.url), "utf8");
-    expect(src).toContain("isLinkLocalOrMetadataHost(hostnameOf(targetUrl))");
+    // 守两道闸门都在、且字面量在前（DNS 复核必须先拿到 hostname）。
+    expect(src).toContain("if (isLinkLocalOrMetadataHost(hostname))");
+    expect(src).toContain("if (await resolvesToLinkLocalOrMetadataHost(hostname))");
+    expect(src.indexOf("isLinkLocalOrMetadataHost(hostname)")).toBeLessThan(
+      src.indexOf("resolvesToLinkLocalOrMetadataHost(hostname)")
+    );
     expect(isLinkLocalOrMetadataHost("127.0.0.1")).toBe(false);
     expect(isLinkLocalOrMetadataHost("192.168.1.97")).toBe(false);
   });
@@ -217,5 +222,52 @@ describe("cloud metadata endpoints outside 169.254/16", () => {
     "http://168.63.129.16/machine?comp=acisettings",
   ])("refuses %s without attempting a direct fetch", async (target) => {
     await expect(proxyAwareFetch(target, { method: "GET" })).rejects.toThrow(/refused link-local\/metadata/);
+  });
+});
+
+// 2026-10-28 curator P1（#463603 复核 §三）：闸门是纯 hostname 字符串比较，
+// 任何「名字不是 IP、解析后是元数据地址」的域名整类绕过。实测
+// 169.254.169.254.nip.io 拿到 200 SECRET-METADATA，而字面量在同一入口 0ms 被拒。
+// 这里用注入的 lookup 跑，不依赖外网 DNS —— 只有 nip.io 在线时才会红的用例不是守卫。
+describe("hostnames that resolve to metadata are refused", () => {
+  const fakeLookup = (map) => async (host) => {
+    if (!(host in map)) throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
+    return map[host];
+  };
+
+  it("sees through a wildcard-DNS name pointing at link-local", async () => {
+    const lookup = fakeLookup({ "169.254.169.254.nip.io": [{ address: "169.254.169.254" }] });
+    expect(await resolvesToLinkLocalOrMetadataHost("169.254.169.254.nip.io", lookup)).toBe(true);
+  });
+
+  it("sees through a wildcard-DNS name pointing at Aliyun metadata", async () => {
+    const lookup = fakeLookup({ "100.100.100.200.nip.io": [{ address: "100.100.100.200" }] });
+    expect(await resolvesToLinkLocalOrMetadataHost("100.100.100.200.nip.io", lookup)).toBe(true);
+  });
+
+  // 只拒最终落在元数据/链路本地的名字。LAN 对等体与 loopback 是有意直连的
+  // （见 isPrivateHost 上方 "those are the peers this rule exists for"），
+  // 在这里判私有会把 192.168.x.x 一并拒掉，等于把 10-28 修好的 502 退回去。
+  it.each([
+    ["192.168.1.97", "192.168.1.97"],
+    ["127.0.0.1", "127.0.0.1"],
+    ["8.8.8.8", "8.8.8.8"],
+  ])("does not refuse a name resolving to %s", async (_label, address) => {
+    const lookup = fakeLookup({ "peer.example": [{ address }] });
+    expect(await resolvesToLinkLocalOrMetadataHost("peer.example", lookup)).toBe(false);
+  });
+
+  // 解析失败不等于安全结论，也不能把请求打死：原错误路径照常走。
+  it("treats an unresolvable name as not-metadata", async () => {
+    const lookup = fakeLookup({});
+    expect(await resolvesToLinkLocalOrMetadataHost("nxd.example", lookup)).toBe(false);
+  });
+
+  // 字面量 IP 不查 DNS（dns.lookup 只会原样返回），由前一道闸门负责。
+  it("does not resolve literal IPs a second time", async () => {
+    let called = 0;
+    const lookup = async () => { called++; return []; };
+    await resolvesToLinkLocalOrMetadataHost("169.254.169.254", lookup);
+    expect(called).toBe(0);
   });
 });

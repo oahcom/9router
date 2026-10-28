@@ -11,6 +11,7 @@ import {
   normalizeProxyUrl,
   normalizeString,
   resolveConnectionProxyUrl,
+  resolvesToLinkLocalOrMetadataHost,
 } from "./proxyResolution.js";
 
 const originalFetch = globalThis.fetch;
@@ -342,8 +343,15 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   // 2026-10-28 实测：把它们交给代理后，下面的 catch 会 `falling back to direct`
   // 再连一次，于是 169.254.169.254 反而变得可读（探测器日志见报告 §0）。
   // 这类地址只有本机可达，路由没有正当用途，直接报错最快也最明确。
-  if (isLinkLocalOrMetadataHost(hostnameOf(targetUrl))) {
+  //
+  // 字面量检查之后必须再复核 DNS：闸门看的是 hostname 字符串，`127.0.0.1.nip.io`
+  // / `169.254.169.254.nip.io` 这类域名一个字都不匹配，实测拿到 200 SECRET-METADATA。
+  const hostname = hostnameOf(targetUrl);
+  if (isLinkLocalOrMetadataHost(hostname)) {
     throw new Error(`[ProxyFetch] refused link-local/metadata target: ${targetHost(targetUrl)}`);
+  }
+  if (await resolvesToLinkLocalOrMetadataHost(hostname)) {
+    throw new Error(`[ProxyFetch] refused host resolving to link-local/metadata: ${targetHost(targetUrl)}`);
   }
 
   // Vercel relay: forward request via relay headers

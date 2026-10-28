@@ -128,6 +128,63 @@ export function isLinkLocalOrMetadataHost(hostname) {
   return Number.isFinite(first) && (first & 0xffc0) === 0xfe80;
 }
 
+// 闸门只看字面量，于是 `127.0.0.1.nip.io` / `169.254.169.254.nip.io` 这类
+// 通配 DNS 域名整类绕过——字符串不是 IP，解析后才是。实测 2026-10-28：
+// 本地服务器上 `127.0.0.1.nip.io` 拿到 200 SECRET-METADATA，字面量 169.254.169.254
+// 在同一入口 0ms 被拒。
+//
+// 只复核「解析结果是否落在元数据/链路本地」，**不**按 ssrfGuard 的整段私有
+// 判据：192.168.x.x / 10.x 是有意走直连的局域网对等体（见上方 isPrivateHost 说明），
+// 用 ssrfGuard.assertPublicUrlResolved 会把它们一并拒掉。
+// ponytail: 只做一次解析，不复核重定向后的目标——direct 分支走 undici Agent，
+// 重定向在该层内部完成，要在那里拦需要接 connect 回调。要堵重定向再往上升。
+//
+// 这是热路径：它在每个出站请求之前跑，而 undici 之后自己还会再查一次。
+// 本机 resolver 实测 p50=229ms、p90=5341ms、max=10008ms（n=24），不设防就是
+// 给每个请求白加几秒。所以带 TTL 缓存，并给单次解析设时限：超时就退回
+// 「不拒绝」，因为这里的目标是堵名字，不是给正常请求加一道新的失败模式。
+const RESOLVE_CACHE_MAX = 256;
+const RESOLVE_TIMEOUT_MS = 1500;
+const resolvedHostCache = new Map();
+
+function cachePut(host, isMetadata) {
+  if (resolvedHostCache.size >= RESOLVE_CACHE_MAX) {
+    resolvedHostCache.delete(resolvedHostCache.keys().next().value);
+  }
+  const ttl = isMetadata ? 60_000 : 10 * 60_000;
+  resolvedHostCache.set(host, { isMetadata, expires: Date.now() + ttl });
+}
+
+export async function resolvesToLinkLocalOrMetadataHost(hostname, lookupImpl) {
+  const host = canonicalHost(hostname);
+  if (!host) return false;
+  // 字面量 IP 无需解析：上面那个闸门已经判过，dns.lookup 只会原样返回。
+  if (ipv4ToInt(host) !== null || host.includes(":")) return false;
+  const cached = resolvedHostCache.get(host);
+  if (cached && cached.expires > Date.now()) return cached.isMetadata;
+
+  const lookup = lookupImpl || (await import("node:dns")).promises.lookup;
+  let timer;
+  try {
+    // 一次取全部 A/AAAA，避免只看到公网记录而漏掉同名的私网记录。
+    const records = await Promise.race([
+      lookup(host, { all: true }),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("DNS lookup timed out")), RESOLVE_TIMEOUT_MS);
+      }),
+    ]);
+    const isMetadata = records.some(({ address }) => isLinkLocalOrMetadataHost(address));
+    // 注入的 lookup 是调用方的假数据，不能污染共享缓存。
+    if (!lookupImpl) cachePut(host, isMetadata);
+    return isMetadata;
+  } catch {
+    // 解析失败/超时不是安全结论：交给调用方按原有错误路径处理。
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function isPrivateHost(hostname) {
   const host = canonicalHost(hostname);
   if (!host) return false;

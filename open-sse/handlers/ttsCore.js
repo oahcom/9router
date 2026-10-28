@@ -56,9 +56,12 @@ export async function handleTtsCore({ provider, model, input, credentials, respo
   try {
     // Special-case adapters — the authoritative list is SPECIAL_ADAPTERS in
     // ttsProviders/index.js (google-tts, edge-tts, local-device, elevenlabs, openai,
-    // openrouter, gemini, xiaomi-mimo, selfhosted-tts, ollama-local). Providers with an
-    // adapter never reach synthesizeViaConfig, so they do NOT read ttsConfig.defaultModel;
-    // their default lives in the adapter (ollamaLocal takes it from the registry).
+    // openrouter, gemini, xiaomi-mimo, selfhosted-tts, ollama-local). A provider with an
+    // adapter returns here and never reaches synthesizeViaConfig, so it skips the
+    // defaultModel fallback in ttsProviders/index.js — but the adapters still read the
+    // same PROVIDER_MEDIA[id].ttsConfig.defaultModel to resolve their own default
+    // (openai.js:5, openrouter.js:11, ollamaLocal.js:7). Editing a registry defaultModel
+    // therefore does take effect; what it does not feed is that generic fallback.
     const adapter = getTtsAdapter(provider);
     if (adapter) {
       const result = await adapter.synthesize(input.trim(), model, credentials, responseFormat, { language, style });

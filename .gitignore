@@ -123,6 +123,9 @@ node_modules/
 /db/*.sqlite-shm
 /db/*.sqlite-wal
 /db/*.bak-*
+# Crash/cleanup leftovers keep the original name plus a suffix, e.g.
+# "data.sqlite (deleted)", which the .sqlite rules above do not match.
+/db/*.sqlite *
 /model-catalog.json
 /model-catalog-raw.json
 /.next.stale-*/

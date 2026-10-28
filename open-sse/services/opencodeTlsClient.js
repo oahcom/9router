@@ -92,7 +92,9 @@ export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEF
     method: init.method || "GET",
     headers: init.headers,
     redirect: "follow",
-    timeout: timeoutMs,
+    // timeoutMs 为 null/0 = 不设整请求超时。wreq 的 timeout 含正文读取，流式请求
+    // 到点会被拦腰 abort，所以这个键要么是一个明确的数，要么根本不出现。
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
   };
   if (init.body !== undefined) options.body = init.body;
   if (signal) options.signal = signal;

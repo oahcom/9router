@@ -127,15 +127,27 @@ export function generateSessionId(timestamp = Date.now()) {
 const translatedOpencodeSessions = new Map();
 const MAX_TRANSLATED_SESSIONS = 1000;
 
-function syntheticTransportError(message, { retryable = true } = {}) {
-  const headers = { "content-type": "application/json" };
-  if (retryable) headers["retry-after"] = "1";
-  headers["x-transport-error-type"] = "synthetic";
+function syntheticTransportError(message) {
+  const headers = {
+    "content-type": "application/json",
+    "retry-after": "1",
+    "x-transport-error-type": "synthetic",
+  };
   return new Response(JSON.stringify({
     type: "error",
     error: { type: "UpstreamTransportError", message },
   }), { status: 503, headers });
 }
+
+// 这条车道只有流式（transformRequest 无条件把 body.stream 置 true），而 wreq 的
+// timeout 是整请求超时、到点会把流拦腰 abort —— 所以这条兜底不设 timeout，
+// 终止只靠调用方的 signal（客户端断开）。
+const tlsDirectFetch = (target, init) =>
+  opencodeTlsFetch(
+    target,
+    { method: init.method, headers: init.headers, body: init.body },
+    { signal: init.signal, timeoutMs: null },
+  );
 
 // 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
@@ -601,8 +613,9 @@ export class OpenCodeExecutor extends BaseExecutor {
   // undici's OpenSSL ClientHello is answered with a quota-shaped 429. So the lane
   // always prefers the sidecar; when the sidecar is down and no proxy is
   // configured, OPENCODE_TLS_FALLBACK=on lets wreq-js send the same cipher list.
-  // Otherwise we answer a retryable 503. 配了代理（含 vercel relay）时这条兜底不
-  // 参与：proxyAwareFetch 会先走代理/relay，那是调用方明确选的路。
+  // Otherwise we answer a retryable 503. 带 vercel relay 时留意：proxyAwareFetch 的
+  // relay 分支在解析 proxyUrl 之前就 return，directFetch 会被忽略 —— 那种情况下这条
+  // 兜底并没有生效，请求仍以 undici 的 ClientHello 走 relay。
   async execute(args) {
     const { model, stream, credentials, log } = args;
     let proxyOptions = args.proxyOptions || null;
@@ -738,7 +751,16 @@ export class OpenCodeExecutor extends BaseExecutor {
     // asip sync rotate: 9router 的两个 proxy pool 内容完全相同（都指向 127.0.0.1:7890），
     // selectAlternateProxy 换不出任何东西，这里的 429 只能靠 asip 切 sing-box 选择器解决。
     // 切完必须丢掉复用连接，否则重试走的还是旧隧道。
-    if (retryBody || typeof args.body === "string") {
+    // wreq 兜底是从本机 IP 直出的：切 sing-box 选择器、丢 undici dispatcher 都改不了
+    // 它，重试一次只会白烧一次请求，日志还会说「换了出口」把人带偏。
+    const onTlsFallbackPath =
+      TLS_FALLBACK_ENABLED && !resolveEffectiveProxyUrl(targetUrl, proxyOptions).url;
+    if (onTlsFallbackPath) {
+      log?.warn?.(
+        "EGRESS",
+        `{upstreamStatus} on the wreq fallback path ({rotateReason}) — egress rotation cannot change the host IP; not retrying`
+      );
+    } else if (retryBody || typeof args.body === "string") {
       const asip = await rotateEgress(rotateReason);
       if (asip.switchedAt >= requestStartedAt) {
         clearProxyDispatchers();
@@ -843,10 +865,32 @@ export class OpenCodeExecutor extends BaseExecutor {
     return /UpstreamTransportError/.test(text) ? false : null;
   }
 
+  /** 兜底出口：把 wreq 的 ClientHello 递给 proxyAwareFetch 的 directFetch。 */
+  async fetchViaTlsFallback(url, options, proxyOptions = null) {
+    try {
+      return await proxyAwareFetch(url, { ...options, directFetch: tlsDirectFetch }, proxyOptions);
+    } catch (error) {
+      // 客户端自己断了要原样往上抛：base.execute 靠 AbortError 区分取消和连接
+      // 超时，吞成 503 会让下游带着已 abort 的 signal 再打一次上游。
+      if (error?.name === "AbortError") throw error;
+      // 其余（wreq 不可用 / 真传输失败）回可重试的 503 synthetic，和 sidecar 路径
+      // 同一个契约：fetchUpstream 永远回 Response，不抛给 base.execute。
+      console.warn(`[OpenCode] TLS fallback failed (${error?.message || error}); answering a retryable 503`);
+      return syntheticTransportError(`OpenCode free lane: TLS fallback failed (${error?.message || error}).`);
+    }
+  }
+
   async fetchUpstream(url, options, proxyOptions = null) {
     const response = await fetchViaTransport(url, options, proxyOptions);
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
+      // off 只是「不要 sidecar」，不等于「不要 TLS 兜底」：两个开关各管一件事。
+      // 少了这一层，设置 off 的人会以为只是绕开 sidecar，实际 free lane 直接回到
+      // undici 的假 429，而 OPENCODE_TLS_FALLBACK=on 看起来毫无作用。
+      const offConfiguredProxy = resolveEffectiveProxyUrl(url, proxyOptions).url;
+      if (!offConfiguredProxy && TLS_FALLBACK_ENABLED) {
+        return this.fetchViaTlsFallback(url, options, proxyOptions);
+      }
       return proxyAwareFetch(url, options, proxyOptions);
     }
     // 结构性不支持（socks5 等 Bun 无法承载的出口）与"sidecar 暂时不可用"是
@@ -881,53 +925,10 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 代理判据只认 configuredProxy（= 连接代理 || 环境变量代理，NO_PROXY 已经算过），
     // 不自己再读一遍 process.env —— 那会在 NO_PROXY 放行时把能直连的路挡掉。
     if (!configuredProxy && TLS_FALLBACK_ENABLED) {
-      // wreq 的 timeout 是整请求超时（含正文），而 sidecar 只卡响应头。流式请求
-      // 一旦超过它会在流中间被 abort，所以只在非流式请求上传这个上限。
-      const streamingRequest = (() => {
-        try {
-          return JSON.parse(options.body || "{}").stream === true;
-        } catch {
-          return false;
-        }
-      })();
-      try {
-        return await proxyAwareFetch(url, {
-          ...options,
-          directFetch: (target, init) =>
-            opencodeTlsFetch(
-              target,
-              { method: init.method, headers: init.headers, body: init.body },
-              {
-                signal: init.signal,
-                timeoutMs: streamingRequest ? undefined : OPENCODE_TRANSPORT_CONFIG.tlsTimeoutMs,
-              },
-            ),
-        }, proxyOptions);
-      } catch (error) {
-        // 客户端自己断了要原样往上抛：base.execute 靠 AbortError 区分取消和
-        // 连接超时，吞成 503 会让下游带着已 abort 的 signal 再打一次上游。
-        if (error?.name === "AbortError") throw error;
-        // 其余（wreq 不可用 / 真传输失败）回可重试的 503 synthetic，和 sidecar
-        // 路径同一个契约：fetchUpstream 永远回 Response，不抛给 base.execute。
-        console.warn("[OpenCode] TLS fallback failed (" + error.message + "); answering a retryable 503");
-        return syntheticTransportError("OpenCode free lane: TLS fallback failed; sidecar unavailable.");
-      }
+      return this.fetchViaTlsFallback(url, options, proxyOptions);
     }
     console.warn(`[OpenCode] Bun transport unavailable for ${url}; refusing Node fallback`);
-    return new Response(JSON.stringify({
-      type: "error",
-      error: {
-        type: "UpstreamTransportError",
-        message: "OpenCode free lane requires the Bun transport; sidecar unavailable.",
-      },
-    }), {
-      status: 503,
-      headers: {
-        "content-type": "application/json",
-        "retry-after": "1",
-        "x-transport-error-type": "synthetic",
-      },
-    });
+    return syntheticTransportError("OpenCode free lane requires the Bun transport; sidecar unavailable.");
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

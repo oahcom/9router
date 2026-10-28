@@ -63,10 +63,12 @@ describe("OpenCode TLS fallback gate", () => {
     expect(String(url)).toContain("opencode");
     expect(options.directFetch).toBeTypeOf("function");
 
-    // 这个钩子必须真的接到 wreq-js 上（而不是又落回 undici）。
+    // 这个钩子必须真的接到 wreq-js 上（而不是又落回 undici），而且不能给它
+    // 整请求超时 —— 这条车道只有流式，120s 会把长回答拦腰 abort。
     await options.directFetch(url, { method: "POST", headers: {}, body: "{}" });
     expect(tlsMock).toHaveBeenCalledTimes(1);
     expect(tlsMock.mock.calls[0][0]).toBe(url);
+    expect(tlsMock.mock.calls[0][2]).toMatchObject({ timeoutMs: null });
   });
 
   it("answers a retryable 503 — not a thrown error — when wreq-js is missing", async () => {

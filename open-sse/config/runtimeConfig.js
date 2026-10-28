@@ -77,8 +77,6 @@ export const OPENCODE_TRANSPORT_CONFIG = {
   // 上游 ce060c79 的 wreq-js 兜底（sidecar 不在、又没配代理时才用得上）。
   // 默认 off：那条路从本机 IP 直出，wreq-js 缺失时还会在请求里 npm install。
   tlsFallback: envChoice("OPENCODE_TLS_FALLBACK", ["off", "on"], "off") === "on",
-  // wreq 的 timeout 是整请求超时（含正文），和 sidecar 的「只卡响应头」不同语义。
-  tlsTimeoutMs: envMs("OPENCODE_TLS_TIMEOUT_MS", 120 * 1000),
 };
 
 // SearXNG endpoint used by the unauthenticated web-search provider.

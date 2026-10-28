@@ -19,7 +19,7 @@ import path from "path";
 // rather than importing it (avoids next/server bootstrap requirements).
 
 const src = fs.readFileSync(
-  path.resolve("../src/app/api/providers/[id]/test/testUtils.js"),
+  path.resolve(import.meta.dirname, "../..", "src/app/api/providers/[id]/test/testUtils.js"),
   "utf-8"
 );
 

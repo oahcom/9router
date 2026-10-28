@@ -25,6 +25,9 @@ globalThis.fetch = fetchMock;
 vi.mock("undici", () => ({
   Agent: class {},
   ProxyAgent: class {},
+  // proxyDispatcher.js 现在同时 import 这个（socks5 出口用）：桩里少一个，
+  // 整条 strictProxy 路径就报 "No Socks5ProxyAgent export is defined"。
+  Socks5ProxyAgent: class {},
 }));
 
 const { proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js");

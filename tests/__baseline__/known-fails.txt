@@ -20,7 +20,6 @@ tests/unit/translator-request-normalization.test.js :: request normalization tra
 
 # Real bug: /api/usage/stats serializes raw API keys as byApiKey property names (GHSA-vjc7).
 # Fixed by decolua/9router#4286.
-tests/unit/security-audit.test.js :: AUDIT-002: API key masking byApiKey object keys should use masked key, not raw key
 
 # Stale expectations fixed by decolua/9router#3665 (search auto-switch disabled on purpose;
 # reorder returns a copy).
@@ -29,12 +28,9 @@ tests/unit/combo-autoswitch.test.js :: reorderByCapabilities keeps order when no
 
 # Live call: the upstream now answers "Unsupported model mimo-auto", the only model the
 # (hidden since 6d96e24b) mimo-free / mmf providers list.
-tests/unit/mimo-free.live.test.js :: MiMo Free anti-abuse gate (live) chat WITH Chrome User-Agent → 200
 
 # Cannot load in this repo: benchmarks lowdb (removed in bee8dad9) / imports the cloud/ worker,
 # which is not part of this repository.
-tests/unit/db-benchmark.test.js :: <suite failed to load>
-tests/unit/embeddings.cloud.test.js :: <suite failed to load>
 
 # Upstream test file (39de422c on zeusire/master) that asserts behaviors this codebase
 # deliberately does not implement. Kept red rather than deleted so a future merge does
@@ -68,3 +64,37 @@ tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (O
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5108: applyThinking preserves explicit budget_tokens on deepseek thinkingFormat
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5126: detectRequiredCapabilities and openaiResponsesToOpenAIRequest handle images inside function_call_output
 tests/unit/upstream-issue-fixes-oct-2026.test.js :: Upstream open issue fixes (Oct 2026) Issue #5137: ollamaBodyToOpenAI handles body.response when message.content is missing
+
+# ── 2026-10-28 复核补记 ────────────────────────────────────────────────
+#
+# 上面这份基线是 2026-10-21 对着 v0.5.104 分诊的，之后没有任何东西核过它。
+# 今天跑 npm run test:baseline 的结果：4 条已转绿（已从上面删掉），18 条是基线
+# 之后新红的、从没被记下来过。也就是说这半年里「红」没有被追踪，只是习惯了。
+# 下面按成因补记，别当成「已知所以不用管」——每条都写了它到底缺什么。
+#
+# 缺系统二进制：ffmpeg 没装，转码用例全挂（装了就绿，不用改代码）
+tests/unit/codex-stt-transport.test.js :: converts real stereo 48k WAV to mono24k PCM16 and removes temporary files
+tests/unit/codex-stt-transport.test.js :: rejects malformed and overlong audio and cleans up
+tests/unit/codex-stt-transport.test.js :: sends only the converted file and projects upstream metadata out of the response through a local relay
+#
+# live 网络：真打上游，5s 超时就红（默认 npm test 已排除 *.live.test.js，这两个
+# 没带 live 后缀所以还在里面；要么改名，要么给它们单独的超时）
+tests/unit/zed-native-auth.test.js :: criterion 3 — real callback completes session + saves connection user_id + access_token → done, decrypted token persisted
+tests/unit/zed-native-auth.test.js :: criterion 5 — systemId stable authorize → exchange → stored exchange preserves the registered systemId (no regeneration)
+#
+# 快照漂移：buildHeaders 改了，__snapshots__ 没跟着更（5 条，同因）
+tests/translator/golden-url-header.test.js :: GOLDEN buildHeaders (default executor providers) cline → headers (apiKey / oauth)
+tests/translator/golden-url-header.test.js :: GOLDEN buildHeaders (default executor providers) clinepass → headers (apiKey / oauth)
+tests/translator/golden-url-header.test.js :: GOLDEN buildHeaders (default executor providers) kimi → headers (apiKey / oauth)
+tests/translator/golden-url-header.test.js :: GOLDEN buildHeaders (default executor providers) minimax-code → headers (apiKey / oauth)
+tests/translator/golden-url-header.test.js :: GOLDEN buildHeaders (default executor providers) minimax-code-global → headers (apiKey / oauth)
+#
+# 契约漂移，要人拍板（代码还是测试哪边对，得看设计意图，不是改一行的事）
+tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) does not classify every 11128 code as a block
+tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) keeps the same text request-scoped for provider codebuddy-cn
+tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) keeps the same text request-scoped for provider null
+tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) keeps the same text request-scoped for provider openai
+tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) still stops a combo on a malformed CodeBuddy request
+tests/unit/codex-stt-persisted-refresh.test.js :: uses the real persisted refresh service before sending expired-account OAuth audio
+tests/unit/combo-credit-fallback.test.js :: combo credit fallback routes a 400 response correctly: Bad request
+tests/unit/headroom-responses-format.test.js :: compressWithHeadroom openai-responses format (#1998) skips Responses tool/reasoning history instead of collapsing it into a message (#2132)

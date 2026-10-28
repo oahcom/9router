@@ -282,6 +282,8 @@ export const PROVIDER_CAPABILITIES = {
   "opencode": {
     "mimo-v2.6-flash-free": { vision: true, audioInput: true, videoInput: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: true, contextWindow: 1048576, maxOutput: 131072 },
     "deepseek-v4.1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
+    // 同一个模型的连字符写法也必须落在同一条覆盖上，否则两个 id 报不同的 maxOutput
+    "deepseek-v4-1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
   },
   "commandcode": {
     // The generic commandcode fallback (1M/384k for every unlisted model) happened

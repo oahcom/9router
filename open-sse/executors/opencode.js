@@ -742,15 +742,17 @@ export class OpenCodeExecutor extends BaseExecutor {
     // asip sync rotate: 9router 的两个 proxy pool 内容完全相同（都指向 127.0.0.1:7890），
     // selectAlternateProxy 换不出任何东西，这里的 429 只能靠 asip 切 sing-box 选择器解决。
     // 切完必须丢掉复用连接，否则重试走的还是旧隧道。
-    // wreq 兜底是从本机 IP 直出的：切 sing-box 选择器、丢 undici dispatcher 都改不了
-    // 它，重试一次只会白烧一次请求，日志还会说「换了出口」把人带偏。
-    const onTlsFallbackPath = proxyOptions?.tlsFallbackUsed === true;
-    if (onTlsFallbackPath) {
+    // 直连出口（含 wreq 兜底）时，切 sing-box 选择器不一定改得了这条请求的去路：
+    // 主机把流量交给 sing-box（TUN）时有效，纯粹本机直出时无效。两种情况都可能，
+    // 所以这里不跳过重试，只补一句说明 —— 免得日志把「重试后还是 429」说成
+    // 「换了出口就好了」，让人去追一个不存在的因果。
+    if (!resolveEffectiveProxyUrl(targetUrl, proxyOptions).url) {
       log?.warn?.(
         "EGRESS",
-        `${upstreamStatus} on the wreq fallback path (${rotateReason}) — egress rotation cannot change the host IP; not retrying`
+        `${upstreamStatus} on a direct egress (${rotateReason}); rotation only helps when the host routes through sing-box`
       );
-    } else if (retryBody || typeof args.body === "string") {
+    }
+    if (retryBody || typeof args.body === "string") {
       const asip = await rotateEgress(rotateReason);
       if (asip.switchedAt >= requestStartedAt) {
         clearProxyDispatchers();
@@ -861,16 +863,12 @@ export class OpenCodeExecutor extends BaseExecutor {
     // timeout 是整请求超时、到点会把流拦腰 abort —— 所以这条兜底不设 timeout，
     // 终止只靠调用方的 signal（客户端断开）。
     //
-    // 顺便在「钩子真的被调用」时记一笔：429 分支据此决定不再换出口重试（切 sing-box
-    // 改不了本机 IP）。票据挂在本次请求自己的 proxyOptions 上，并发安全。
-    const tlsDirectFetch = (target, init) => {
-      if (proxyOptions && typeof proxyOptions === "object") proxyOptions.tlsFallbackUsed = true;
-      return opencodeTlsFetch(
+    const tlsDirectFetch = (target, init) =>
+      opencodeTlsFetch(
         target,
         { method: init.method, headers: init.headers, body: init.body },
         { signal: init.signal, timeoutMs: null },
       );
-    };
     try {
       return await proxyAwareFetch(url, { ...options, directFetch: tlsDirectFetch }, proxyOptions);
     } catch (error) {

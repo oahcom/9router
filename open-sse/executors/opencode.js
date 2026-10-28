@@ -11,6 +11,26 @@ import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { fetchViaTransport } from "../utils/opencodeTransport.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+
+// 同一出口的「没有备选」每分钟最多落一行；被压掉的次数在下一行末尾追报。
+const NO_ALTERNATE_LOG_INTERVAL_MS = 60_000;
+const noAlternateLogState = new Map();
+
+function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
+  const key = egress?.id || "unknown";
+  const state = noAlternateLogState.get(key) || { at: 0, suppressed: 0 };
+  if (now - state.at < NO_ALTERNATE_LOG_INTERVAL_MS) {
+    state.suppressed += 1;
+    noAlternateLogState.set(key, state);
+    return;
+  }
+  const suffix = state.suppressed > 0 ? ` (+${state.suppressed} suppressed)` : "";
+  noAlternateLogState.set(key, { at: now, suppressed: 0 });
+  log?.warn?.(
+    "EGRESS",
+    `${describeEgress(egress)} 429, no alternate egress (${configured} configured, all excluded as this url or cooling)${suffix}`
+  );
+}
 import {
   resolveEgress,
   markEgressCooling,
@@ -668,18 +688,17 @@ export class OpenCodeExecutor extends BaseExecutor {
           `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
         );
       } else {
-        // Fixed proxy egresses are never cooled (sing-box rotates the real exit IP
-        // beneath one proxyUrl), so the branch above stays silent for them and the
-        // whole switch path logs nothing. That makes "no alternate exists" read
-        // exactly like "switched and failed" — three pools sharing one proxyUrl
-        // produce that blind spot permanently. Name the condition instead.
+        // Fixed proxy egresses are never cooled (the sing-box selector is swapped
+        // out-of-band by the rotation manager, so a URL-keyed cooldown can outlive
+        // the exit it was recorded against), so the branch above stays silent for
+        // them and the whole switch path logs nothing. That makes "no alternate
+        // exists" read exactly like "switched and failed". Name the condition, but
+        // throttle it: while WARP quota is exhausted every request is a 429 and the
+        // first version of this line produced 585 identical entries in 39 minutes.
         const configured = Array.isArray(proxyOptions?.connectionProxyAlternates)
           ? proxyOptions.connectionProxyAlternates.length
           : 0;
-        log?.warn?.(
-          "EGRESS",
-          `${describeEgress(egress)} 429, no alternate egress (${configured} configured, all excluded as this url or cooling)`
-        );
+        logNoAlternateEgress(log, egress, configured);
       }
       return result;
     }

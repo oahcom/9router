@@ -175,6 +175,17 @@ export class BaseExecutor {
         // Connect timeout is internal — convert to retryable network error, don't propagate AbortError
         if (error.name === "AbortError" && !isConnectTimeout) throw error;
 
+        // 60s 内连响应头都没拿到 = 这条出口已经死了。重试同一个 URL 只是把
+        // 60s 再走一遍（实测 4 次 ≈ 236s 才回 502，而外层 combo 本来就有自己的
+        // 降级）。改为主张换 fallback URL，没有就直接抛出。
+        if (isConnectTimeout) {
+          if (urlIndex + 1 < fallbackCount) {
+            log?.debug?.("RETRY", `header timeout on ${url}, trying fallback ${urlIndex + 1}`);
+            continue;
+          }
+          throw error;
+        }
+
         // Map network/fetch exceptions to 502 retry config
         if (await tryRetry(urlIndex, HTTP_STATUS.BAD_GATEWAY, `network "${error.message}"`)) { urlIndex--; continue; }
 

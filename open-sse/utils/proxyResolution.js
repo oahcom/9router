@@ -34,7 +34,9 @@ export function shouldBypassByNoProxy(targetUrl, noProxyValue) {
 // were all treated as public (routed to the pool). Ranges below are compared
 // numerically and only ever applied to real IP literals.
 const PRIVATE_HOSTNAMES = new Set(["localhost", "ip6-localhost", "ip6-loopback", "metadata.google.internal"]);
-const PRIVATE_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa"];
+// ".lan" is not a delegated TLD but is the common shorthand for LAN peers; a
+// public host can never end in it.
+const PRIVATE_HOST_SUFFIXES = [".localhost", ".local", ".lan", ".internal", ".home.arpa"];
 
 const PRIVATE_V4_RANGES = [
   ["0.0.0.0", 8],

@@ -97,6 +97,7 @@ describe("isPrivateHost covers RFC1918 + loopback only", () => {
     ["100.64.0.1", true],             // CGNAT
     ["0.0.0.0", true],
     ["metadata.google.internal", true],
+    ["nas.lan", true], // ICANN 未委派 .lan，局域网常见简写
   ])("treats %s as private", (host, expected) => {
     expect(isPrivateHost(host)).toBe(expected);
   });

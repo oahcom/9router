@@ -229,12 +229,14 @@ export function markEgressCooling(egress, retryAfterMs) {
   if (!egress?.id || egress.confirmed !== true) return null;
 
   // Retrying on a collided proxy egress must not happen here: the fixed proxy
-  // URL is an opaque downstream for an external rotation manager (sing-box),
-  // whose upstream IP rotates underneath without changing the proxyUrl — the
-  // egress-or-id key does not follow that IP. Cooling the same 7890 URL for
-  // hours after a 429 deadlocks the lane even though the real exit IP is
-  // brand-new. The rotation manager owns per-IP Retry-After compliance; cool
-  // only egresses whose exit IP 9router itself controls (direct / relay).
+  // URL is an opaque downstream for an external rotation manager (sing-box).
+  // Its selector is static between swaps — check singbox-config.json, the
+  // opencode.ai rule points at a `selector`, not a `urltest` — and only the
+  // manager can move it, out-of-band. A URL-keyed cooldown therefore outlives
+  // the exit it was recorded against: the manager may already have swapped the
+  // member while this table still jails 127.0.0.1:7890 for hours. The manager
+  // owns per-IP Retry-After compliance; cool only egresses whose exit IP
+  // 9router itself controls (direct / relay).
   if (egress.kind === "proxy") return null;
 
   const requested = Number(retryAfterMs);

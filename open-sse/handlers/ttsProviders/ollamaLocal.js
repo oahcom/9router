@@ -3,7 +3,6 @@ import { responseToBase64, throwUpstreamError } from "./_base.js";
 
 const DEFAULT_MODEL = "phonon:multilingual";
 const DEFAULT_VOICE = "default";
-const KNOWN_PHONON_VOICES = new Set(["default", "zoey", "easton", "freya"]);
 
 export default {
   async synthesize(text, model, credentials, responseFormat = "mp3") {

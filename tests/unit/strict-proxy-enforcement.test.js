@@ -15,7 +15,24 @@
 //    directly.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// 这台机器的 shell 里带着 http_proxy 一类的变量时，getEnvProxyUrl 会把它当成// 「配了代理」，strictProxy 于是有了可尝试的路径 —— 用例的前提「没有代理可试」// 就不成立，断言会拿 /strictProxy/ 去配一条「Proxy required but failed」的错。// 所以每条用例前先清掉，跑完原样还原。const PROXY_ENV_KEYS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];const savedProxyEnv = new Map();beforeEach(() => {  savedProxyEnv.clear();  for (const key of PROXY_ENV_KEYS) {    savedProxyEnv.set(key, process.env[key]);    delete process.env[key];  }});afterEach(() => {  for (const [key, value] of savedProxyEnv) {    if (value === undefined) delete process.env[key];    else process.env[key] = value;  }});
+// 这台机器的 shell 里带着 http_proxy 一类的变量时，getEnvProxyUrl 会把它当成
+// 「配了代理」，strictProxy 于是有了可尝试的路径 —— 用例的前提「没有代理可试」
+// 就不成立。所以每条用例前先清掉，跑完原样还原。
+const PROXY_ENV_KEYS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+const savedProxyEnv = new Map();
+beforeEach(() => {
+  savedProxyEnv.clear();
+  for (const key of PROXY_ENV_KEYS) {
+    savedProxyEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
+afterEach(() => {
+  for (const [key, value] of savedProxyEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 vi.mock("@/models", () => ({
   getProxyPoolById: vi.fn(),

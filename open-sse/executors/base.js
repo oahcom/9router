@@ -97,13 +97,14 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
-  // 出口可以按协议换：默认走 proxyAwareFetch，子类（opencode）覆盖它去接 Bun
-  // sidecar / wreq-js。上游 ce060c79 只加了 directFetch 形参，方法本体在我们这边。
+  // 选出口的唯一入口：默认走 proxyAwareFetch，子类（opencode）覆盖它去接 Bun
+  // sidecar / wreq-js。上游 ce060c79 走的是 execute 的 directFetch 实参，这里换成
+  // 覆写钩子，所以 base.execute 不再需要那个形参（没人会传）。
   fetchUpstream(url, options, proxyOptions = null) {
     return proxyAwareFetch(url, options, proxyOptions);
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null, directFetch = null }) {
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null }) {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
@@ -154,9 +155,6 @@ export class BaseExecutor {
           headers,
           body: bodyStr,
           signal: mergedSignal,
-          // Protocol adapters that need their own transport (opencode's TLS
-          // fingerprint) override the direct path; proxies still take priority.
-          ...(directFetch ? { directFetch } : {}),
         }, proxyOptions);
         clearTimeout(connectTimer);
         const ct = response.headers?.get?.("content-type") || "";

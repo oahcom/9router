@@ -6,7 +6,7 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
+import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import { fetchViaTransport } from "../utils/opencodeTransport.js";
 import { opencodeTlsFetch, OpencodeTlsUnavailableError } from "../services/opencodeTlsClient.js";
@@ -127,10 +127,24 @@ export function generateSessionId(timestamp = Date.now()) {
 const translatedOpencodeSessions = new Map();
 const MAX_TRANSLATED_SESSIONS = 1000;
 
+// proxyAwareFetch 只在「没有 proxyUrl」时才走 directFetch，所以 env 代理也要算进来，
+// 否则 TLS 兜底会静默退回 undici（那条路的 429 和真配额耗尽分不出来）。
+const ENV_PROXY_KEYS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+
+function syntheticTransportError(message, { retryable = true } = {}) {
+  const headers = { "content-type": "application/json" };
+  if (retryable) headers["retry-after"] = "1";
+  headers["x-transport-error-type"] = "synthetic";
+  return new Response(JSON.stringify({
+    type: "error",
+    error: { type: "UpstreamTransportError", message },
+  }), { status: 503, headers });
+}
+
 // 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
-// 需要那条路时：OPENCODE_TLS_FALLBACK=1。
-const TLS_FALLBACK_ENABLED = process.env.OPENCODE_TLS_FALLBACK === "1";
+// 开关在 runtimeConfig 里统一读：OPENCODE_TLS_FALLBACK=on 才开。
+const TLS_FALLBACK_ENABLED = OPENCODE_TRANSPORT_CONFIG.tlsFallback;
 
 export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
@@ -584,15 +598,14 @@ export class OpenCodeExecutor extends BaseExecutor {
       dropAdaptiveReasoningEffort(body);
       applyFingerprintTools(body, false, { claude: isMessagesModel(model || body?.model) });
     }
-    applyFingerprintSystemPrompt(body);
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
-  // The free gate keys on the TLS ClientHello, so a native Node fetch is refused
-  // no matter how faithful the body is. Route through the impersonating client
-  // and keep proxy handling on the existing path (proxyAwareFetch delegates to
-  // `directFetch` when no proxy is configured). Fail-open: without wreq-js the
-  // request still goes out on native fetch instead of erroring here.
+  // The free gate keys on the TLS ClientHello: Bun (the sidecar) is served, while
+  // undici's OpenSSL ClientHello is answered with a quota-shaped 429. So the lane
+  // always prefers the sidecar; when the sidecar is down and no proxy is
+  // configured, OPENCODE_TLS_FALLBACK=on lets wreq-js send the same cipher list.
+  // Otherwise we answer a retryable 503 — never a silent undici downgrade.
   async execute(args) {
     const { model, stream, credentials, log } = args;
     let proxyOptions = args.proxyOptions || null;
@@ -868,16 +881,25 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 上游 ce060c79：undici 的 OpenSSL ClientHello 会被拒成 quota 形状的 429，
     // 但 wreq-js 送同一份 cipher 列表能过。所以 sidecar 不可用、又没有配代理时，
     // 这里退到它（要 OPENCODE_TLS_FALLBACK=1 才开）；没装 wreq-js 就照旧回可重试的 503。
-    if (!configuredProxy && TLS_FALLBACK_ENABLED) {
+    // 环境变量代理（http_proxy 之类）也算「配了代理」：proxyAwareFetch 只在没有
+    // proxyUrl 时才用 directFetch，带着 env 代理进来会静默退回 undici。
+    const envProxy = ENV_PROXY_KEYS.some((key) => Boolean(process.env[key]));
+    if (!configuredProxy && !envProxy && TLS_FALLBACK_ENABLED) {
       try {
         return await proxyAwareFetch(url, {
           ...options,
           directFetch: (target, init) =>
-            opencodeTlsFetch(target, { method: init.method, headers: init.headers, body: init.body }, { signal: init.signal }),
+            opencodeTlsFetch(
+              target,
+              { method: init.method, headers: init.headers, body: init.body },
+              { signal: init.signal, timeoutMs: OPENCODE_TRANSPORT_CONFIG.tlsTimeoutMs },
+            ),
         }, proxyOptions);
       } catch (error) {
-        if (!(error instanceof OpencodeTlsUnavailableError)) throw error;
-        console.warn("[OpenCode] wreq-js unavailable; not downgrading to undici");
+        // 契约：fetchUpstream 永远回 Response。把异常抛给 base.execute 会被当成
+        // 网络错误走 502 重试，和 sidecar 路径的 503 synthetic 对不上。
+        console.warn("[OpenCode] TLS fallback failed (" + error.message + "); answering a retryable 503");
+        return syntheticTransportError("OpenCode free lane: TLS fallback failed; sidecar unavailable.");
       }
     }
     console.warn(`[OpenCode] Bun transport unavailable for ${url}; refusing Node fallback`);

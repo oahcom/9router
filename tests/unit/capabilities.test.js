@@ -27,14 +27,20 @@ describe("getCapabilitiesForModel", () => {
       reasoning: true,
       thinkingFormat: "deepseek",
       contextWindow: 330000,
-      // maxOutput 不写死：上游 #5097 的 provider 覆盖层给的是 128000，我们通用表      // 里曾经是 65536。两边都满足「不超过上下文窗口」，所以这里只钉这个不变式，      // 钉具体数字只会在下一次调参时又红一次。
+      maxOutput: 128000,
     };
     expect(getCapabilitiesForModel("opencode", "deepseek-v4.1-flash-free")).toMatchObject(free);
     // hyphenated alias used by some providers must not fall back to the 1M pattern
     expect(getCapabilitiesForModel("opencode", "deepseek-v4-1-flash-free")).toMatchObject(free);
-    for (const id of ["deepseek-v4.1-flash-free", "deepseek-v4-1-flash-free"]) {
-      const caps = getCapabilitiesForModel("opencode", id);
-      expect(caps.maxOutput).toBeLessThanOrEqual(caps.contextWindow);
+    // 同一个模型按 provider / 别名 / null 三条路径解析必须给同一套数字：通用表和
+    // provider 覆盖层各写一份时最容易在这里漂移（曾经 65536 vs 128000）。
+    for (const [provider, id] of [
+      ["opencode", "deepseek-v4.1-flash-free"],
+      ["opencode", "deepseek-v4-1-flash-free"],
+      ["oc", "deepseek-v4.1-flash-free"],
+      [null, "deepseek-v4.1-flash-free"],
+    ]) {
+      expect(getCapabilitiesForModel(provider, id)).toMatchObject(free);
     }
     // the paid lane keeps 1M — the cap is a property of the free backend only
     expect(getCapabilitiesForModel("opencode-go", "deepseek-v4.1-flash").contextWindow).toBe(1000000);

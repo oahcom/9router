@@ -182,8 +182,11 @@ export const MODEL_CAPABILITIES = {
   // The free lane rejects prompts above ~330k tokens server-side (#5097); publishing
   // 1M here makes clients skip compaction and die mid-session instead. The paid
   // opencode-go ids keep 1M via the exact entries above.
-  "deepseek-v4.1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 65536 },
-  "deepseek-v4-1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 65536 },
+  // maxOutput 与 provider 覆盖层（PROVIDER_CAPABILITIES.opencode）保持一致：同一个
+  // 模型按 provider / 别名 / null 三条路径解析必须给同一个数，否则 /v1/models 的
+  // alias 分支会和主路径报不同的输出上限。
+  "deepseek-v4.1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
+  "deepseek-v4-1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
   "deepseek-flash":      { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 128000, maxOutput: 64000 },
 
   // Qwen plain coder/text (no vision) — registry "vision-model" / "coder-model" aliases
@@ -286,6 +289,9 @@ export const PROVIDER_CAPABILITIES = {
     "deepseek-v4-1-flash-free": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 330000, maxOutput: 128000 },
   },
   "commandcode": {
+    // K3.1 Pro 与 opencode-go 同一条模型数据（1,048,576 / 131,072）。不列出来会
+    // 掉进下面「未列模型 1M/384k」的兜底，客户端按 384k 预算发会被上游截断。
+    "moonshotai/Kimi-K3.1-Pro": { vision: true, reasoning: true, thinkingFormat: "commandcode", thinkingEffortSupported: true, contextWindow: 1048576, maxOutput: 131072 },
     // The generic commandcode fallback (1M/384k for every unlisted model) happened
     // to give haiku-5-5 the right context by accident. Pin it to the catalog values:
     // GET https://api.commandcode.ai/provider/v1/models reports context_length 1000000

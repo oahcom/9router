@@ -23,18 +23,18 @@ describe("Command Code Kimi K3.1 Pro", () => {
       reasoning: true,
       thinkingFormat: "commandcode",
       thinkingEffortSupported: true,
-      contextWindow: 1000000,
-      maxOutput: 384000,
+      contextWindow: 1048576,
+      maxOutput: 131072,
     });
   });
 
-  it("prices at the Kimi K3 tier", () => {
+  it("prices at the Kimi K3.1 tier", () => {
     expect(getPricingForModel("commandcode", KIMI_K31_PRO)).toEqual({
-      input: 3,
-      output: 15,
-      cached: 0.3,
-      reasoning: 15,
-      cache_creation: 3,
+      input: 2,
+      output: 10,
+      cached: 0.2,
+      reasoning: 10,
+      cache_creation: 2,
     });
   });
 

@@ -194,6 +194,11 @@ export const MODEL_PRICING = {
  * Keyed by provider alias (cc, cx, gc, gh, ...) or provider id (openai, anthropic, ...).
  */
 export const PROVIDER_PRICING = {
+  // CommandCode 的 K3.1 Pro 与 opencode-go 是同一个模型：单价按 K3.1 档（2/10），
+  // 不列出来会落到 K3 的 3/15。
+  commandcode: {
+    "moonshotai/Kimi-K3.1-Pro": { input: 2.0, output: 10.0, cached: 0.2, reasoning: 10.0, cache_creation: 2.0 },
+  },
   // GitHub Copilot (gh) — explicit override, matches canonical gpt-5.3-codex rate
   gh: {
     "gpt-5.3-codex": { input: 1.75, output: 14.00, cached: 0.175, reasoning: 14.00, cache_creation: 1.75 },

@@ -54,7 +54,11 @@ export async function handleTtsCore({ provider, model, input, credentials, respo
   }
 
   try {
-    // Special-case adapters (google-tts, edge-tts, local-device, elevenlabs, openai, openrouter, gemini, xiaomi-mimo)
+    // Special-case adapters — the authoritative list is SPECIAL_ADAPTERS in
+    // ttsProviders/index.js (google-tts, edge-tts, local-device, elevenlabs, openai,
+    // openrouter, gemini, xiaomi-mimo, selfhosted-tts, ollama-local). Providers with an
+    // adapter never reach synthesizeViaConfig, so they do NOT read ttsConfig.defaultModel;
+    // their default lives in the adapter (ollamaLocal takes it from the registry).
     const adapter = getTtsAdapter(provider);
     if (adapter) {
       const result = await adapter.synthesize(input.trim(), model, credentials, responseFormat, { language, style });

@@ -727,6 +727,10 @@ export class OpenCodeExecutor extends BaseExecutor {
             proxyOptions: failover.alternate.proxyOptions,
           });
           attemptEgress = failover.alternate.egress;
+          // 从这里起「这次响应的出口」就是 alternate：冷却、会话轮换、候选排除集、
+          // 重试日志都得跟着它走，否则会把从没被限流的第一条出口误烧（INC-008/INC-009），
+          // 排除集还会把重试送回刚回 429 的那条。egress 本来就是 let，后面 probe 也会改它。
+          egress = attemptEgress;
         }
       }
     }

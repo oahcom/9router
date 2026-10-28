@@ -225,6 +225,14 @@ function sanitizeIp(value) {
   return /^[0-9a-fA-F:.]{3,45}$/.test(ip) ? ip : null;
 }
 
+// Milliseconds from `now` to the next local occurrence of `hour` (0-23).
+function msUntilLocalHour(hour, now = Date.now()) {
+  const next = new Date(now);
+  next.setHours(hour, 0, 0, 0);
+  while (next.getTime() <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now;
+}
+
 export function markEgressCooling(egress, retryAfterMs) {
   if (!egress?.id || egress.confirmed !== true) return null;
 
@@ -241,10 +249,17 @@ export function markEgressCooling(egress, retryAfterMs) {
 
   const requested = Number(retryAfterMs);
   const hasHint = retryAfterMs !== null && retryAfterMs !== undefined && Number.isFinite(requested) && requested >= 0;
-  const ms = Math.min(
+  let ms = Math.min(
     Math.max(hasHint ? requested : EGRESS_CONFIG.defaultCooldownMs, EGRESS_CONFIG.minCooldownMs),
     EGRESS_CONFIG.maxCooldownMs
   );
+  // Quota windows reset on a wall clock, not N seconds after the 429: park the
+  // exit until the next aligned hour so a request two minutes later does not
+  // re-run the whole discovery path. Only ever extends a cooldown.
+  const alignHour = EGRESS_CONFIG.alignCooldownHour;
+  if (alignHour !== null && alignHour !== undefined) {
+    ms = Math.max(ms, msUntilLocalHour(alignHour));
+  }
   const until = Date.now() + ms;
   const existing = cooldowns.get(egress.id);
   if (existing && existing.until >= until) return existing;

@@ -49,6 +49,17 @@ function envChoice(name, allowed, def) {
   return allowed.includes(raw) ? raw : def;
 }
 
+// Cooldown alignment: when set, a cooldown on an egress 9router controls
+// (direct / relay) runs until the next local occurrence of this hour, so a
+// free-quota 429 parks the exit until the window actually resets instead of
+// for however many seconds upstream happened to hint. Empty = off.
+function envHour(name) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === "") return null;
+  const value = Number.parseInt(raw, 10);
+  return Number.isInteger(value) && value >= 0 && value <= 23 ? value : null;
+}
+
 export const EGRESS_CONFIG = {
   mode: envChoice("EGRESS_PROBE_MODE", ["off", "auto", "always"], "auto"),
   probeUrl: envUrl("EGRESS_PROBE_URL", "https://api64.ipify.org?format=json"),
@@ -59,6 +70,7 @@ export const EGRESS_CONFIG = {
   minCooldownMs: envMs("EGRESS_MIN_COOLDOWN_MS", 1000),
   maxCooldownMs: envMs("EGRESS_MAX_COOLDOWN_MS", 24 * 60 * 60 * 1000),
   defaultCooldownMs: envMs("EGRESS_DEFAULT_COOLDOWN_MS", 60 * 1000),
+  alignCooldownHour: envHour("EGRESS_COOLDOWN_ALIGN_HOUR"),
   limitMessage: envUrl(
     "EGRESS_LIMIT_MESSAGE",
     "Free usage limit reached on the current egress. Retry after the indicated delay or switch proxies."

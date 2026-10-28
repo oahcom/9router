@@ -68,7 +68,9 @@ const server = Bun.serve({
     if (url.pathname !== "/forward" || request.method !== "POST") {
       return new Response("not found", { status: 404 });
     }
-    if (token && request.headers.get("x-transport-token") !== token) {
+    // fail-closed：没有 token 就不服务。父进程总会 randomBytes(24) 生成一个，
+    // 缺了只可能是环境没传对 —— 那时候把 sidecar 当开放代理用比不可用更糟。
+    if (!token || request.headers.get("x-transport-token") !== token) {
       return new Response("forbidden", { status: 403 });
     }
 

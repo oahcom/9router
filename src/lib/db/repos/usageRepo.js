@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import { createHash } from "node:crypto";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 import { getMeta, setMeta } from "../helpers/metaStore.js";
@@ -62,6 +63,24 @@ function addToCounter(target, key, values) {
   if (values.meta) Object.assign(target[key], values.meta);
 }
 
+// byApiKey 的对象键是 `${key}|${model}|${provider}`。2026-10-28 之前第一段存的是
+// 原始 key，已经落库的行读出来照样要掩一次，否则 /api/usage/stats 的响应里
+// 还是原始 key。已掩过的不再动（否则每次读都换一个字符串）。
+function sanitizeByApiKeyKey(key) {
+  const parts = String(key || "").split("|");
+  const head = parts.shift() || "";
+  if (!head || head === "local-no-key" || head.startsWith("k_")) return key;
+  return [byApiKeyId(head), ...parts].join("|");
+}
+
+// byApiKey 的桶 id。原来是直接拿原始 key 当对象键 —— 它会被 JSON.stringify 进
+// usageDaily，也会作为 /api/usage/stats 的键发出去，等于把 key 写进库里和响应里。
+// 换成掩码又不行（maskApiKey 只留头 8 + 尾 4，同前缀的团队 key 会撞成一个桶，
+// 见下面 24h 实时路径那句注释）。所以用定长哈希：既不泄漏，也不撞桶。
+function byApiKeyId(rawKey) {
+  return "k_" + createHash("sha256").update(String(rawKey)).digest("hex").slice(0, 12);
+}
+
 function aggregateEntryToDay(day, entry) {
   const promptTokens = entry.tokens?.prompt_tokens || entry.tokens?.input_tokens || 0;
   const completionTokens = entry.tokens?.completion_tokens || entry.tokens?.output_tokens || 0;
@@ -91,7 +110,10 @@ function aggregateEntryToDay(day, entry) {
   }
 
   const apiKeyVal = entry.apiKey && typeof entry.apiKey === "string" ? entry.apiKey : "local-no-key";
-  const akModelKey = `${apiKeyVal}|${entry.model}|${entry.provider || "unknown"}`;
+  // 桶 id 用哈希，不用原始 key，也不用掩码（见 byApiKeyId 的注释）。
+  // meta.apiKey 仍存原始值：读出来按它查 key 名字（apiKeyMap）。
+  const apiKeyId = entry.apiKey ? byApiKeyId(apiKeyVal) : "local-no-key";
+  const akModelKey = `${apiKeyId}|${entry.model}|${entry.provider || "unknown"}`;
   addToCounter(day.byApiKey, akModelKey, { ...vals, meta: { rawModel: entry.model, provider: entry.provider, apiKey: entry.apiKey || null } });
 
   const endpoint = entry.endpoint || "Unknown";
@@ -513,15 +535,16 @@ export async function getUsageStats(period = "all") {
         const apiKeyMasked = maskApiKey(apiKeyVal);
         const keyName = keyInfo?.name || (apiKeyVal ? (apiKeyMasked || apiKeyVal.slice(0, 8) + "...") : "Local (No API Key)");
         const apiKeyKey = apiKeyMasked || "local-no-key";
-        if (!stats.byApiKey[akKey]) {
-          stats.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0, rawModel, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey, lastUsed: dateKey };
+        const safeKey = sanitizeByApiKeyKey(akKey);
+        if (!stats.byApiKey[safeKey]) {
+          stats.byApiKey[safeKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0, rawModel, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey, lastUsed: dateKey };
         }
-        stats.byApiKey[akKey].requests += ak.requests || 0;
-        stats.byApiKey[akKey].promptTokens += ak.promptTokens || 0;
-        stats.byApiKey[akKey].completionTokens += ak.completionTokens || 0;
-        stats.byApiKey[akKey].cachedTokens += ak.cachedTokens || 0;
-        stats.byApiKey[akKey].cost += ak.cost || 0;
-        if (dateKey > (stats.byApiKey[akKey].lastUsed || "")) stats.byApiKey[akKey].lastUsed = dateKey;
+        stats.byApiKey[safeKey].requests += ak.requests || 0;
+        stats.byApiKey[safeKey].promptTokens += ak.promptTokens || 0;
+        stats.byApiKey[safeKey].completionTokens += ak.completionTokens || 0;
+        stats.byApiKey[safeKey].cachedTokens += ak.cachedTokens || 0;
+        stats.byApiKey[safeKey].cost += ak.cost || 0;
+        if (dateKey > (stats.byApiKey[safeKey].lastUsed || "")) stats.byApiKey[safeKey].lastUsed = dateKey;
       }
 
       for (const [epKey, ep] of Object.entries(day.byEndpoint || {})) {
@@ -566,7 +589,7 @@ export async function getUsageStats(period = "all") {
       }
 
       const apiKeyKey = (e.apiKey && typeof e.apiKey === "string")
-        ? `${e.apiKey}|${e.model}|${e.provider || "unknown"}`
+        ? `${byApiKeyId(e.apiKey)}|${e.model}|${e.provider || "unknown"}`
         : "local-no-key";
       if (stats.byApiKey[apiKeyKey] && new Date(ts) > new Date(stats.byApiKey[apiKeyKey].lastUsed)) stats.byApiKey[apiKeyKey].lastUsed = ts;
 
@@ -639,9 +662,9 @@ export async function getUsageStats(period = "all") {
         const keyInfo = apiKeyMap[apiKeyVal];
         const apiKeyMasked = maskApiKey(apiKeyVal);
         const keyName = keyInfo?.name || apiKeyMasked || r.apiKey.slice(0, 8) + "...";
-        // Key by the FULL api key (same as the daily rollup + lastUsed overlay)
-        // — masking here collided all keys sharing a prefix into one bucket.
-        const akKey = `${r.apiKey}|${r.model}|${r.provider || "unknown"}`;
+        // 与日汇总、lastUsed overlay 用同一个桶 id：哈希而不是原始 key。
+        // （掩码会撞桶，见 byApiKeyId 的注释。）
+        const akKey = `${byApiKeyId(r.apiKey)}|${r.model}|${r.provider || "unknown"}`;
         if (!stats.byApiKey[akKey]) {
           stats.byApiKey[akKey] = { requests: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0, rawModel: r.model, provider: providerDisplayName, apiKeyMasked, keyName, apiKeyKey: apiKeyMasked, lastUsed: r.timestamp };
         }
@@ -669,6 +692,14 @@ export async function getUsageStats(period = "all") {
   }
 
   stats.totalRequests = Object.values(stats.byProvider).reduce((sum, p) => sum + (p.requests || 0), 0);
+  // 出口收口：byApiKey 的键里不许出现原始 key。历史行（修复前落库的）第一段
+  // 就是原始 key，各条聚合路径也曾经这么写，所以这里再统一过一遍。
+  const sanitizedApiKeyBuckets = {};
+  for (const [bucketKey, bucketValue] of Object.entries(stats.byApiKey || {})) {
+    sanitizedApiKeyBuckets[sanitizeByApiKeyKey(bucketKey)] = bucketValue;
+  }
+  stats.byApiKey = sanitizedApiKeyBuckets;
+
   return stats;
 }
 

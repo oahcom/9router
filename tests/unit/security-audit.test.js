@@ -33,34 +33,35 @@ describe("AUDIT-002: API key masking", () => {
     expect(historyReturn[0]).not.toContain("apiKey: r.apiKey");
   });
 
-  it("getUsageStats should use apiKeyMasked in byApiKey entries", () => {
+  it("getUsageStats masks the key value and hashes the bucket key", () => {
     const source = fs.readFileSync(
       path.resolve(REPO_ROOT, "src/lib/db/repos/usageRepo.js"),
       "utf-8"
     );
-    // Both code paths (daily summary + 24h live) should use apiKeyMasked
+    // 两条路径（日汇总 + 24h 实时）都要把 key 掩码后放进 value 里
     const maskedCount = (source.match(/apiKeyMasked/g) || []).length;
-    expect(maskedCount).toBeGreaterThanOrEqual(4); // function def + 3 usage sites
+    expect(maskedCount).toBeGreaterThanOrEqual(3);
 
-    // The byApiKey stats entries should use apiKeyMasked, not raw apiKey
-    // Check the daily summary path
-    const dailyPath = source.match(/stats\.byApiKey\[akKey\] = \{[^}]*apiKeyMasked[^}]*\}/);
-    expect(dailyPath).not.toBeNull();
-    // Check the 24h live path
-    const livePath = source.match(/stats\.byApiKey\[akKey\] = \{[^}]*apiKeyMasked[^}]*\}/g);
-    expect(livePath).not.toBeNull();
-    expect(livePath.length).toBeGreaterThanOrEqual(1);
+    // 桶键一律交给 byApiKeyId（哈希），不是原始 key，也不是掩码
+    expect(source).toContain("byApiKeyId(apiKeyVal)");
+    expect(source).toContain("byApiKeyId(r.apiKey)");
+    expect(source).toContain("byApiKeyId(e.apiKey)");
   });
 
-  it("byApiKey object keys should use masked key, not raw key", () => {
+  it("byApiKey bucket keys never carry the raw key", () => {
     const source = fs.readFileSync(
       path.resolve(REPO_ROOT, "src/lib/db/repos/usageRepo.js"),
       "utf-8"
     );
-    // The 24h path should use apiKeyMasked in the akKey template
-    expect(source).toContain("${apiKeyMasked}|${r.model}|${r.provider");
-    // Should NOT use raw r.apiKey in the key
+    // 2026-10-28 之前这里是反过来的：桶键直接拼原始 key（会 JSON.stringify 进
+    // usageDaily，也会作为 /api/usage/stats 的键发出去）。掩码又不行 —— 同前缀
+    // 的团队 key 会撞成一个桶。所以现在的契约是：哈希做桶 id，原始 key 只留在
+    // meta.apiKey 里供查名字用。
     expect(source).not.toContain("${r.apiKey}|${r.model}|${r.provider");
+    expect(source).not.toContain("${e.apiKey}|${e.model}|${e.provider");
+    expect(source).not.toContain("${apiKeyVal}|${entry.model}");
+    // 出口收口：历史行里第一段是原始 key，读的时候再哈希一遍
+    expect(source).toContain("sanitizeByApiKeyKey(bucketKey)");
   });
 });
 

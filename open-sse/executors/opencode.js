@@ -127,6 +127,11 @@ export function generateSessionId(timestamp = Date.now()) {
 const translatedOpencodeSessions = new Map();
 const MAX_TRANSLATED_SESSIONS = 1000;
 
+// 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
+// wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
+// 需要那条路时：OPENCODE_TLS_FALLBACK=1。
+const TLS_FALLBACK_ENABLED = process.env.OPENCODE_TLS_FALLBACK === "1";
+
 export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
@@ -855,21 +860,21 @@ export class OpenCodeExecutor extends BaseExecutor {
         },
       });
     }
-    // Never downgrade to Node here. OpenCode fingerprints the client TLS/HTTP
+    // Never downgrade to Node undici here. OpenCode fingerprints the client TLS/HTTP
     // stack: Bun (the sidecar) is served, while Node/undici is answered with a
     // quota-shaped 429 that is not a real quota. A silent downgrade therefore
     // burns egress health and sessions. Fail retryably so the caller can wait
     // for ASIP to rotate the IP.
     // 上游 ce060c79：undici 的 OpenSSL ClientHello 会被拒成 quota 形状的 429，
     // 但 wreq-js 送同一份 cipher 列表能过。所以 sidecar 不可用、又没有配代理时，
-    // 这里退到它；没装 wreq-js 就照旧回可重试的 503（仍然不降级到 undici）。
-    if (!configuredProxy) {
+    // 这里退到它（要 OPENCODE_TLS_FALLBACK=1 才开）；没装 wreq-js 就照旧回可重试的 503。
+    if (!configuredProxy && TLS_FALLBACK_ENABLED) {
       try {
         return await proxyAwareFetch(url, {
           ...options,
           directFetch: (target, init) =>
             opencodeTlsFetch(target, { method: init.method, headers: init.headers, body: init.body }, { signal: init.signal }),
-        });
+        }, proxyOptions);
       } catch (error) {
         if (!(error instanceof OpencodeTlsUnavailableError)) throw error;
         console.warn("[OpenCode] wreq-js unavailable; not downgrading to undici");

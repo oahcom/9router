@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { EGRESS_CONFIG, MEMORY_CONFIG } from "../config/runtimeConfig.js";
-import { normalizeString, resolveEffectiveProxyUrl } from "./proxyResolution.js";
+import { canonicalProxyKey, normalizeString, resolveEffectiveProxyUrl } from "./proxyResolution.js";
 
 export const DIRECT_EGRESS_ID = "direct";
 
@@ -64,7 +64,7 @@ export function identifyFixedEgress(targetUrl, proxyOptions = null) {
   const { url: proxyUrl } = resolveEffectiveProxyUrl(targetUrl, proxyOptions);
   if (proxyUrl) {
     return {
-      id: hashEgress("proxy", proxyUrl),
+      id: hashEgress("proxy", canonicalProxyKey(proxyUrl) || proxyUrl),
       kind: "proxy",
       confirmed: true,
       ip: null,

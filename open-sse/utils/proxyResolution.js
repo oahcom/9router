@@ -247,6 +247,40 @@ export function normalizeProxyUrl(proxyUrl) {
   }
 }
 
+const PROXY_DEFAULT_PORTS = {
+  "http:": 80,
+  "https:": 443,
+  "socks:": 1080,
+  "socks4:": 1080,
+  "socks4a:": 1080,
+  "socks5:": 1080,
+  "socks5h:": 1080,
+};
+
+// Identity key for a fixed proxy egress. Two spellings of one downstream must
+// not read as two exits: pool egresses are identified by a hash of the URL, so
+// "http://127.0.0.1:7890", "http://127.0.0.1:7890/" and "HTTP://127.0.0.1:7890"
+// used to hash differently, and a "switch" between them logged a new egress
+// while the physical exit never moved. Identity only: credentials dropped,
+// default ports filled in, path and query ignored, socks5h folded into socks5
+// (same host and port means the same exit). http and socks stay distinct.
+export function canonicalProxyKey(proxyUrl) {
+  const normalized = normalizeProxyUrl(proxyUrl);
+  if (!normalized) return null;
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    return normalized.toLowerCase();
+  }
+  let protocol = parsed.protocol.toLowerCase();
+  if (protocol === "socks5h:") protocol = "socks5:";
+  const port = parsed.port || String(PROXY_DEFAULT_PORTS[protocol] ?? "");
+  const hostname = parsed.hostname.toLowerCase();
+  const host = hostname.includes(":") ? `[${hostname}]` : hostname;
+  return `${protocol}//${host}${port ? ":" + port : ""}`;
+}
+
 export function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
   const enabled = proxyOptions?.enabled === true || proxyOptions?.connectionProxyEnabled === true;
   if (!enabled) return null;

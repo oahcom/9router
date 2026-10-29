@@ -15,6 +15,6 @@ describe("request id", () => {
   it("sorts by time: a later request has a larger prefix", () => {
     const earlier = newRequestId(1_793_188_800_000).slice(0, 7);
     const later = newRequestId(1_793_188_800_500).slice(0, 7);
-    expect(later >= earlier).toBe(true);
+    expect(later > earlier).toBe(true);
   });
 });

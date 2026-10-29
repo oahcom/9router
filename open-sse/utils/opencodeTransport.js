@@ -48,7 +48,7 @@ function sidecarPath() {
 
 function block(error) {
   retryAt = Date.now() + OPENCODE_TRANSPORT_CONFIG.failureBackoffMs;
-  console.warn(`[OpenCodeTransport] ${error.message}`);
+  transportWarn(log, `${error.message}`);
   stop();
 }
 
@@ -86,7 +86,7 @@ function start() {
   // stop() 可能在 spawn 等待期间发生：此时这个 promise 已被作废，settle 后
   // 再写入 active 会把旧 sidecar 复活，下次 stop() 就杀不到它（进程泄漏）。
   const gen = startGen;
-  console.log(`[OpenCodeTransport] starting sidecar: ${OPENCODE_TRANSPORT_CONFIG.bunBin} ${sidecarPath()}`);
+  console.log(`starting sidecar: ${OPENCODE_TRANSPORT_CONFIG.bunBin} ${sidecarPath()}`);
   starting = new Promise((resolve, reject) => {
     const token = randomBytes(24).toString("hex");
     // 父进程已经决定这条请求走哪条出口（payload.proxy 为 null 即直连）。
@@ -235,7 +235,14 @@ function forward(transport, payload, signal, headerTimeoutMs = 0) {
   });
 }
 
-export async function fetchViaTransport(url, options = {}, proxyOptions = null) {
+// log 由执行器递进来（可为空）：传输层失败也要能按会话/tag/req= 归档，
+// 之前这里全是裸 console.warn，线上只能看到时间戳（审查发现）。
+function transportWarn(log, message) {
+  if (log && typeof log.warn === "function") log.warn("TRANSPORT", message);
+  else console.warn("[OpenCodeTransport] " + message);
+}
+
+export async function fetchViaTransport(url, options = {}, proxyOptions = null, log = null) {
   // 闸在 available() 之前：能不能发请求是配置问题，许不许发给这个目标不是。
   // 只装在 proxyFetch 里等于没装 —— auto 模式下 executor 先问 sidecar。
   await assertEgressTargetAllowed(typeof url === "string" ? url : url.toString());
@@ -278,8 +285,8 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
         // 出口的请求都会 retire 一次 sidecar，退化成 spawn 风暴。
         let upstreamTimeout = false;
         try { upstreamTimeout = JSON.parse(detail)?.timeout === true; } catch { }
-        console.warn(
-          `[OpenCodeTransport] upstream fetch failed (attempt ${attempt + 1}/2)${upstreamTimeout ? " [timeout]" : ""}: ${detail.slice(0, 300)}`
+        transportWarn(log, 
+          `upstream fetch failed (attempt ${attempt + 1}/2)${upstreamTimeout ? " [timeout]" : ""}: ${detail.slice(0, 300)}`
         );
         if (upstreamTimeout) {
           // 同一出口（同一 proxyUrl）重试必然再等满一次超时：attempt 1 只是把
@@ -287,10 +294,10 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
           // 交回上层换出口；30s 冷却避免大批量超时时把 sidecar 反复杀穿。
           if (Date.now() - lastResetAt >= 30000) {
             lastResetAt = Date.now();
-            console.warn("[OpenCodeTransport] sidecar reported upstream timeout; restarting sidecar to drop stale socket");
+            transportWarn(log, "sidecar reported upstream timeout; restarting sidecar to drop stale socket");
             retire();
           } else {
-            console.warn("[OpenCodeTransport] sidecar reported upstream timeout; reset throttled, fail fast");
+            transportWarn(log, "sidecar reported upstream timeout; reset throttled, fail fast");
           }
           return noteFailure("upstream-timeout");
         }
@@ -313,7 +320,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
       if (options.signal?.aborted || error.name === "AbortError") {
         if (Date.now() - lastResetAt >= 30000) {
           lastResetAt = Date.now();
-          console.warn("[OpenCodeTransport] caller aborted before headers; retiring sidecar to drop stale socket");
+          transportWarn(log, "caller aborted before headers; retiring sidecar to drop stale socket");
           retire();
         }
         return noteFailure(options.signal?.aborted ? "caller-aborted" : "abort-error");
@@ -326,14 +333,14 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
         // 能清池；30s 冷却避免大批量超时时把 sidecar 反复杀穿。
         if (Date.now() - lastResetAt >= 30000) {
           lastResetAt = Date.now();
-          console.warn(`[OpenCodeTransport] ${error.message}; restarting sidecar to drop stale socket`);
+          transportWarn(log, `${error.message}; restarting sidecar to drop stale socket`);
           retire();
         } else {
-          console.warn(`[OpenCodeTransport] ${error.message}; sidecar reset throttled, fail fast`);
+          transportWarn(log, `${error.message}; sidecar reset throttled, fail fast`);
         }
         return noteFailure("header-timeout");
       }
-      console.warn(`[OpenCodeTransport] forward failed (attempt ${attempt + 1}/2): ${error.message}`);
+      transportWarn(log, `forward failed (attempt ${attempt + 1}/2): ${error.message}`);
       // socket hang up 多半是别的请求刚把共享 sidecar 退役了，不是本请求的
       // 上游有问题。此时重试会再开一个 sidecar，把一次失败放大成雪崩。
       if (error.code === "ECONNRESET" || error.code === "EPIPE") {

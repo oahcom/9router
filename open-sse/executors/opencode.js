@@ -52,6 +52,22 @@ function warnTransport(log, message) {
   else console.warn("[OpenCode] " + message);
 }
 
+const DECLINE_LOG_INTERVAL_MS = 60_000;
+const declineLogState = new Map();
+
+// 换线被拒的原因按 reason 聚合：429 风暴时每个请求都会撞上同一句，
+// 逐条打会淹掉真正的信号，完全不打又等于没有归因（审查发现）。
+function logDecline(log, reason, now = Date.now()) {
+  const key = String(reason || "unknown");
+  const last = declineLogState.get(key) || 0;
+  if (now - last < DECLINE_LOG_INTERVAL_MS) {
+    declineLogState.set(key, last);
+    return;
+  }
+  declineLogState.set(key, now);
+  log?.warn?.("EGRESS", "asip declined (" + key + "); no retry");
+}
+
 function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
   const key = egress?.id || "unknown";
   const state = noAlternateLogState.get(key) || { at: 0, suppressed: 0 };
@@ -697,9 +713,9 @@ export class OpenCodeExecutor extends BaseExecutor {
         const rotateHappened = rotated.reason !== "unavailable";
         if (rotateHappened) {
           clearProxyDispatchers();
-        // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
-        // 换一个 generation 让它重建 session，否则重试还走旧隧道（审查发现）。
-        bumpTransportGeneration();
+          // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
+          // 换一个 generation 让它重建 session，否则重试还走旧隧道。
+          bumpTransportGeneration();
           resetEgressState();
           log?.warn?.(
             "EGRESS",
@@ -813,6 +829,9 @@ export class OpenCodeExecutor extends BaseExecutor {
       const asip = await rotateEgress(rotateReason, { signal: args?.signal });
       if (asip.switchedAt >= requestStartedAt) {
         clearProxyDispatchers();
+        // 主路径也必须 bump：sidecar 的 session key 是 proxy|generation，只清 undici
+        // dispatcher 不影响 Bun 那边池化的 socket（原请求刚回 429，socket 还在池里）。
+        bumpTransportGeneration();
         log?.warn?.("EGRESS", "asip rotated egress (" + asip.reason + ") -> retry once on fresh connection");
         const rotatedResult = await super.execute({
           ...args,
@@ -828,9 +847,13 @@ export class OpenCodeExecutor extends BaseExecutor {
         }
         result = rotatedResult ?? result;
       } else {
-        // 换线被拒（合并 / 节流 / 不可用）时不重试：重试会打到同一条被烧的隧道上。
-        // 这句留在 debug：429 风暴里每个请求都会撞上它，WARN 会淹掉真正的信号。
-        log?.debug?.("EGRESS", "asip declined (" + asip.reason + "); no retry");
+        // 换线被拒（合并 / 节流 / 超时 / 不可用）时不重试：重试会打到同一条被烧的隧道上。
+        // 但「为什么没换」必须留在生产日志里 —— 之前写 debug，而服务 LEVEL=INFO，
+        // 274 次 429 的换线结论全都不存在（审查发现）。改成按 reason 60s 限流的 WARN。
+        logDecline(log, asip.reason);
+        // 超时是「asip 已经在换、只是没等它回话」：那条隧道确实要换了，bump 一次，
+        // 免得下一条请求继续骑着它（审查发现）。
+        if (asip.reason === "timeout") bumpTransportGeneration();
       }
     }
     const bodyText = await readResponseText(result.response);
@@ -947,7 +970,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   async fetchUpstream(url, options, proxyOptions = null, log = null) {
-    const response = await fetchViaTransport(url, options, proxyOptions);
+    const response = await fetchViaTransport(url, options, proxyOptions, log);
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
       // off 只是「不要 sidecar」，不等于「不要 TLS 兜底」：两个开关各管一件事。
@@ -991,7 +1014,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 代理判据只认 configuredProxy（= 连接代理 || 环境变量代理，NO_PROXY 已经算过），
     // 不自己再读一遍 process.env —— 那会在 NO_PROXY 放行时把能直连的路挡掉。
     if (!configuredProxy && TLS_FALLBACK_ENABLED) {
-      return this.fetchViaTlsFallback(url, options, proxyOptions);
+      return this.fetchViaTlsFallback(url, options, proxyOptions, log);
     }
     // 具体原因由 transport 侧记录：60s 连接超时、上游无首字节、sidecar 启动失败
     // 是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。

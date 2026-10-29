@@ -44,9 +44,9 @@ function readToken() {
 
 function callAsip(path, payload, signal = null) {
   return new Promise((resolve) => {
-    if (DISABLED) return resolve(null);
+    if (DISABLED) return resolve({ error: "disabled" });
     const token = readToken();
-    if (!token) return resolve(null);
+    if (!token) return resolve({ error: "no-token" });
     const body = payload ? JSON.stringify(payload) : "";
     const req = http.request(
       {
@@ -70,7 +70,7 @@ function callAsip(path, payload, signal = null) {
           try {
             resolve(JSON.parse(buf));
           } catch {
-            resolve(null);
+            resolve({ error: "timeout" });
           }
         });
       }
@@ -80,7 +80,7 @@ function callAsip(path, payload, signal = null) {
       req.destroy();
       resolve(null);
     });
-    req.on("error", () => resolve(null));
+    req.on("error", () => resolve({ error: "socket" }));
     if (body) req.write(body);
       if (signal) signal.addEventListener("abort", () => req.destroy(), { once: true });
     req.end();
@@ -99,6 +99,9 @@ export async function rotateEgress(reason = "rate429", { signal = null } = {}) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted" };
   const res = await callAsip("/rotate", { reason }, signal);
+  // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
+  // 调用方要据此提前重建连接（审查发现）。
+  if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error };
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable" };
   return {
     switched: Boolean(res.switched),

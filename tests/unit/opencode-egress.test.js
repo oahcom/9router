@@ -205,6 +205,38 @@ describe("OpenCode free-lane egress switching", () => {
     expect(messages.every((message) => message.includes("(req=abc1234)"))).toBe(true);
   });
 
+  it("survives a namespace logger whose warn is getter-only", async () => {
+    // 2026-10-30 01:28 线上 502 的复现：log 是 webpack 模块导出对象，warn 只有 getter。
+    // 旧实现 Object.create(log) 之后直接赋值 -> TypeError: Cannot set property warn of
+    // #<Object> which has only a getter，每个请求直接 502。普通对象 {warn} 测不出来。
+    const executor = getExecutor("opencode");
+    const primary = pool("a", "http://proxy-a.example:8080");
+    const alternate = pool("b", "http://proxy-b.example:8080");
+    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const warn = vi.fn();
+    const namespaceLog = Object.create(null);
+    Object.defineProperty(namespaceLog, "warn", { get: () => warn, enumerable: true });
+    Object.defineProperty(namespaceLog, "debug", { value: vi.fn(), enumerable: true });
+    Object.defineProperty(namespaceLog, "info", { value: vi.fn(), enumerable: true });
+
+    fetchMock.mockResolvedValueOnce(rateLimitedResponse()).mockResolvedValueOnce(okResponse());
+
+    const result = await executor.execute({
+      model: MODEL,
+      body: makeBody("getter-only"),
+      stream: false,
+      credentials: { rawHeaders: {} },
+      clientTool: "claude",
+      proxyOptions,
+      providerSessionId: "conv-getter-only",
+      log: namespaceLog,
+      reqId: "abc9999",
+    });
+
+    expect(result.response.status).toBe(200);
+    expect(warn.mock.calls.some((call) => String(call[1]).includes("(req=abc9999)"))).toBe(true);
+  });
+
   it("leaves warn lines untagged when no request id is supplied", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");

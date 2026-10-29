@@ -93,11 +93,4 @@ tests/unit/codex-stt-persisted-refresh.test.js :: uses the real persisted refres
 tests/unit/combo-credit-fallback.test.js :: combo credit fallback routes a 400 response correctly: Bad request
 tests/unit/headroom-responses-format.test.js :: compressWithHeadroom openai-responses format (#1998) skips Responses tool/reasoning history instead of collapsing it into a message (#2132)
 
-# 2026-10-30：本机没有 Bun（command -v bun 为空），sidecar 起不来。下面前两条要 spawn
 # sidecar（spawnCount() / 流式不截断），在此环境下必然红；本机装了 bun 之后可以直接删。
-tests/unit/opencode-transport-retire.test.js :: sidecar retirement does not truncate an in-flight stream when another request fails
-tests/unit/opencode-transport-timeout-cooldown.test.js :: OpenCode transport upstream-timeout cooldown fails fast on a sidecar 504 timeout without retrying the same egress
-
-# 2026-10-30：非流式不套 header timeout 的那条，断言「至少活到 700ms」，实测 40ms 就返回 ——
-# 2026-10-29 的基线里就是红的，和 req= / 换线这批改动无关，等有人重新对一遍语义。
-tests/unit/opencode-transport-header-timeout.test.js :: OpenCode transport header timeout does not apply the header timeout to non-streaming requests

@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { fetchMock, rotateMock, enabledMock } = vi.hoisted(() => {
+const { fetchMock, rotateMock, enabledMock, bumpMock } = vi.hoisted(() => {
   process.env.EGRESS_PROBE_MODE = "off";
   process.env.OPENCODE_TRANSPORT = "off";
   return {
     fetchMock: vi.fn(),
     rotateMock: vi.fn(),
     enabledMock: vi.fn(() => true),
+    bumpMock: vi.fn(),
   };
 });
 
@@ -14,6 +15,13 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: fetchMock,
   clearProxyDispatchers: vi.fn(),
   default: fetchMock,
+}));
+
+vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
+  bumpTransportGeneration: bumpMock,
+  fetchViaTransport: vi.fn(async () => null),
+  peekTransportFailure: vi.fn(() => null),
+  resetTransport: vi.fn(),
 }));
 
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
@@ -75,6 +83,7 @@ beforeEach(() => {
   rotateMock.mockReset();
   enabledMock.mockReset();
   enabledMock.mockReturnValue(true);
+  bumpMock.mockReset();
   resetEgressState();
 });
 
@@ -88,6 +97,9 @@ describe("asip rotation without an alternate pool", () => {
     expect(rotateMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(result.response.status).toBe(200);
+    // 只清 undici dispatcher 不够：Bun sidecar 的 session 是 proxy|generation 分桶的，
+    // 换线后不 bump 就等于还骑在旧隧道上（审查发现）。
+    expect(bumpMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not retry when asip declines the rotation", async () => {
@@ -112,6 +124,18 @@ describe("asip rotation without an alternate pool", () => {
     expect(rotateMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(result.response.status).toBe(429);
+  });
+
+  it("bumps the transport generation when asip times out", async () => {
+    // 超时 = asip 已经在换、只是没等到回话：这条隧道确实要换了，得让 sidecar 重建。
+    fetchMock.mockResolvedValueOnce(rateLimited());
+    rotateMock.mockResolvedValueOnce({ switched: false, switchedAt: 0, reason: "timeout" });
+
+    const result = await run("timeout");
+
+    expect(result.response.status).toBe(429);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bumpMock).toHaveBeenCalledTimes(1);
   });
 
   it("skips asip entirely when rotation is disabled", async () => {

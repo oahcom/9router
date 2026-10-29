@@ -4,8 +4,9 @@
 # 2026-10-28 校正：这里原来 `systemctl --user restart nine-router.service`，
 # 但 nine-router.service 与 auto-switch-ip.service 在本机都不存在（both inactive，
 # 无 unit 文件），脚本在 set -e 下第一条 restart 就中断，且探活还打在已废弃的
-# 20128 端口。9router 的真实运行方式是 setsid + npm run start（custom-server.js）。
-# 现在按真实进程管理重写：只有确实存在 unit 时才走 systemctl。
+# 20128 端口。真实运行方式是 system 级 nine-router-src.service
+# （ExecStart=custom-server.js，Restart=always）——脚本只驱动 unit，不再自己起进程。
+# 历史注记：曾有 setsid + npm run start 的写法，已废弃（不留孤儿进程）。
 set -e
 
 PORT=20127
@@ -30,7 +31,15 @@ echo "[2/3] 重启 nine-router-src.service（system 级 unit）"
 # 脚本拉起的实例 systemd 不认，10s 后 Restart=always 还会撞 EADDRINUSE，
 # 结果是「在跑的进程没人管、unit 进 failed」。
 mkdir -p logs
-systemctl restart nine-router-src.service
+# system 级 unit：非 root 时用 sudo -n（不带 -n 会在 polkit 上卡住，脚本就悄悄挂掉）。
+if [ "$(id -u)" -eq 0 ]; then
+  systemctl restart nine-router-src.service
+else
+  sudo -n systemctl restart nine-router-src.service || {
+    echo "  需要 root：请用 sudo 运行，或手动 systemctl restart nine-router-src.service" >&2
+    exit 1
+  }
+fi
 
 for _ in $(seq 1 60); do
   ss -ltn 2>/dev/null | grep -q ":$PORT " && break

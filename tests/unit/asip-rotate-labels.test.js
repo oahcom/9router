@@ -122,6 +122,15 @@ describe("asip rotate error labels", () => {
     expect(result.reason).toBe("aborted");
   });
 
+  it("reports socket when the token file is corrupt enough to make http.request throw", async () => {
+    // http.request 会同步抛（header 里有非法字符）：不接住就变成 reject，
+    // 异常穿出 execute()，用户请求变 500 —— 而这里是「失败只降级」。
+    fs.writeFileSync(TOKEN_FILE, "tok\u4e2dn", { mode: 0o600 });
+    await listen(() => {});
+    const result = await rotateEgress("rate429");
+    expect(result.reason).toBe("socket");
+  });
+
   it("reports socket when nothing is listening", async () => {
     const result = await rotateEgress("rate429");
     expect(result.reason).toBe("socket");

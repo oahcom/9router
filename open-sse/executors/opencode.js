@@ -867,7 +867,12 @@ export class OpenCodeExecutor extends BaseExecutor {
         logDecline(args?.log, asip.reason);
         // 超时是「asip 已经在换、只是没等它回话」：那条隧道确实要换了，bump 一次，
         // 免得下一条请求继续骑着它（审查发现）。
-        if (asip.reason === "timeout") bumpTransportGeneration();
+        if (asip.reason === "timeout") {
+          // 超时 = asip 已经在换；sidecar 的 session 和 undici 的 keep-alive 池
+          // 都得丢，否则下一条请求还拴在旧隧道上（和上面早退分支保持一致）。
+          clearProxyDispatchers();
+          bumpTransportGeneration();
+        }
       }
     }
     const bodyText = await readResponseText(result.response);

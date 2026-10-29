@@ -48,44 +48,52 @@ function callAsip(path, payload, signal = null) {
     const token = readToken();
     if (!token) return resolve({ error: "no-token" });
     const body = payload ? JSON.stringify(payload) : "";
-    const req = http.request(
-      {
-        socketPath: SOCKET_PATH,
-        path,
-        method: payload ? "POST" : "GET",
-        timeout: TIMEOUT_MS,
-        headers: {
-          "X-Asip-Token": token,
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
+    let req;
+    try {
+      req = http.request(
+        {
+          socketPath: SOCKET_PATH,
+          path,
+          method: payload ? "POST" : "GET",
+          timeout: TIMEOUT_MS,
+          headers: {
+            "X-Asip-Token": token,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
         },
-      },
-      (res) => {
-        // asip 换线途中被 systemd 重启 / OOM 时，响应会半截断掉：
-        // res 只发 aborted + error，req 只发 close，end 永远不来。
-        // 之前这里只挂 data/end，Promise 就永久 pending —— 而两处 await 外层
-        // 没有超时，请求直接挂死（审查发现，实测 3s 仍未 settle）。
-        res.on("aborted", () => resolve({ error: "bad-response" }));
-        res.on("error", () => resolve({ error: "socket" }));
-        if (res.statusCode >= 400) {
-          res.resume();
-          resolve({ error: "bad-status-" + res.statusCode });
-          return;
-        }
-        let buf = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          buf += chunk;
-        });
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(buf));
-          } catch {
-            resolve({ error: "bad-response" });
+        (res) => {
+          // asip 换线途中被 systemd 重启 / OOM 时，响应会半截断掉：
+          // res 只发 aborted + error，req 只发 close，end 永远不来。
+          // 之前这里只挂 data/end，Promise 就永久 pending —— 而两处 await 外层
+          // 没有超时，请求直接挂死（审查发现，实测 3s 仍未 settle）。
+          res.on("aborted", () => resolve({ error: "bad-response" }));
+          res.on("error", () => resolve({ error: "socket" }));
+          if (res.statusCode >= 400) {
+            res.resume();
+            resolve({ error: "bad-status-" + res.statusCode });
+            return;
           }
-        });
-      }
-    );
+          let buf = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            buf += chunk;
+          });
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(buf));
+            } catch {
+              resolve({ error: "bad-response" });
+            }
+          });
+        }
+      );
+    } catch {
+      // http.request 自身会同步抛（header 里有非法字符，比如 token 文件写坏、
+      // 带进了控制字符）。这里若让它 reject，异常会穿出 execute()，
+      // 用户请求变成 500 —— 而这个客户端的原则是「失败只降级，不拖垮请求」。
+      return resolve({ error: "socket" });
+    }
     // 超时/连不上都当作「这次没换」：接口是增强，不能让它拖垮请求本身。
     req.on("timeout", () => {
       req.destroy();

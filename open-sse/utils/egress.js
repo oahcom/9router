@@ -509,7 +509,8 @@ export function syntheticRateLimitResponse(retryAfterMs) {
 export function describeEgress(egress) {
   if (!egress) return "unknown";
   if (egress.kind === "relay") return "relay";
-  if (egress.kind === "proxy") return "proxy";
+  // 只写 "proxy" 的话换池前后是同一句，日志看不出换没换；带短 id 才分得出。
+  if (egress.kind === "proxy") return `proxy#${String(egress.id || "").slice(-6) || "?"}`;
   return egress.confirmed ? `direct ${egress.ip}` : "direct (unconfirmed)";
 }
 

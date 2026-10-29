@@ -155,7 +155,7 @@ export class BaseExecutor {
           headers,
           body: bodyStr,
           signal: mergedSignal,
-        }, proxyOptions);
+        }, proxyOptions, log);
         clearTimeout(connectTimer);
         const ct = response.headers?.get?.("content-type") || "";
         const cl = response.headers?.get?.("content-length") || "?";

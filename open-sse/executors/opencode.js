@@ -888,7 +888,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   /** 兜底出口：把 wreq 的 ClientHello 递给 proxyAwareFetch 的 directFetch。 */
-  async fetchViaTlsFallback(url, options, proxyOptions = null) {
+  async fetchViaTlsFallback(url, options, proxyOptions = null, log = null) {
     // 这条车道只有流式（transformRequest 无条件把 body.stream 置 true），而 wreq 的
     // timeout 是整请求超时、到点会把流拦腰 abort —— 所以这条兜底不设 timeout，
     // 终止只靠调用方的 signal（客户端断开）。
@@ -907,12 +907,12 @@ export class OpenCodeExecutor extends BaseExecutor {
       if (error?.name === "AbortError") throw error;
       // 其余（wreq 不可用 / 真传输失败）回可重试的 503 synthetic，和 sidecar 路径
       // 同一个契约：fetchUpstream 永远回 Response，不抛给 base.execute。
-      console.warn(`[OpenCode] TLS fallback failed (${error?.message || error}); answering a retryable 503`);
+      log?.warn?.("TRANSPORT", `TLS fallback failed (${error?.message || error}); answering a retryable 503`);
       return syntheticTransportError(`OpenCode free lane: TLS fallback failed (${error?.message || error}).`);
     }
   }
 
-  async fetchUpstream(url, options, proxyOptions = null) {
+  async fetchUpstream(url, options, proxyOptions = null, log = null) {
     const response = await fetchViaTransport(url, options, proxyOptions);
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
@@ -921,7 +921,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       // undici 的假 429，而 OPENCODE_TLS_FALLBACK=on 看起来毫无作用。
       const offConfiguredProxy = resolveEffectiveProxyUrl(url, proxyOptions).url;
       if (!offConfiguredProxy && TLS_FALLBACK_ENABLED) {
-        return this.fetchViaTlsFallback(url, options, proxyOptions);
+        return this.fetchViaTlsFallback(url, options, proxyOptions, log);
       }
       return proxyAwareFetch(url, options, proxyOptions);
     }
@@ -931,7 +931,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     const configuredProxy = resolveEffectiveProxyUrl(url, proxyOptions).url;
     if (configuredProxy && !/^https?:\/\//i.test(configuredProxy)) {
       const scheme = configuredProxy.split(":")[0];
-      console.warn(`[OpenCode] ${scheme} 出口不受 Bun 传输支持；请改用 http(s) 代理或设置 OPENCODE_TRANSPORT=off`);
+      log?.warn?.("TRANSPORT", `${scheme} 出口不受 Bun 传输支持；请改用 http(s) 代理或设置 OPENCODE_TRANSPORT=off`);
       return new Response(JSON.stringify({
         type: "error",
         error: {
@@ -962,7 +962,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 具体原因由 transport 侧记录：60s 连接超时、上游无首字节、sidecar 启动失败
     // 是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。
     const transportFailure = peekTransportFailure() || "unknown";
-    console.warn(`[OpenCode] Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
+    log?.warn?.("TRANSPORT", `Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
     return syntheticTransportError(
       `OpenCode free lane requires the Bun transport; sidecar unavailable (${transportFailure}).`,
     );

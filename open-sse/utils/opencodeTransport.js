@@ -48,7 +48,9 @@ function sidecarPath() {
 
 function block(error) {
   retryAt = Date.now() + OPENCODE_TRANSPORT_CONFIG.failureBackoffMs;
-  transportWarn(log, `${error.message}`);
+  // 这里是模块级 spawn 失败的兜底（没有请求上下文，拿不到 log）：
+  // 调用方拿到 synthetic 503 时会用带 tag 的 warnTransport 再报一次。
+  console.warn("[OpenCodeTransport] " + error.message);
   stop();
 }
 

@@ -706,7 +706,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         // （都指向 127.0.0.1:7890），selectAlternateProxy 永远返回 null，这里
         // 一旦拒绝就是「回带 retry-after 数十小时」的死锁 —— 后续请求全被本地
         // 拦掉，根本走不到下面 429 重试分支。实测这就是服务不可用的直接原因。
-        const rotated = await rotateEgress("rate429");
+        const rotated = await rotateEgress("rate429", { signal: args?.signal });
         // 判据不能只看 switched：no_warm_standby / too_frequent 时 asip 没换线，
         // 但冷却已经过期、请求本来也发不出去，重试一次成本极低，而放弃必然 429。
         // 唯一不该重试的是接口不可用（asip 没在跑），那种情况重试也是白重试。

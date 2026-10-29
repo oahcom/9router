@@ -1,3 +1,6 @@
+// 需要 Bun sidecar 的用例：没有 bun 的机器上 skip，别变成「基线之外的新失败」。
+const HAS_BUN = globalThis.__HAS_BUN__ !== false;
+
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,7 +24,7 @@ afterEach(() => {
   transport?.resetTransport();
 });
 
-describe("OpenCode transport header timeout", () => {
+describe.skipIf(!HAS_BUN)("OpenCode transport header timeout", () => {
   it("fails fast instead of waiting for the caller's 60s abort on a stalled egress", async () => {
     const started = Date.now();
     const response = await transport.fetchViaTransport(

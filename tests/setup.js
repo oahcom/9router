@@ -14,7 +14,11 @@ import fs from "node:fs";
 import path from "node:path";
 
 const bunDir = path.join(os.homedir(), ".bun", "bin");
-if (fs.existsSync(path.join(bunDir, "bun"))) {
+const hasBun = fs.existsSync(path.join(bunDir, "bun"));
+// 依赖 Bun sidecar 的用例用 describe.skipIf(!globalThis.__HAS_BUN__)：
+// 没有 bun 的机器上应该 skip，而不是变成「基线之外的新失败」（审查发现）。
+globalThis.__HAS_BUN__ = hasBun;
+if (hasBun) {
   const parts = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
   if (!parts.includes(bunDir)) process.env.PATH = [bunDir, ...parts].join(path.delimiter);
 }

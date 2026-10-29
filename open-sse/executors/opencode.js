@@ -59,13 +59,17 @@ const declineLogState = new Map();
 // 逐条打会淹掉真正的信号，完全不打又等于没有归因（审查发现）。
 function logDecline(log, reason, now = Date.now()) {
   const key = String(reason || "unknown");
-  const last = declineLogState.get(key) || 0;
-  if (now - last < DECLINE_LOG_INTERVAL_MS) {
-    declineLogState.set(key, last);
+  const state = declineLogState.get(key) || { at: 0, suppressed: 0 };
+  if (now - state.at < DECLINE_LOG_INTERVAL_MS) {
+    state.suppressed += 1;
+    declineLogState.set(key, state);
     return;
   }
-  declineLogState.set(key, now);
-  log?.warn?.("EGRESS", "asip declined (" + key + "); no retry");
+  const suffix = state.suppressed ? " (+" + state.suppressed + " suppressed)" : "";
+  declineLogState.set(key, { at: now, suppressed: 0 });
+  const line = "asip declined (" + key + "); no retry" + suffix;
+  if (log?.warn) log.warn("EGRESS", line);
+  else console.warn("[OpenCode] EGRESS " + line);
 }
 
 function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
@@ -710,7 +714,10 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 判据不能只看 switched：no_warm_standby / too_frequent 时 asip 没换线，
         // 但冷却已经过期、请求本来也发不出去，重试一次成本极低，而放弃必然 429。
         // 唯一不该重试的是接口不可用（asip 没在跑），那种情况重试也是白重试。
-        const rotateHappened = rotated.reason !== "unavailable";
+        // asip 没在跑 / 没 token / 连接断了 / 超时 —— 这些都没有「换线」可言，
+        // 重试只会白打一次上游（还会把刚设的冷却清掉）。
+        const NO_ROTATION = ["unavailable", "disabled", "no-token", "socket", "timeout", "aborted", "bad-response"];
+        const rotateHappened = !NO_ROTATION.includes(rotated.reason);
         if (rotateHappened) {
           clearProxyDispatchers();
           // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
@@ -850,7 +857,8 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 换线被拒（合并 / 节流 / 超时 / 不可用）时不重试：重试会打到同一条被烧的隧道上。
         // 但「为什么没换」必须留在生产日志里 —— 之前写 debug，而服务 LEVEL=INFO，
         // 274 次 429 的换线结论全都不存在（审查发现）。改成按 reason 60s 限流的 WARN。
-        logDecline(log, asip.reason);
+        // 这是 60s 聚合行，覆盖多个请求，不能贴某一条的 req=（会误导归属）。
+        logDecline(args?.log, asip.reason);
         // 超时是「asip 已经在换、只是没等它回话」：那条隧道确实要换了，bump 一次，
         // 免得下一条请求继续骑着它（审查发现）。
         if (asip.reason === "timeout") bumpTransportGeneration();

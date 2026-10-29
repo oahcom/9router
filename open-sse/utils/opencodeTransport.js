@@ -88,7 +88,7 @@ function start() {
   // stop() 可能在 spawn 等待期间发生：此时这个 promise 已被作废，settle 后
   // 再写入 active 会把旧 sidecar 复活，下次 stop() 就杀不到它（进程泄漏）。
   const gen = startGen;
-  console.log(`starting sidecar: ${OPENCODE_TRANSPORT_CONFIG.bunBin} ${sidecarPath()}`);
+  console.log("[OpenCodeTransport] " + `starting sidecar: ${OPENCODE_TRANSPORT_CONFIG.bunBin} ${sidecarPath()}`);
   starting = new Promise((resolve, reject) => {
     const token = randomBytes(24).toString("hex");
     // 父进程已经决定这条请求走哪条出口（payload.proxy 为 null 即直连）。

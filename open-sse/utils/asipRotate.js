@@ -70,7 +70,7 @@ function callAsip(path, payload, signal = null) {
           try {
             resolve(JSON.parse(buf));
           } catch {
-            resolve({ error: "timeout" });
+            resolve({ error: "bad-response" });
           }
         });
       }
@@ -78,11 +78,12 @@ function callAsip(path, payload, signal = null) {
     // 超时/连不上都当作「这次没换」：接口是增强，不能让它拖垮请求本身。
     req.on("timeout", () => {
       req.destroy();
-      resolve(null);
+      resolve({ error: "timeout" });
     });
-    req.on("error", () => resolve({ error: "socket" }));
+    // 客户端自己走了（abort）和 asip 连不上是两回事：前者不该触发重试。
+    req.on("error", () => resolve({ error: signal?.aborted ? "aborted" : "socket" }));
     if (body) req.write(body);
-      if (signal) signal.addEventListener("abort", () => req.destroy(), { once: true });
+    if (signal) signal.addEventListener("abort", () => req.destroy(), { once: true });
     req.end();
   });
 }

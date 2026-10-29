@@ -138,3 +138,7 @@ jwt-secret
 auth/cli-secret
 machine-id
 .vitest-report.json
+
+# 手工备份 / 编辑器残留不许进仓库（opencode.js.bak-20261030-0125 教训）
+*.bak-*
+*.bak

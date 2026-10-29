@@ -520,7 +520,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log, reqId };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 

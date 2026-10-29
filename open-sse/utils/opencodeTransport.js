@@ -26,6 +26,14 @@ function noteFailure(reason) {
   return null;
 }
 
+// sidecar 按 (proxy, generation) 分桶复用 socket：换线后 bump 一次，
+// 下一次请求就会拿到新 session / 新连接，而不是骑在旧隧道上。
+let transportGeneration = 0;
+export function bumpTransportGeneration() {
+  transportGeneration += 1;
+  return transportGeneration;
+}
+
 export function peekTransportFailure() {
   return lastFailure;
 }
@@ -259,6 +267,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
         headers: headerObject(options.headers),
         body: options.body,
         proxy: proxyUrl || null,
+        sessionGeneration: transportGeneration,
         // 0 = 不设上限（非流式：长生成可能在响应头返回前就超过 19s）
         timeoutMs: headerTimeoutMs,
       }, options.signal, headerTimeoutMs);

@@ -42,8 +42,9 @@ const SESSION_IDLE_TIMEOUT_SEC = 10;
 const SESSION_MAX_IDLE_SOCKETS = 8;
 const sessions = new Map();
 
-function sessionFor(proxy) {
-  const key = proxy || "direct";
+function sessionFor(proxy, generation = 0) {
+  // generation 由父进程在换线后 bump：selector 变了，旧连接不再是同一条出口。
+  const key = (proxy || "direct") + "|" + generation;
   let session = sessions.get(key);
   if (!session) {
     session = new Bun.FetchSession({
@@ -53,6 +54,8 @@ function sessionFor(proxy) {
         maxIdleSockets: SESSION_MAX_IDLE_SOCKETS,
       },
     });
+    // 旧 generation 的 session 不会再用到，交给 idleTimeout 淘汰；表只留最近 64 个。
+    if (sessions.size >= 64) sessions.delete(sessions.keys().next().value);
     sessions.set(key, session);
   }
   return session;
@@ -98,7 +101,7 @@ const server = Bun.serve({
 
     let upstream;
     try {
-      upstream = await sessionFor(payload.proxy).fetch(payload.url, options);
+      upstream = await sessionFor(payload.proxy, payload.sessionGeneration).fetch(payload.url, options);
     } catch (error) {
       clearTimeout(timeoutId);
       const msg = String(error?.message || error);

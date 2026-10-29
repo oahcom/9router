@@ -101,6 +101,19 @@ describe("asip rotation without an alternate pool", () => {
     expect(result.response.status).toBe(429);
   });
 
+  it("does not retry on a stale non-zero switchedAt", async () => {
+    // coalesced / too_frequent 会回上一次换线的时间戳：非零，但远早于本次请求。
+    // 只看「非零」会误判成换成功，所以 gate 必须比时间。
+    fetchMock.mockResolvedValueOnce(rateLimited());
+    rotateMock.mockResolvedValueOnce({ switched: false, switchedAt: Date.now() - 60_000, reason: "coalesced" });
+
+    const result = await run("stale");
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.response.status).toBe(429);
+  });
+
   it("skips asip entirely when rotation is disabled", async () => {
     enabledMock.mockReturnValue(false);
     fetchMock.mockResolvedValueOnce(rateLimited());

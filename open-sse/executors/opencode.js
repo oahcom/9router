@@ -8,7 +8,7 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
-import { fetchViaTransport, peekTransportFailure } from "../utils/opencodeTransport.js";
+import { bumpTransportGeneration, fetchViaTransport, peekTransportFailure } from "../utils/opencodeTransport.js";
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
@@ -22,7 +22,17 @@ const noAlternateLogState = new Map();
 function tagWarnWithRequest(log, reqId) {
   if (!log || typeof log.warn !== "function" || !reqId) return log;
   const warn = log.warn.bind(log);
-  return { ...log, warn: (tag, message, data) => warn(tag, message + " (req=" + reqId + ")", data) };
+  // Object.create 而不是 {...log}：class logger 的 debug/info/errorLine 在 prototype 上，
+  // 浅拷贝只复制自有属性，会把这些方法整个丢掉，日志静默消失（审查发现）。
+  const wrapped = Object.create(log);
+  wrapped.warn = (tag, message, data) => warn(tag, message + " (req=" + reqId + ")", data);
+  return wrapped;
+}
+
+// 传输层诊断：有请求上下文就回 tag 体系，没有就退回 console —— 不能因为没 log 而静默。
+function warnTransport(log, message) {
+  if (log && typeof log.warn === "function") log.warn("TRANSPORT", message);
+  else console.warn("[OpenCode] " + message);
 }
 
 function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
@@ -670,6 +680,9 @@ export class OpenCodeExecutor extends BaseExecutor {
         const rotateHappened = rotated.reason !== "unavailable";
         if (rotateHappened) {
           clearProxyDispatchers();
+        // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
+        // 换一个 generation 让它重建 session，否则重试还走旧隧道（审查发现）。
+        bumpTransportGeneration();
           resetEgressState();
           log?.warn?.(
             "EGRESS",
@@ -678,6 +691,7 @@ export class OpenCodeExecutor extends BaseExecutor {
           const retryPrepared = this.prepareRequestCredentials({ ...args, egressId: "asip-rotated" });
           const retried = await super.execute({
             ...args,
+            log,
             credentials: retryPrepared,
             proxyOptions,
           });
@@ -712,7 +726,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     const mayReplay = hasAlternateEgresses(proxyOptions) || asipRotationEnabled();
     const retryBody = mayReplay ? cloneRequestBody(args.body) : null;
 
-    let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
+    let result = await super.execute({ ...args, log, credentials: prepared, proxyOptions });
     // 这条响应实际来自哪条出口：503 failover 会把 result 换成另一条出口的结果，
     // 所以下面那句诊断日志要跟着 attempt 走，不能拿第一条出口的对象去猜。
     let attemptEgress = egress;
@@ -737,6 +751,7 @@ export class OpenCodeExecutor extends BaseExecutor {
           );
           result = await super.execute({
             ...args,
+            log,
             body: retryBody,
             credentials: failoverCredentials,
             proxyOptions: failover.alternate.proxyOptions,
@@ -784,6 +799,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         log?.warn?.("EGRESS", "asip rotated egress (" + asip.reason + ") -> retry once on fresh connection");
         const rotatedResult = await super.execute({
           ...args,
+          log,
           credentials: prepared,
           proxyOptions,
           ...(retryBody ? { body: retryBody } : {}),
@@ -866,6 +882,7 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     const retryResult = await super.execute({
       ...args,
+      log,
       body: retryBody || args.body,
       credentials: retryCredentials,
       proxyOptions: retryProxyOptions,
@@ -907,7 +924,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       if (error?.name === "AbortError") throw error;
       // 其余（wreq 不可用 / 真传输失败）回可重试的 503 synthetic，和 sidecar 路径
       // 同一个契约：fetchUpstream 永远回 Response，不抛给 base.execute。
-      log?.warn?.("TRANSPORT", `TLS fallback failed (${error?.message || error}); answering a retryable 503`);
+      warnTransport(log, `TLS fallback failed (${error?.message || error}); answering a retryable 503`);
       return syntheticTransportError(`OpenCode free lane: TLS fallback failed (${error?.message || error}).`);
     }
   }
@@ -931,7 +948,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     const configuredProxy = resolveEffectiveProxyUrl(url, proxyOptions).url;
     if (configuredProxy && !/^https?:\/\//i.test(configuredProxy)) {
       const scheme = configuredProxy.split(":")[0];
-      log?.warn?.("TRANSPORT", `${scheme} 出口不受 Bun 传输支持；请改用 http(s) 代理或设置 OPENCODE_TRANSPORT=off`);
+      warnTransport(log, `${scheme} 出口不受 Bun 传输支持；请改用 http(s) 代理或设置 OPENCODE_TRANSPORT=off`);
       return new Response(JSON.stringify({
         type: "error",
         error: {
@@ -962,7 +979,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 具体原因由 transport 侧记录：60s 连接超时、上游无首字节、sidecar 启动失败
     // 是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。
     const transportFailure = peekTransportFailure() || "unknown";
-    log?.warn?.("TRANSPORT", `Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
+    warnTransport(log, `Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
     return syntheticTransportError(
       `OpenCode free lane requires the Bun transport; sidecar unavailable (${transportFailure}).`,
     );

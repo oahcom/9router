@@ -38,11 +38,19 @@ for _ in $(seq 1 60); do
   ss -ltn 2>/dev/null | grep -q ":$PORT " && break
   sleep 0.5
 done
+# 启动事实落进日志：buildId 是本次启动实际服务的构建标识，pid 是和端口绑定的进程。
+# 文件名里的时刻只作人读线索 —— 本机时钟会漂，判据只能是文件内容。
+NEW_PID=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
+echo "buildId=$(cat .next/BUILD_ID 2>/dev/null || echo unknown) pid=${NEW_PID:-unknown} at=$(date -Is)" | tee -a "$LOG"
 echo "  日志: $LOG"
 
 echo "[3/3] 验证"
 curl -s -o /dev/null -w "  /v1/models HTTP=%{http_code} t=%{time_total}s\n" --max-time 10 \
   "http://127.0.0.1:$PORT/v1/models" \
   -H "Authorization: Bearer ${HERMES_ROUTER_KEY:-9router-local}"
+
+# 部署态自检：刚重启过，磁盘与运行应当一致。不一致就当场喊出来，
+# 而不是等下次有人发现产物里有修复、线上还是旧闸门。不因它中断脚本。
+bash scripts/check_deploy_state.sh || true
 
 echo "=== 完成 ==="

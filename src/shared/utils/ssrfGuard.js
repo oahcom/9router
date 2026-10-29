@@ -37,15 +37,20 @@ function ipv4ToInt(host) {
   return value >>> 0;
 }
 
-// Private/reserved IPv4 ranges as [startInt, maskBits].
+// Private/reserved IPv4 ranges as [startInt, maskBits, reason].
+// reason 是审计对账用的：listBlockedRanges() 直接把它吐出来，不必再维护第二张表。
 const BLOCKED_V4_RANGES = [
-  [ipv4ToInt("0.0.0.0"), 8],
-  [ipv4ToInt("10.0.0.0"), 8],
-  [ipv4ToInt("100.64.0.0"), 10], // CGNAT — also used by some cloud metadata proxies
-  [ipv4ToInt("127.0.0.0"), 8],
-  [ipv4ToInt("169.254.0.0"), 16], // includes 169.254.169.254 cloud metadata
-  [ipv4ToInt("172.16.0.0"), 12],
-  [ipv4ToInt("192.168.0.0"), 16],
+  [ipv4ToInt("0.0.0.0"), 8, "\"this network\" (RFC 1122)"],
+  [ipv4ToInt("10.0.0.0"), 8, "RFC1918 private"],
+  [ipv4ToInt("100.64.0.0"), 10, "CGNAT — also used by some cloud metadata proxies (Aliyun 100.100.100.200)"],
+  [ipv4ToInt("127.0.0.0"), 8, "loopback"],
+  [ipv4ToInt("169.254.0.0"), 16, "link-local (AWS/GCP/Tencent metadata 169.254.169.254)"],
+  // 两个云厂商把元数据端点放在公网可路由的段里，只能按 /32 精确拦：
+  // 168.63.0.0/16 与 192.0.0.0/24 含大量正常服务地址，放宽会误杀真实出站。
+  [ipv4ToInt("168.63.129.16"), 32, "Azure WireServer / IMDS virtual IP"],
+  [ipv4ToInt("192.0.0.192"), 32, "Oracle Cloud IMDS"],
+  [ipv4ToInt("172.16.0.0"), 12, "RFC1918 private"],
+  [ipv4ToInt("192.168.0.0"), 16, "RFC1918 private"],
 ];
 
 function isBlockedIpv4Int(ip) {
@@ -59,6 +64,19 @@ function isBlockedIpv4(host) {
   const ip = ipv4ToInt(host);
   if (ip === null) return false;
   return isBlockedIpv4Int(ip);
+}
+
+function intToIpv4(value) {
+  return [(value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff].join(".");
+}
+
+// 拒绝集合可枚举：审计要能问「现在到底拦了哪些段」，而不是读源码猜。
+// 返回 [{cidr, reason}]，reason 供对账；判定内核仍只用 [int, maskBits] 元组。
+export function listBlockedRanges() {
+  return BLOCKED_V4_RANGES.map(([base, bits, reason]) => ({
+    cidr: `${intToIpv4(base)}/${bits}`,
+    reason,
+  }));
 }
 
 function parseHextets(s) {

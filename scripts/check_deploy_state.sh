@@ -1,0 +1,49 @@
+#!/bin/bash
+# 部署态自检：比对磁盘上的构建标识与运行进程报告的构建标识。
+#
+# 为什么需要它：npm run build 只换磁盘文件，不换正在跑的进程。没有这道比对，
+# 「构建完成了」和「新构建生效了」在外部看来完全一样，于是会出现「产物里有修复、
+# 线上仍是旧闸门」这种沉默态。
+#
+# 判据来源刻意选 BUILD_ID 双方比对，而不是「进程启动时刻 vs 产物 mtime」：
+# 本机（WSL2）用 /proc/stat 的 btime 反推进程启动时刻会漂，同一 pid 三次读数
+# 得到 10:04 / 11:07 / 12:04，那条判据不可用。buildId 是常量字符串，不依赖时钟。
+#
+# 退出码：
+#   0  MATCH        磁盘与运行一致
+#   1  MISMATCH     构建了但没重启（或运行的是别的构建）
+#   2  UNAVAILABLE  判不了（读不到磁盘 BUILD_ID / 连不上服务 / 服务没报 buildId）
+#                   —— 连不上绝不能当「一致」返回 0。
+#
+# 可用环境变量覆盖：NEXT_DIST_DIR（默认 .next）、HEALTH_URL。
+
+cd "$(dirname "$0")/.." || exit 2
+
+DIST_DIR="${NEXT_DIST_DIR:-.next}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:20127/api/health}"
+
+disk=$(tr -d '[:space:]' < "$DIST_DIR/BUILD_ID" 2>/dev/null)
+if [ -z "$disk" ]; then
+  echo "UNAVAILABLE disk BUILD_ID unreadable: $DIST_DIR/BUILD_ID"
+  exit 2
+fi
+
+body=$(curl -s -m 3 "$HEALTH_URL" 2>/dev/null)
+if [ -z "$body" ]; then
+  echo "UNAVAILABLE cannot reach $HEALTH_URL"
+  exit 2
+fi
+
+runtime=$(printf '%s' "$body" | jq -r '.buildId // empty' 2>/dev/null)
+if [ -z "$runtime" ]; then
+  echo "UNAVAILABLE runtime did not report buildId (endpoint predates this check): $body"
+  exit 2
+fi
+
+if [ "$disk" = "$runtime" ]; then
+  echo "disk=$disk runtime=$runtime MATCH"
+  exit 0
+fi
+
+echo "disk=$disk runtime=$runtime MISMATCH"
+exit 1

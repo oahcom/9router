@@ -177,6 +177,60 @@ describe("OpenCode free-lane egress switching", () => {
     // neither shape matters to the quota — the exit IP does.
     expect(second[1].headers["x-opencode-session"]).toMatch(OPENCODE_SESSION_RE);
   });
+  it("tags every EGRESS warn with the request id it was given", async () => {
+    const executor = getExecutor("opencode");
+    const primary = pool("a", "http://proxy-a.example:8080");
+    const alternate = pool("b", "http://proxy-b.example:8080");
+    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const warn = vi.fn();
+    const log = { warn, debug: vi.fn(), info: vi.fn() };
+
+    fetchMock.mockResolvedValueOnce(rateLimitedResponse()).mockResolvedValueOnce(okResponse());
+
+    const result = await executor.execute({
+      model: MODEL,
+      body: makeBody("tagged"),
+      stream: false,
+      credentials: { rawHeaders: {} },
+      clientTool: "claude",
+      proxyOptions,
+      providerSessionId: "conv-tagged",
+      log,
+      reqId: "abc1234",
+    });
+
+    expect(result.response.status).toBe(200);
+    const messages = warn.mock.calls.map((call) => String(call[1]));
+    expect(messages.length).toBeGreaterThan(0);
+    expect(messages.every((message) => message.includes("(req=abc1234)"))).toBe(true);
+  });
+
+  it("leaves warn lines untagged when no request id is supplied", async () => {
+    const executor = getExecutor("opencode");
+    const primary = pool("a", "http://proxy-a.example:8080");
+    const alternate = pool("b", "http://proxy-b.example:8080");
+    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const warn = vi.fn();
+    const log = { warn, debug: vi.fn(), info: vi.fn() };
+
+    fetchMock.mockResolvedValueOnce(rateLimitedResponse()).mockResolvedValueOnce(okResponse());
+
+    const result = await executor.execute({
+      model: MODEL,
+      body: makeBody("untagged"),
+      stream: false,
+      credentials: { rawHeaders: {} },
+      clientTool: "claude",
+      proxyOptions,
+      providerSessionId: "conv-untagged",
+      log,
+    });
+
+    expect(result.response.status).toBe(200);
+    const messages = warn.mock.calls.map((call) => String(call[1]));
+    expect(messages.length).toBeGreaterThan(0);
+    expect(messages.every((message) => !message.includes("req="))).toBe(true);
+  });
   it("retries only once when the alternate is also rate-limited", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");

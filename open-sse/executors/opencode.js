@@ -19,6 +19,12 @@ import { classifyRotateReason } from "../utils/egressClassify.js";
 const NO_ALTERNATE_LOG_INTERVAL_MS = 60_000;
 const noAlternateLogState = new Map();
 
+function tagWarnWithRequest(log, reqId) {
+  if (!log || typeof log.warn !== "function" || !reqId) return log;
+  const warn = log.warn.bind(log);
+  return { ...log, warn: (tag, message, data) => warn(tag, message + " (req=" + reqId + ")", data) };
+}
+
 function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
   const key = egress?.id || "unknown";
   const state = noAlternateLogState.get(key) || { at: 0, suppressed: 0 };
@@ -608,7 +614,11 @@ export class OpenCodeExecutor extends BaseExecutor {
   // relay 分支在解析 proxyUrl 之前就 return，directFetch 会被忽略 —— 那种情况下这条
   // 兜底并没有生效，请求仍以 undici 的 ClientHello 走 relay。
   async execute(args) {
-    const { model, stream, credentials, log } = args;
+    const { model, stream, credentials } = args;
+    // Every warn this request emits carries its short id, so the EGRESS lines
+    // (rotate / cooling / no-alternate) and the final ERROR can be stitched
+    // together without guessing from timestamps. Call sites stay untouched.
+    const log = tagWarnWithRequest(args.log, args.reqId);
     let proxyOptions = args.proxyOptions || null;
 
     let targetUrl;

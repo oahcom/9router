@@ -25,27 +25,32 @@ else
   echo "[1/3] 跳过 auto-switch-ip.service（本机无该 unit）"
 fi
 
-echo "[2/3] 重启 9router 进程"
-OLD_PID=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1 || true)
-if [ -n "${OLD_PID:-}" ]; then
-  echo "  kill $OLD_PID"
-  kill "$OLD_PID" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    ss -ltn 2>/dev/null | grep -q ":$PORT " || break
-    sleep 0.5
-  done
-fi
-LOG="logs/start-$(date +%Y%m%d-%H%M).log"
-setsid nohup npm run start > "$LOG" 2>&1 &
+echo "[2/3] 重启 nine-router-src.service（system 级 unit）"
+# 不在这里 kill 端口上的进程再自己 setsid 起一个：真实部署由 unit 管，
+# 脚本拉起的实例 systemd 不认，10s 后 Restart=always 还会撞 EADDRINUSE，
+# 结果是「在跑的进程没人管、unit 进 failed」。
+mkdir -p logs
+systemctl restart nine-router-src.service
+
 for _ in $(seq 1 60); do
   ss -ltn 2>/dev/null | grep -q ":$PORT " && break
   sleep 0.5
 done
-echo "  日志: $LOG"
+if ! ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+  echo "  启动失败：$PORT 没有在听（unit 起不来的话，日志在 journalctl -u nine-router-src）" >&2
+  systemctl status nine-router-src.service --no-pager -n 20 >&2 || true
+  exit 1
+fi
+echo "  systemctl is-active: $(systemctl is-active nine-router-src.service)"
 
 echo "[3/3] 验证"
-curl -s -o /dev/null -w "  /v1/models HTTP=%{http_code} t=%{time_total}s\n" --max-time 10 \
-  "http://127.0.0.1:$PORT/v1/models" \
-  -H "Authorization: Bearer ${HERMES_ROUTER_KEY:-9router-local}"
+# 探活要判结果：原来 curl 的退出码没人看，服务没起来也打印「完成」。
+KEY=$HERMES_ROUTER_KEY
+[ -n "$KEY" ] || KEY=9router-local
+if ! curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:$PORT/v1/models" -H "Authorization: Bearer $KEY"; then
+  echo "  探活失败：/v1/models 没回 2xx" >&2
+  exit 1
+fi
+echo "  /v1/models OK"
 
 echo "=== 完成 ==="

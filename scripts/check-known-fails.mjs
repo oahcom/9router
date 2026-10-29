@@ -25,17 +25,22 @@ function readBaseline() {
 
 function readFailures() {
   const report = JSON.parse(readFileSync(REPORT, "utf8"));
-  const out = new Set();
+  // 存「条目 -> 失败文本」：ABI 这类环境问题只体现在 message 里，
+  // 光看标题永远匹配不到（审查发现 exit 2 分支其实不可达）。
+  const out = new Map();
   for (const file of report.testResults || []) {
     const rel = file.name.replace(/\\/g, "/").replace(/^.*?(tests\/)/, "$1");
-    if (file.status === "failed" && !(file.assertionResults || []).length) {
-      out.add(`${rel} :: <suite failed to load>`);
+    const suiteText = file.message || "";
+    const assertions = file.assertionResults || [];
+    if (file.status === "failed" && !assertions.length) {
+      out.set(rel + " :: <suite failed to load>", suiteText);
       continue;
     }
-    for (const a of file.assertionResults || []) {
+    for (const a of assertions) {
       if (a.status !== "failed") continue;
       const name = [...(a.ancestorTitles || []), a.title].join(" ");
-      out.add(`${rel} :: ${name}`);
+      const text = [suiteText, a.message || "", ...(a.failureMessages || [])].join("\n");
+      out.set(rel + " :: " + name, text);
     }
   }
   return out;
@@ -43,34 +48,38 @@ function readFailures() {
 
 const baseline = readBaseline();
 const failures = readFailures();
-const unexpected = [...failures].filter((f) => !baseline.has(f)).sort();
 console.log("node " + process.version + " (abi " + process.versions.modules + ")");
+
+const unexpected = [...failures.keys()].filter((f) => !baseline.has(f)).sort();
 const fixed = [...baseline].filter((f) => !failures.has(f)).sort();
 
 if (fixed.length) {
-  console.log(`基线里已转绿（可以从 known-fails.txt 删掉）：${fixed.length}`);
+  console.log("基线里已转绿（可以从 known-fails.txt 删掉）：" + fixed.length);
   for (const f of fixed) console.log("  - " + f);
 }
 
 // ABI 不符（better_sqlite3 这类原生模块）不是回归：用默认 node 跑就会冒出来。
-// 单独说清楚，别混进「基线之外的新失败」里让人以为代码坏了。
-const abiMismatch = unexpected.filter((f) => /NODE_MODULE_VERSION/.test(f));
-const realUnexpected = unexpected.filter((f) => !abiMismatch.includes(f));
+// 判据看失败文本，不看标题；而且必须先把真实新失败报完，再决定要不要 exit 2 ——
+// 不然一次运行里的真回归会被环境问题吞掉（审查发现）。
+const isAbi = (f) => /NODE_MODULE_VERSION/.test(failures.get(f) || "");
+const abiMismatch = unexpected.filter(isAbi);
+const realUnexpected = unexpected.filter((f) => !isAbi(f));
+
+if (realUnexpected.length) {
+  console.error("基线之外的新失败：" + realUnexpected.length);
+  for (const f of realUnexpected) console.error("  + " + f);
+  if (abiMismatch.length) {
+    console.error("（另有 " + abiMismatch.length + " 条是 Node ABI 不符，先修上面这些）");
+  }
+  process.exit(1);
+}
 
 if (abiMismatch.length) {
-  console.error(
-    "环境不符：" + abiMismatch.length + " 条是 Node ABI 不对（本机 " +
-    process.version + "，abi " + process.versions.modules + "）。"
-  );
+  console.error("环境不符：" + abiMismatch.length + " 条是 Node ABI 不对（本机 " + process.version +
+    "，abi " + process.versions.modules + "）。");
   console.error("  用 PATH=/opt/node-v22.23.4/bin:$PATH 重跑，或 npm rebuild 原生模块。");
   for (const f of abiMismatch) console.error("  ! " + f);
   process.exit(2);
 }
 
-if (unexpected.length) {
-  console.error(`基线之外的新失败：${unexpected.length}`);
-  for (const f of unexpected) console.error("  + " + f);
-  process.exit(1);
-}
-
-console.log(`没有基线之外的新失败（当前失败 ${failures.size} 条，基线 ${baseline.size} 条）`);
+console.log("没有基线之外的新失败（当前失败 " + failures.size + " 条，基线 " + baseline.size + " 条）");

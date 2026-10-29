@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import fs from "node:fs";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { MEMORY_CONFIG, OPENCODE_TRANSPORT_CONFIG } from "../config/runtimeConfig.js";
@@ -8,7 +9,7 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
-import { fetchViaTransport } from "../utils/opencodeTransport.js";
+import { fetchViaTransport, peekTransportFailure } from "../utils/opencodeTransport.js";
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
@@ -18,6 +19,12 @@ import { classifyRotateReason } from "../utils/egressClassify.js";
 // 同一出口的「没有备选」每分钟最多落一行；被压掉的次数在下一行末尾追报。
 const NO_ALTERNATE_LOG_INTERVAL_MS = 60_000;
 const noAlternateLogState = new Map();
+
+function tagWarnWithRequest(log, reqId) {
+  if (!log || typeof log.warn !== "function" || !reqId) return log;
+  const warn = log.warn.bind(log);
+  return { ...log, warn: (tag, message, data) => warn(tag, message + " (req=" + reqId + ")", data) };
+}
 
 function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
   const key = egress?.id || "unknown";
@@ -144,6 +151,24 @@ function syntheticTransportError(message) {
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
 // 开关在 runtimeConfig 里统一读：OPENCODE_TLS_FALLBACK=on 才开。
 const TLS_FALLBACK_ENABLED = OPENCODE_TRANSPORT_CONFIG.tlsFallback;
+
+// WB-DUMP（临时）：把发往 free lane 的请求体与请求头落盘，用于对比 DSH 与
+// Claude Code 的差异。定位完成后整段删除。
+function wbDump(url, options) {
+  try {
+    const body = typeof options?.body === "string" ? options.body : "";
+    if (!body) return;
+    const isDsh = body.includes("DeepSeek Harness");
+    if (!isDsh && !body.includes("Claude")) return;
+    const dir = "/tmp/ocdump";
+    fs.mkdirSync(dir, { recursive: true });
+    if (fs.readdirSync(dir).length > 300) return;
+    const kind = isDsh ? "dsh" : "cc";
+    const name = `${dir}/${Date.now()}-${kind}-${process.pid}.json`;
+    const parsed = (() => { try { return JSON.parse(body); } catch { return body.slice(0, 2000); } })();
+    fs.writeFileSync(name, JSON.stringify({ url, headers: options?.headers, body: parsed }, null, 1));
+  } catch {}
+}
 
 export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
@@ -608,7 +633,11 @@ export class OpenCodeExecutor extends BaseExecutor {
   // relay 分支在解析 proxyUrl 之前就 return，directFetch 会被忽略 —— 那种情况下这条
   // 兜底并没有生效，请求仍以 undici 的 ClientHello 走 relay。
   async execute(args) {
-    const { model, stream, credentials, log } = args;
+    const { model, stream, credentials } = args;
+    // Every warn this request emits carries its short id, so the EGRESS lines
+    // (rotate / cooling / no-alternate) and the final ERROR can be stitched
+    // together without guessing from timestamps. Call sites stay untouched.
+    const log = tagWarnWithRequest(args.log, args.reqId);
     let proxyOptions = args.proxyOptions || null;
 
     let targetUrl;
@@ -893,6 +922,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   async fetchUpstream(url, options, proxyOptions = null) {
+    wbDump(url, options);
     const response = await fetchViaTransport(url, options, proxyOptions);
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
@@ -939,8 +969,13 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (!configuredProxy && TLS_FALLBACK_ENABLED) {
       return this.fetchViaTlsFallback(url, options, proxyOptions);
     }
-    console.warn(`[OpenCode] Bun transport unavailable for ${url}; refusing Node fallback`);
-    return syntheticTransportError("OpenCode free lane requires the Bun transport; sidecar unavailable.");
+    // 具体原因由 transport 侧记录：60s 连接超时、上游无首字节、sidecar 启动失败
+    // 是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。
+    const transportFailure = peekTransportFailure() || "unknown";
+    console.warn(`[OpenCode] Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
+    return syntheticTransportError(
+      `OpenCode free lane requires the Bun transport; sidecar unavailable (${transportFailure}).`,
+    );
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

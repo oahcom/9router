@@ -16,6 +16,9 @@
  *   headers, UA or session shape; both halves together pass.
  *
  * Transport is a third gate and lives in services/opencodeTlsClient.js.
+ *
+ * 第四道门（2026-10-29 追加）：caller 工具名本身也会被判 429，
+ * 见 neutralizeCallerToolNames()。
  */
 import os from "node:os";
 import path from "node:path";
@@ -183,6 +186,64 @@ export function concealFingerprintToolNames(tools) {
     out.push(withToolName(tool, alias));
   }
   return { tools: out, map };
+}
+
+/**
+ * Free lane 的第二道「名字门」（实测 2026-10-29，非推断）：
+ *
+ * - 单个 `subagent_fork` 就触发 429 FreeUsageLimitError —— 大小写不敏感
+ *   （`subagent_Fork` 同样 429），且与工具定义无关：把它的定义换成 `subagent`
+ *   的照样 429，反过来 `subagent_zzz` 挂着 fork 的定义却 200。
+ * - 名字集合层面还有阈值：48 个 caller 工具里真名占 46 个即 429，45 个通过；
+ *   逐个单测时每个名字又都通过。
+ * - 决定性对照：同一份 50 工具报文（定义一字未改）只把 48 个 caller 名换成
+ *   中性名，连续 4 次全部 200；换回真名立刻 429。
+ *
+ * 因此把非指纹工具统一改成稳定的中性别名，响应侧交给现成的
+ * restoreToolNames() 还原。别名按名字哈希生成：跨轮次稳定，不吃 prefix cache。
+ * 开关：OPENCODE_NEUTRALIZE_TOOL_NAMES=off 可关掉。
+ */
+const NEUTRALIZE_ENABLED = !["0", "off", "false", "no"].includes(
+  String(process.env.OPENCODE_NEUTRALIZE_TOOL_NAMES ?? "on").toLowerCase(),
+);
+
+/** 稳定的中性别名：同一个名字永远得到同一个别名，与工具数组顺序无关。 */
+function neutralToolAlias(name, taken) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  const base = `fn_${h.toString(36).padStart(7, "0")}`;
+  let alias = base;
+  for (let i = 2; taken.has(alias); i++) alias = `${base}${i}`;
+  return alias;
+}
+
+/**
+ * Rename every caller tool that is not a fingerprint tool to a neutral alias.
+ * `skip` holds names already renamed by concealFingerprintToolNames() so they
+ * are not aliased twice (the restore map is single-hop).
+ *
+ * @param {Array} tools
+ * @param {Map<string,string>} map  sent name -> original name
+ * @param {Set<string>} skip
+ * @returns {Array}
+ */
+export function neutralizeCallerToolNames(tools, map, skip = new Set()) {
+  if (!NEUTRALIZE_ENABLED) return tools;
+  if (!Array.isArray(tools) || tools.length === 0) return tools;
+
+  const taken = new Set(tools.map(toolNameOf).filter(Boolean));
+  return tools.map((tool) => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return tool;
+    const name = toolNameOf(tool);
+    if (!name || fingerprintToolKey(name) || skip.has(name)) return tool;
+    const alias = neutralToolAlias(name, taken);
+    taken.add(alias);
+    map.set(alias, name);
+    return withToolName(tool, alias);
+  });
 }
 
 /**
@@ -392,7 +453,8 @@ export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   if (!body || typeof body !== "object") return new Map();
 
   const { tools, map } = concealFingerprintToolNames(body.tools);
-  body.tools = Array.isArray(tools) ? tools : [];
+  const normalized = neutralizeCallerToolNames(Array.isArray(tools) ? tools : [], map, new Set(map.keys()));
+  body.tools = Array.isArray(normalized) ? normalized : [];
   const appended = appendMissingFingerprintTools(body.tools, flat);
   retargetToolChoice(body, map);
   aliasHistoryToolCalls(body, map);

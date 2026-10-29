@@ -32,6 +32,15 @@ export function tagForSession(seed) {
   return REQ_TAGS[Math.abs(h) % REQ_TAGS.length];
 }
 
+// Short per-request id: printed on every warn/error line of one request, so a
+// 429 can be traced through the egress retry path without guessing from
+// timestamps. Time-sortable, 7 chars, unique per millisecond by counter.
+let requestIdCursor = 0;
+export function newRequestId(now = Date.now()) {
+  requestIdCursor = (requestIdCursor + 1) % 1296;
+  return now.toString(36).slice(-5) + requestIdCursor.toString(36).padStart(2, "0");
+}
+
 // Print one correlated line: [time] tag symbol message
 export function line(tag, symbol, message) {
   if (LEVEL > LOG_LEVELS.INFO) return;

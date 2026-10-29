@@ -1,5 +1,4 @@
 import crypto from "crypto";
-import fs from "node:fs";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { MEMORY_CONFIG, OPENCODE_TRANSPORT_CONFIG } from "../config/runtimeConfig.js";
@@ -13,7 +12,7 @@ import { fetchViaTransport, peekTransportFailure } from "../utils/opencodeTransp
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
-import { rotateEgress } from "../utils/asipRotate.js";
+import { asipRotationEnabled, rotateEgress } from "../utils/asipRotate.js";
 import { classifyRotateReason } from "../utils/egressClassify.js";
 
 // 同一出口的「没有备选」每分钟最多落一行；被压掉的次数在下一行末尾追报。
@@ -152,23 +151,6 @@ function syntheticTransportError(message) {
 // 开关在 runtimeConfig 里统一读：OPENCODE_TLS_FALLBACK=on 才开。
 const TLS_FALLBACK_ENABLED = OPENCODE_TRANSPORT_CONFIG.tlsFallback;
 
-// WB-DUMP（临时）：把发往 free lane 的请求体与请求头落盘，用于对比 DSH 与
-// Claude Code 的差异。定位完成后整段删除。
-function wbDump(url, options) {
-  try {
-    const body = typeof options?.body === "string" ? options.body : "";
-    if (!body) return;
-    const isDsh = body.includes("DeepSeek Harness");
-    if (!isDsh && !body.includes("Claude")) return;
-    const dir = "/tmp/ocdump";
-    fs.mkdirSync(dir, { recursive: true });
-    if (fs.readdirSync(dir).length > 300) return;
-    const kind = isDsh ? "dsh" : "cc";
-    const name = `${dir}/${Date.now()}-${kind}-${process.pid}.json`;
-    const parsed = (() => { try { return JSON.parse(body); } catch { return body.slice(0, 2000); } })();
-    fs.writeFileSync(name, JSON.stringify({ url, headers: options?.headers, body: parsed }, null, 1));
-  } catch {}
-}
 
 export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
@@ -724,7 +706,11 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
     const requestStartedAt = Date.now();
-    const retryBody = hasAlternateEgresses(proxyOptions) ? cloneRequestBody(args.body) : null;
+    // 克隆的触发条件是「这次请求有可能需要重放 body」，不是「有没有备选代理池」：
+    // asip 换线跟备选池是两条独立的路，单池部署一样要靠它绕 429。transformRequest
+    // 会就地改 body（打指纹、改工具名），不先克隆就重放等于二次改指纹 → 403。
+    const mayReplay = hasAlternateEgresses(proxyOptions) || asipRotationEnabled();
+    const retryBody = mayReplay ? cloneRequestBody(args.body) : null;
 
     let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
     // 这条响应实际来自哪条出口：503 failover 会把 result 换成另一条出口的结果，
@@ -792,7 +778,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       );
     }
     if (retryBody || typeof args.body === "string") {
-      const asip = await rotateEgress(rotateReason);
+      const asip = await rotateEgress(rotateReason, { signal: args?.signal });
       if (asip.switchedAt >= requestStartedAt) {
         clearProxyDispatchers();
         log?.warn?.("EGRESS", "asip rotated egress (" + asip.reason + ") -> retry once on fresh connection");
@@ -808,6 +794,10 @@ export class OpenCodeExecutor extends BaseExecutor {
           return rotatedResult;
         }
         result = rotatedResult ?? result;
+      } else {
+        // 换线被拒（合并 / 节流 / 不可用）时不重试：重试会打到同一条被烧的隧道上。
+        // 这句留在 debug：429 风暴里每个请求都会撞上它，WARN 会淹掉真正的信号。
+        log?.debug?.("EGRESS", "asip declined (" + asip.reason + "); no retry");
       }
     }
     const bodyText = await readResponseText(result.response);
@@ -845,7 +835,8 @@ export class OpenCodeExecutor extends BaseExecutor {
         const configured = Array.isArray(proxyOptions?.connectionProxyAlternates)
           ? proxyOptions.connectionProxyAlternates.length
           : 0;
-        logNoAlternateEgress(log, egress, configured);
+        // 60s 聚合行覆盖多个请求，贴单个 req= 会误导归属，所以给它未包装的 logger。
+        logNoAlternateEgress(args?.log, egress, configured);
       }
       return result;
     }
@@ -922,7 +913,6 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   async fetchUpstream(url, options, proxyOptions = null) {
-    wbDump(url, options);
     const response = await fetchViaTransport(url, options, proxyOptions);
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {

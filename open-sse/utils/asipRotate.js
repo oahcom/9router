@@ -24,6 +24,11 @@ const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 2000);
 // 线上出口换掉，而且结果取决于当时网络。测试里由 tests/setup.js 置 1。
 const DISABLED = process.env.ASIP_DISABLED === "1";
 
+// 调用方据此决定「要不要为一次可能的重试先克隆 body」：asip 关着时克隆纯属浪费。
+export function asipRotationEnabled() {
+  return !DISABLED;
+}
+
 let lastToken = null;
 
 function readToken() {
@@ -37,7 +42,7 @@ function readToken() {
   }
 }
 
-function callAsip(path, payload) {
+function callAsip(path, payload, signal = null) {
   return new Promise((resolve) => {
     if (DISABLED) return resolve(null);
     const token = readToken();
@@ -77,6 +82,7 @@ function callAsip(path, payload) {
     });
     req.on("error", () => resolve(null));
     if (body) req.write(body);
+      if (signal) signal.addEventListener("abort", () => req.destroy(), { once: true });
     req.end();
   });
 }
@@ -89,8 +95,10 @@ function callAsip(path, payload) {
  * 之前确实有人换过线，本次请求照样值得重试。所以判断一律用 switchedAt 与请求
  * 发起时刻比较：只要换线发生在请求发出之后，旧连接上的 429 就和新隧道无关。
  */
-export async function rotateEgress(reason = "rate429") {
-  const res = await callAsip("/rotate", { reason });
+export async function rotateEgress(reason = "rate429", { signal = null } = {}) {
+  // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
+  if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted" };
+  const res = await callAsip("/rotate", { reason }, signal);
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable" };
   return {
     switched: Boolean(res.switched),

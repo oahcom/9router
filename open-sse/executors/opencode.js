@@ -713,11 +713,11 @@ export class OpenCodeExecutor extends BaseExecutor {
         const rotated = await rotateEgress("rate429", { signal: args?.signal });
         // 判据不能只看 switched：no_warm_standby / too_frequent 时 asip 没换线，
         // 但冷却已经过期、请求本来也发不出去，重试一次成本极低，而放弃必然 429。
-        // 唯一不该重试的是接口不可用（asip 没在跑），那种情况重试也是白重试。
-        // asip 没在跑 / 没 token / 连接断了 / 超时 —— 这些都没有「换线」可言，
-        // 重试只会白打一次上游（还会把刚设的冷却清掉）。
-        const NO_ROTATION = ["unavailable", "disabled", "no-token", "socket", "timeout", "aborted", "bad-response"];
-        const rotateHappened = !NO_ROTATION.includes(rotated.reason);
+        // 白名单而不是黑名单：reason 是 asip 那边的开放词表（还有 ok / coalesced /
+        // too_frequent / no_warm_standby / unauthorized / internal_error / unknown…），
+        // 黑名单每漏一个就等于「没换线也当换过了」——清冷却、bump、白打一次上游。
+        const ROTATED_REASONS = ["ok", "coalesced", "too_frequent", "no_warm_standby"];
+        const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
         if (rotateHappened) {
           clearProxyDispatchers();
           // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
@@ -736,6 +736,12 @@ export class OpenCodeExecutor extends BaseExecutor {
             proxyOptions,
           });
           if (retried?.response && retried.response.status !== 429) return retried;
+        } else if (rotated.reason === "timeout") {
+          // 超时 = asip 已经在换、只是没等到回话：这次不重试（结果不确定），
+          // 但那条隧道确实在换，必须让 sidecar 重建 —— 否则下一条请求继续骑着它，
+          // 和主路径那处 timeout 的处理保持一致。
+          clearProxyDispatchers();
+          bumpTransportGeneration();
         }
         // upstream 的 retry-after 可能是数万秒（实测见过 34842s = 9.7 小时）。
         // 原样透传等于一次 429 就把服务锁死大半天，这才是服务不可用的直接原因。

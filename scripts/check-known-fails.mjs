@@ -44,11 +44,27 @@ function readFailures() {
 const baseline = readBaseline();
 const failures = readFailures();
 const unexpected = [...failures].filter((f) => !baseline.has(f)).sort();
+console.log("node " + process.version + " (abi " + process.versions.modules + ")");
 const fixed = [...baseline].filter((f) => !failures.has(f)).sort();
 
 if (fixed.length) {
   console.log(`基线里已转绿（可以从 known-fails.txt 删掉）：${fixed.length}`);
   for (const f of fixed) console.log("  - " + f);
+}
+
+// ABI 不符（better_sqlite3 这类原生模块）不是回归：用默认 node 跑就会冒出来。
+// 单独说清楚，别混进「基线之外的新失败」里让人以为代码坏了。
+const abiMismatch = unexpected.filter((f) => /NODE_MODULE_VERSION/.test(f));
+const realUnexpected = unexpected.filter((f) => !abiMismatch.includes(f));
+
+if (abiMismatch.length) {
+  console.error(
+    "环境不符：" + abiMismatch.length + " 条是 Node ABI 不对（本机 " +
+    process.version + "，abi " + process.versions.modules + "）。"
+  );
+  console.error("  用 PATH=/opt/node-v22.23.4/bin:$PATH 重跑，或 npm rebuild 原生模块。");
+  for (const f of abiMismatch) console.error("  ! " + f);
+  process.exit(2);
 }
 
 if (unexpected.length) {

@@ -14,7 +14,11 @@ import fs from "node:fs";
 import path from "node:path";
 
 const bunDir = path.join(os.homedir(), ".bun", "bin");
-const hasBun = fs.existsSync(path.join(bunDir, "bun"));
+// 不只认 ~/.bun/bin：bun 装在 /usr/local/bin 的机器不能因此被静默 skip。
+const hasBun = fs.existsSync(path.join(bunDir, "bun"))
+  || (process.env.PATH || "").split(path.delimiter).some((dir) => {
+    try { return dir && fs.existsSync(path.join(dir, "bun")); } catch { return false; }
+  });
 // 依赖 Bun sidecar 的用例用 describe.skipIf(!globalThis.__HAS_BUN__)：
 // 没有 bun 的机器上应该 skip，而不是变成「基线之外的新失败」（审查发现）。
 globalThis.__HAS_BUN__ = hasBun;

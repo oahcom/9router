@@ -9,15 +9,18 @@
 set -e
 
 PORT=20127
-cd /home/administrator/.9router
+# 真实部署是 system 级 nine-router-src.service（WorkingDirectory 是仓库根，
+# ExecStart=custom-server.js）。之前 cd 到数据目录 .9router，那里没有 package.json，
+# 照这个脚本重启就是先 kill 再起不来（审查发现）。
+cd /home/administrator/9router
 
 echo "=== 重启 9router（port $PORT） ==="
 
-if systemctl --user list-unit-files 2>/dev/null | grep -q '^auto-switch-ip\.service'; then
+if systemctl list-unit-files 2>/dev/null | grep -q '^auto-switch-ip\.service'; then
   echo "[1/3] 重启 auto-switch-ip.service"
-  systemctl --user restart auto-switch-ip.service
+  systemctl restart auto-switch-ip.service
   sleep 2
-  systemctl --user is-active auto-switch-ip.service
+  systemctl is-active auto-switch-ip.service
 else
   echo "[1/3] 跳过 auto-switch-ip.service（本机无该 unit）"
 fi

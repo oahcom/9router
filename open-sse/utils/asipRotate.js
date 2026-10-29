@@ -61,6 +61,17 @@ function callAsip(path, payload, signal = null) {
         },
       },
       (res) => {
+        // asip 换线途中被 systemd 重启 / OOM 时，响应会半截断掉：
+        // res 只发 aborted + error，req 只发 close，end 永远不来。
+        // 之前这里只挂 data/end，Promise 就永久 pending —— 而两处 await 外层
+        // 没有超时，请求直接挂死（审查发现，实测 3s 仍未 settle）。
+        res.on("aborted", () => resolve({ error: "bad-response" }));
+        res.on("error", () => resolve({ error: "socket" }));
+        if (res.statusCode >= 400) {
+          res.resume();
+          resolve({ error: "bad-status-" + res.statusCode });
+          return;
+        }
         let buf = "";
         res.setEncoding("utf8");
         res.on("data", (chunk) => {
@@ -82,8 +93,15 @@ function callAsip(path, payload, signal = null) {
     });
     // 客户端自己走了（abort）和 asip 连不上是两回事：前者不该触发重试。
     req.on("error", () => resolve({ error: signal?.aborted ? "aborted" : "socket" }));
+    // 兜底：任何让上面几条路径都没走到的收尾，都不许让 await 挂着。
+    req.on("close", () => resolve({ error: "socket" }));
     if (body) req.write(body);
-    if (signal) signal.addEventListener("abort", () => req.destroy(), { once: true });
+    // 头已到、body 没写完时 abort：req 不会发 error，只有 close —— 所以这里直接
+    // resolve，别指望下面的兜底去猜（审查发现，实测 12s 仍未 settle）。
+    if (signal) signal.addEventListener("abort", () => {
+      req.destroy();
+      resolve({ error: "aborted" });
+    }, { once: true });
     req.end();
   });
 }

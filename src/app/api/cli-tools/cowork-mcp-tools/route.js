@@ -2,13 +2,18 @@
 
 import { NextResponse } from "next/server";
 import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
+// 显式 import：全局 fetch 补丁只在 proxyFetch 被求值过之后才生效，
+// 本进程若没有别的模块先加载它，这里的裸 fetch 会原样跟随 30x（无跳复核）。
+// 用 proxyAwareFetch 把逐跳闸门钉在本路由的求值路径上。
+import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
 const TIMEOUT_MS = 8000;
 
-// Probe MCP server: initialize + tools/list. No auth header — works for authless servers.
-// OAuth servers return 401, signal client to skip tool listing.
-async function probeMcp(url) {
+// 逐跳闸门：本路由可被远程调用，首跳的宽松判据（放行局域网）本身就是攻击面，
+// 所以远程调用方每一跳都按全私有判据复核，而不是沿用首跳口径。
+async function probeMcp(url, strict) {
+  const hop = strict ? { strictRedirects: true } : {};
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -18,7 +23,8 @@ async function probeMcp(url) {
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   try {
     // Step 1: initialize
-    const initRes = await fetch(url, {
+    const initRes = await proxyAwareFetch(url, {
+      ...hop,
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -40,7 +46,8 @@ async function probeMcp(url) {
     if (sessionId) listHeaders["mcp-session-id"] = sessionId;
 
     // Step 2: notifications/initialized (required by spec before tools/list)
-    await fetch(url, {
+    await proxyAwareFetch(url, {
+      ...hop,
       method: "POST",
       headers: listHeaders,
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
@@ -48,7 +55,8 @@ async function probeMcp(url) {
     }).catch(() => {});
 
     // Step 3: tools/list
-    const listRes = await fetch(url, {
+    const listRes = await proxyAwareFetch(url, {
+      ...hop,
       method: "POST",
       headers: listHeaders,
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
@@ -92,14 +100,15 @@ export async function POST(request) {
     // SSRF guard for remote callers; local host keeps self-hosted MCP servers.
     // 必须用 Resolved 版：同步版只看 hostname 字面量，`http://169.254.169.254.nip.io/`
     // 一个字都不匹配 → 放行探针直接读到元数据。
-    if (!isLocalRequest(request)) {
+    const isLocal = isLocalRequest(request);
+    if (!isLocal) {
       try {
         await assertPublicUrlResolved(url);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }
     }
-    const result = await probeMcp(url);
+    const result = await probeMcp(url, !isLocal);
     return NextResponse.json(result);
   } catch (e) {
     return NextResponse.json({ error: e.message, tools: [] }, { status: 500 });

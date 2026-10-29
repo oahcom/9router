@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
 import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
+// 显式 import：全局 fetch 补丁只在 proxyFetch 被求值过之后才生效，
+// 本进程若没有别的模块先加载它，这里的裸 fetch 会原样跟随 30x（无跳复核）。
+// 用 proxyAwareFetch 把逐跳闸门钉在本路由的求值路径上。
+import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
-// Fetch with timeout wrapper
+// Fetch with timeout wrapper. strictRedirects：本路由可被远程调用，跳转目标必须
+// 按全私有判据复核，不能沿用首跳的宽松口径（否则 302 到内网即越权）。
 const fetchWithTimeout = (url, options, timeout = 10000) => {
   return Promise.race([
-    fetch(url, options),
+    proxyAwareFetch(url, options),
     new Promise((_, reject) => 
       setTimeout(() => reject(new Error("Request timeout")), timeout)
     )
@@ -69,13 +74,15 @@ export async function POST(request) {
     // SSRF guard for remote callers; local host keeps self-hosted nodes (e.g. ollama-local)
     // 必须用 Resolved 版：同步版只看字面量，`http://100.100.100.200.nip.io/`
     // 之类通配 DNS 域名会整个放行。
-    if (!isLocalRequest(request)) {
+    const isLocal = isLocalRequest(request);
+    if (!isLocal) {
       try {
         await assertPublicUrlResolved(baseUrl);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }
     }
+    const hop = isLocal ? {} : { strictRedirects: true };
 
     // Custom Embedding Validation - test POST /embeddings directly
     if (type === "custom-embedding") {
@@ -84,6 +91,7 @@ export async function POST(request) {
         return NextResponse.json({ valid: false, error: "Model ID required for embedding validation" });
       }
       const embedRes = await fetchWithTimeout(`${normalizedBase}/embeddings`, {
+        ...hop,
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
@@ -116,6 +124,7 @@ export async function POST(request) {
 
       const modelsUrl = `${normalizedBase}/models`;
       const res = await fetchWithTimeout(modelsUrl, {
+        ...hop,
         method: "GET",
         headers: {
           "x-api-key": apiKey,
@@ -134,6 +143,7 @@ export async function POST(request) {
       // Fallback: try chat/completions if modelId provided
       if (modelId) {
         const chatRes = await fetchWithTimeout(`${normalizedBase}/chat/completions`, {
+          ...hop,
           method: "POST",
           headers: {
             "Authorization": `Bearer ${apiKey}`,
@@ -163,6 +173,7 @@ export async function POST(request) {
     // OpenAI Compatible Validation (Default)
     const modelsUrl = `${baseUrl.replace(/\/$/, "")}/models`;
     const res = await fetchWithTimeout(modelsUrl, {
+      ...hop,
       headers: { "Authorization": `Bearer ${apiKey}` },
     });
 
@@ -176,6 +187,7 @@ export async function POST(request) {
     // Fallback: try chat/completions if modelId provided
     if (modelId) {
       const chatRes = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        ...hop,
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,

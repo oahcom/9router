@@ -12,8 +12,8 @@ import {
   normalizeString,
   resolveConnectionProxyUrl,
 } from "./proxyResolution.js";
-// 重定向逐跳复核复用这一份网段表，不在本文件再抄一份 CIDR
-// （仓内已有 4 份并存，见 #466570）。
+// 只有显式要求 strictRedirects 的调用方（远程可达的路由）才用这份全私有网段判据；
+// 其余调用方第 N 跳与首跳同判据，见下方 fetchFollowingSafeRedirects。
 import { assertPublicUrlResolved } from "../../src/shared/utils/ssrfGuard.js";
 
 const originalFetch = globalThis.fetch;
@@ -345,9 +345,12 @@ function targetHost(url) {
 // 逐跳复核：assertEgressTargetAllowed 只过首跳，30x 之后的目标从不重查，
 // 于是 `https://public/` → `302 http://169.254.169.254/` 能整段读到元数据。
 //
-// 复用 ssrfGuard 的 assertPublicUrlResolved（DNS 无超时上限，网段表单一来源），
-// 不自己再判一遍地址。调用方已关掉自动跟随（redirect: "manual"），这里的
-// 每一跳都是我们主动发起的，拦在发出去之前。
+// 每一跳用**与首跳同一个**闸门。原先这里用 ssrfGuard.assertPublicUrlResolved
+// （一律拒私有网段），于是同一出口的下一跳被当成越权：127.0.0.1 / 192.168.x /
+// 10.x 上的自托管服务只要回一个同源 302（补斜杠、/v1 → /v1/、跳登录页），
+// 就从可用变不可用（实测 `302 /v1/models` → Blocked URL: internal host）。
+// 首跳放行局域网对等体是有意为之（proxyResolution.js 的 isPrivateHost 注释：
+// LAN peer 走错出口实测烧掉 235s/attempt），第 N 跳没有理由反过来拒。
 const MAX_REDIRECTS = 5;
 
 function isRedirectStatus(status) {
@@ -368,21 +371,35 @@ function isReplayableBody(body) {
 }
 
 /**
- * 逐跳复核的 fetch：每一跳的目标先过 assertPublicUrlResolved 再发出去。
+ * 逐跳复核的 fetch：每一跳的目标先过 assertEgressTargetAllowed 再发出去。
  *
  * 301/302/303 按 fetch 语义改 GET 丢 body；307/308 保留 method+body（body 不可
  * 重放时只发回 3xx）。超过 MAX_REDIRECTS 同样交回 3xx，不自行编造错误。
+ * location 无法解析成 URL 时同样交回 3xx —— 交给调用方按「目标不可用」处理，
+ * 不把裸 TypeError 抛到闸门之外的路径上。
+ *
+ * 闸门可切换：默认与首跳同判据（局域网对等体放行）；strictRedirects 时改用
+ * ssrfGuard 的全私有判据，用于「远程调用方可控 URL」的路由 —— 那里首跳的
+ * 宽松判据本身就是被利用点，第 N 跳不该再沿用。
  */
 async function fetchFollowingSafeRedirects(send, url, options, maxRedirects = MAX_REDIRECTS) {
+  const strict = options?.strictRedirects === true;
+  const gate = strict ? assertPublicUrlResolved : assertEgressTargetAllowed;
   let currentUrl = url;
   const followed = { ...options, redirect: "manual" };
+  delete followed.strictRedirects;
   let init = followed;
   for (let hop = 0; ; hop++) {
     const res = await send(currentUrl, init);
     const location = isRedirectStatus(res.status) ? res.headers.get("location") : null;
     if (!location || hop >= maxRedirects) return res;
-    const nextUrl = new URL(location, currentUrl).toString();
-    await assertPublicUrlResolved(nextUrl);
+    let nextUrl;
+    try {
+      nextUrl = new URL(location, currentUrl).toString();
+    } catch {
+      return res;
+    }
+    await gate(nextUrl);
     const keepMethod = res.status === 307 || res.status === 308;
     if (keepMethod && !isReplayableBody(options.body)) return res;
     currentUrl = nextUrl;
@@ -394,7 +411,7 @@ async function fetchFollowingSafeRedirects(send, url, options, maxRedirects = MA
 function withSafeRedirects(send, options) {
   const mode = options.redirect;
   if (mode === "error" || mode === "manual") return send;
-  return (u, o) => fetchFollowingSafeRedirects(send, u, o);
+  return (u, o) => fetchFollowingSafeRedirects(send, u, { ...o, strictRedirects: options.strictRedirects });
 }
 
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {

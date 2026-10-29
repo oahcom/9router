@@ -21,12 +21,29 @@ const noAlternateLogState = new Map();
 
 function tagWarnWithRequest(log, reqId) {
   if (!log || typeof log.warn !== "function" || !reqId) return log;
-  const warn = log.warn.bind(log);
-  // Object.create 而不是 {...log}：class logger 的 debug/info/errorLine 在 prototype 上，
-  // 浅拷贝只复制自有属性，会把这些方法整个丢掉，日志静默消失（审查发现）。
-  const wrapped = Object.create(log);
-  wrapped.warn = (tag, message, data) => warn(tag, message + " (req=" + reqId + ")", data);
-  return wrapped;
+  // 给这个请求的每条 warn 追加 (req=xxx)，429/换线时能按 reqId 串起一次请求的全过程。
+  //
+  // 两个坑，都是踩过的：
+  // 1) 不能 {...log}：class logger / 模块导出的 debug·info·errorLine 在原型上，
+  //    浅拷贝只复制自有属性，日志会静默消失。
+  // 2) 也不能 Object.create(log) 之后直接赋值：log 常常是 webpack 的模块导出对象，
+  //    warn 是只有 getter 的访问器，往继承来的访问器上赋值在严格模式下抛
+  //    TypeError: Cannot set property warn of #<Object> which has only a getter ——
+  //    每个请求直接 502。必须用 defineProperty 建自有数据属性盖住它。
+  // 兜底：诊断逻辑再出任何岔子也只是没有后缀，绝不能把请求打死。
+  try {
+    const warn = log.warn.bind(log);
+    const wrapped = Object.create(log);
+    Object.defineProperty(wrapped, "warn", {
+      value: (tag, message, data) => warn(tag, message + " (req=" + reqId + ")", data),
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    });
+    return wrapped;
+  } catch {
+    return log;
+  }
 }
 
 // 传输层诊断：有请求上下文就回 tag 体系，没有就退回 console —— 不能因为没 log 而静默。

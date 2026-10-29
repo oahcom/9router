@@ -18,9 +18,13 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
   fetchViaTransport: vi.fn(async () => null),
   resetTransport: vi.fn(),
+  bumpTransportGeneration: vi.fn(),
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";
+// 2026-10-30：caller 工具改中性别名（fn_<hash>）后，还原表是契约的一部分，
+// 这里直接断言「客户端拿到的 tool_calls 还能变回真名」。
+import { restoreToolNames, takeRenamedToolNames } from "../../open-sse/utils/opencodeFingerprint.js";
 import {
   OPENCODE_SESSION_RE,
   generateSessionId,
@@ -477,7 +481,22 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
       tool_choice: "auto",
     });
     expect(chatWithTools.tool_choice).toBe("auto");
-    expect(chatWithTools.tools.map((t) => t.function?.name)).toEqual(["Bash", "Read", "read", "shell"]);
+    // 2026-10-30 起：caller 工具名统一改成中性别名 fn_<hash>（实测真名会吃 429），
+    // 指纹工具照旧追加在后面。别名按名字哈希，跨轮次稳定。
+    const chatWithToolsNames = chatWithTools.tools.map((t) => t.function?.name);
+    expect(chatWithToolsNames.slice(2)).toEqual(["read", "shell"]);
+    expect(chatWithToolsNames[0]).toMatch(/^fn_[0-9a-z]{7}$/);
+    expect(chatWithToolsNames[1]).toMatch(/^fn_[0-9a-z]{7}$/);
+    // 同一个真名必须永远得到同一个别名（按名字哈希），否则跨轮次的 prefix cache 会被打散。
+    const again = executor.transformRequest("nemotron-3-ultra-free", {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        { type: "function", function: { name: "Bash", description: "Claude Code tool" } },
+        { type: "function", function: { name: "Read", description: "Claude Code tool" } },
+      ],
+      tool_choice: "auto",
+    });
+    expect(again.tools.map((t) => t.function?.name).slice(0, 2)).toEqual(chatWithToolsNames.slice(0, 2));
 
     const chatClash = executor.transformRequest("nemotron-3-ultra-free", {
       messages: [{ role: "user", content: "hi" }],
@@ -503,7 +522,13 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
 
     expect(transformed.stream).toBe(true);
     expect(transformed.reasoning?.effort).toBe("xhigh");
-    expect(transformed.tools.map((tool) => tool.name)).toEqual(["zcode_search", "read", "shell"]);
+    // 同上：客户端工具换成中性别名，还原表映射回 zcode_search。
+    const museNames = transformed.tools.map((tool) => tool.name);
+    expect(museNames.slice(1)).toEqual(["read", "shell"]);
+    expect(museNames[0]).toMatch(/^fn_[0-9a-z]{7}$/);
+    const museMap = takeRenamedToolNames(transformed);
+    expect(restoreToolNames({ content: [{ type: "tool_use", name: museNames[0] }] }, museMap).content[0].name)
+      .toBe("zcode_search");
     expect(transformed.instructions).toMatch(/Do not call the `read` or `shell` tools/);
   });
 

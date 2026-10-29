@@ -25,6 +25,7 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 
 vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
   fetchViaTransport: transportMock,
+  bumpTransportGeneration: vi.fn(),
   resetTransport: vi.fn(),
 }));
 

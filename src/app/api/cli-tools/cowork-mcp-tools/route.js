@@ -1,7 +1,7 @@
 "use server";
 
 import { NextResponse } from "next/server";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
 const TIMEOUT_MS = 8000;
@@ -90,9 +90,11 @@ export async function POST(request) {
       return NextResponse.json({ error: "url required" }, { status: 400 });
     }
     // SSRF guard for remote callers; local host keeps self-hosted MCP servers.
+    // 必须用 Resolved 版：同步版只看 hostname 字面量，`http://169.254.169.254.nip.io/`
+    // 一个字都不匹配 → 放行探针直接读到元数据。
     if (!isLocalRequest(request)) {
       try {
-        assertPublicUrl(url);
+        await assertPublicUrlResolved(url);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }

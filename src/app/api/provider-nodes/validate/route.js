@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { assertPublicUrl } from "@/shared/utils/ssrfGuard.js";
+import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
 import { isLocalRequest } from "@/dashboardGuard";
 
 // Fetch with timeout wrapper
@@ -67,9 +67,11 @@ export async function POST(request) {
     }
 
     // SSRF guard for remote callers; local host keeps self-hosted nodes (e.g. ollama-local)
+    // 必须用 Resolved 版：同步版只看字面量，`http://100.100.100.200.nip.io/`
+    // 之类通配 DNS 域名会整个放行。
     if (!isLocalRequest(request)) {
       try {
-        assertPublicUrl(baseUrl);
+        await assertPublicUrlResolved(baseUrl);
       } catch {
         return NextResponse.json({ error: "URL not allowed" }, { status: 400 });
       }

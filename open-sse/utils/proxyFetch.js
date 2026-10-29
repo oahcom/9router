@@ -12,6 +12,9 @@ import {
   normalizeString,
   resolveConnectionProxyUrl,
 } from "./proxyResolution.js";
+// 重定向逐跳复核复用这一份网段表，不在本文件再抄一份 CIDR
+// （仓内已有 4 份并存，见 #466570）。
+import { assertPublicUrlResolved } from "../../src/shared/utils/ssrfGuard.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -309,7 +312,7 @@ function bufferedResponse(text, original) {
  * the first attempt cannot be resent, and strictProxy keeps its contract of
  * never leaving over another path — both return the rejection as-is.
  */
-async function replayFreeTierRejectionDirect(url, options, proxied) {
+async function replayFreeTierRejectionDirect(url, options, proxied, send) {
   if (proxied.status !== 403) return proxied;
   let text;
   try {
@@ -323,7 +326,7 @@ async function replayFreeTierRejectionDirect(url, options, proxied) {
   }
   console.warn(`[ProxyFetch] Proxy egress rejected by the OpenCode free-tier gate (403 FreeTierError); replaying direct: ${targetHost(url)}`);
   try {
-    return await fetchWithTlsFallback(url, options, null);
+    return await send(url, options);
   } catch (directError) {
     // The direct replay failed outright — surface the original rejection.
     console.warn(`[ProxyFetch] Direct replay failed: ${directError.message}`);
@@ -337,6 +340,61 @@ function targetHost(url) {
   } catch {
     return String(url);
   }
+}
+
+// 逐跳复核：assertEgressTargetAllowed 只过首跳，30x 之后的目标从不重查，
+// 于是 `https://public/` → `302 http://169.254.169.254/` 能整段读到元数据。
+//
+// 复用 ssrfGuard 的 assertPublicUrlResolved（DNS 无超时上限，网段表单一来源），
+// 不自己再判一遍地址。调用方已关掉自动跟随（redirect: "manual"），这里的
+// 每一跳都是我们主动发起的，拦在发出去之前。
+const MAX_REDIRECTS = 5;
+
+function isRedirectStatus(status) {
+  return status >= 300 && status < 400;
+}
+
+// body 能否原样重放（307/308 要求保留 method 与 body）。
+// ReadableStream 一旦读过就无法回绕 —— 实测原生 fetch 自动跟随流式 body 时
+// 直接抛 `TypeError: fetch failed`，所以这类请求交回 3xx 由调用方决定。
+function isReplayableBody(body) {
+  if (!body) return true;
+  return typeof body === "string"
+    || body instanceof URLSearchParams
+    || body instanceof ArrayBuffer
+    || ArrayBuffer.isView(body)
+    || (typeof Blob !== "undefined" && body instanceof Blob)
+    || (typeof FormData !== "undefined" && body instanceof FormData);
+}
+
+/**
+ * 逐跳复核的 fetch：每一跳的目标先过 assertPublicUrlResolved 再发出去。
+ *
+ * 301/302/303 按 fetch 语义改 GET 丢 body；307/308 保留 method+body（body 不可
+ * 重放时只发回 3xx）。超过 MAX_REDIRECTS 同样交回 3xx，不自行编造错误。
+ */
+async function fetchFollowingSafeRedirects(send, url, options, maxRedirects = MAX_REDIRECTS) {
+  let currentUrl = url;
+  const followed = { ...options, redirect: "manual" };
+  let init = followed;
+  for (let hop = 0; ; hop++) {
+    const res = await send(currentUrl, init);
+    const location = isRedirectStatus(res.status) ? res.headers.get("location") : null;
+    if (!location || hop >= maxRedirects) return res;
+    const nextUrl = new URL(location, currentUrl).toString();
+    await assertPublicUrlResolved(nextUrl);
+    const keepMethod = res.status === 307 || res.status === 308;
+    if (keepMethod && !isReplayableBody(options.body)) return res;
+    currentUrl = nextUrl;
+    if (!keepMethod) init = { ...followed, method: "GET", body: undefined };
+  }
+}
+
+// 调用方显式指定 redirect: "error"/"manual" 时语义由它自己决定，不接管。
+function withSafeRedirects(send, options) {
+  const mode = options.redirect;
+  if (mode === "error" || mode === "manual") return send;
+  return (u, o) => fetchFollowingSafeRedirects(send, u, o);
 }
 
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
@@ -353,6 +411,11 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   // proxyResolution.js 里 resolvesToLinkLocalOrMetadataHost 的注释。
   await assertEgressTargetAllowed(targetUrl);
 
+  // 各出口都套上逐跳复核：首跳已过闸，30x 的目标还要再查一次（本文件入口
+  // 那份闸门只过首跳）。调用方显式指定 redirect 语义时不接管。
+  const proxySend = (proxyUrl) => withSafeRedirects((u, o) => fetchWithTlsFallback(u, o, proxyUrl), options);
+  const directSend = proxySend(null);
+
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
   if (vercelRelayUrl) {
@@ -365,7 +428,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       "x-relay-target": `${parsed.protocol}//${parsed.host}`,
       "x-relay-path": `${parsed.pathname}${parsed.search}`,
     };
-    return originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
+    const relaySend = withSafeRedirects((u, o) => originalFetch(u, o), options);
+    return relaySend(vercelRelayUrl, { ...options, headers: relayHeaders });
   }
 
   const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
@@ -377,7 +441,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
       try {
-        return await fetchWithTlsFallback(url, options, proxyUrl);
+        return await proxySend(proxyUrl)(url, options);
       } catch (proxyError) {
         if (proxyError?.code === "ERR_PROXY_DNS_MODE") throw proxyError;
         if (proxyOptions?.strictProxy === true) {
@@ -398,10 +462,10 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 
   if (proxyUrl) {
     try {
-      const proxied = await fetchWithTlsFallback(url, options, proxyUrl);
+      const proxied = await proxySend(proxyUrl)(url, options);
       // strictProxy never leaves the configured path — pass the rejection through.
       if (proxyOptions?.strictProxy === true) return proxied;
-      return await replayFreeTierRejectionDirect(url, options, proxied);
+      return await replayFreeTierRejectionDirect(url, options, proxied, directSend);
     } catch (proxyError) {
       if (proxyError?.code === "ERR_PROXY_DNS_MODE") throw proxyError;
       // If strictProxy is enabled, fail hard instead of falling back to direct
@@ -409,7 +473,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
       }
       console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
-      return fetchWithTlsFallback(url, options, null);
+      return directSend(url, options);
     }
   }
 
@@ -433,7 +497,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 
   // got-scraping disabled — use native fetch directly
   // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
-  return fetchWithTlsFallback(url, options, null);
+  return directSend(url, options);
 }
 
 /**

@@ -49,8 +49,9 @@ curl -s -o /dev/null -w "  /v1/models HTTP=%{http_code} t=%{time_total}s\n" --ma
   "http://127.0.0.1:$PORT/v1/models" \
   -H "Authorization: Bearer ${HERMES_ROUTER_KEY:-9router-local}"
 
-# 部署态自检：刚重启过，磁盘与运行应当一致。不一致就当场喊出来，
-# 而不是等下次有人发现产物里有修复、线上还是旧闸门。不因它中断脚本。
-bash scripts/check_deploy_state.sh || true
+# 部署态自检：刚重启过，磁盘与运行应当一致。strict 语义下 MISMATCH 让脚本失败 ——
+# 重启没生效就是这次重启的失败，不该以 0 收场等下次有人发现。
+# UNAVAILABLE（服务没起来 / 读不到 BUILD_ID）只警告，那不是部署态结论。
+bash scripts/postdeploy_gate.sh strict
 
 echo "=== 完成 ==="

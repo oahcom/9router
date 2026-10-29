@@ -15,23 +15,16 @@ export function parseDataUri(url) {
 import { lookup } from "node:dns/promises";
 import { Agent } from "undici";
 import { MAX_IMAGE_BYTES, FETCH_TIMEOUT_MS, IMAGE_SIGNATURES, BLOCKED_HOSTS } from "../../config/mediaConfig.js";
+import { isLinkLocalOrMetadataHost, isPrivateHost } from "../../utils/proxyResolution.js";
 
-// True if an IPv4/IPv6 address is private/reserved (SSRF target).
+// 私有段判据复用出口闸的两个函数，不在这里维护第二份网段表：本地那份曾漏掉
+// 168.63.129.16 / 192.0.0.192（Azure WireServer、Oracle IMDS）、以及
+// ::ffff:169.254.169.254 这种 IPv4-mapped 写法，图片预取就只能靠全局 fetch
+// 补丁兜底 —— 补丁没装到的路径（独立脚本、import 顺序变化、补丁生效前的模块求值）
+// 恢复成不设防。判的是同一件事，就不该有第二份定义。
 function isPrivateIp(ip) {
   if (!ip) return true;
-  // IPv6 loopback / unique-local / link-local
-  if (ip === "::1" || ip.startsWith("fc") || ip.startsWith("fd") || ip.startsWith("fe80")) return true;
-  // IPv4-mapped IPv6 (::ffff:a.b.c.d) -> extract tail
-  const v4 = ip.includes(".") ? ip.split(":").pop() : ip;
-  const parts = v4.split(".").map((n) => Number.parseInt(n, 10));
-  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return ip.includes(":") ? false : true;
-  const [a, b] = parts;
-  if (a === 10 || a === 127 || a === 0) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 169 && b === 254) return true; // link-local + cloud metadata
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  return false;
+  return isPrivateHost(ip) || isLinkLocalOrMetadataHost(ip);
 }
 
 // Resolve host once and return only public IPs (SSRF guard).

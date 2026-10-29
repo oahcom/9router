@@ -56,6 +56,22 @@ describe("fetchImageAsBase64 hardening", () => {
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
+  // 2026-10-28 consumer #464910 复核出的纵深防御缺口：image.js 自带一份私有段表，
+  // 只认 10/8、172.16/12、192.168/16、169.254/16、100.64/10、127/8、0/8，
+  // 于是云厂商公布的具体元数据地址（Azure WireServer、Oracle IMDS）在本地判据里
+  // 是「公网」，整条防线只剩 proxyFetch 的全局补丁。这四类必须由本地判据自己拒。
+  it.each([
+    ["100.100.100.200", "Aliyun"],
+    ["fd00:ec2::254", "AWS IMDS over IPv6"],
+    ["168.63.129.16", "Azure WireServer"],
+    ["192.0.0.192", "Oracle Cloud"],
+  ])("SSRF: rejects cloud metadata %s (%s) before any request", async (address) => {
+    lookupMock.mockResolvedValue({ address });
+    mockFetchOnce(PNG);
+    expect(await fetchImageAsBase64(`http://metadata.example/x.png`)).toBeNull();
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it("SSRF: rejects blocked hostname localhost", async () => {
     expect(await fetchImageAsBase64("http://localhost/x.png")).toBeNull();
   });

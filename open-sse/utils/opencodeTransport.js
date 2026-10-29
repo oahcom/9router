@@ -17,6 +17,19 @@ let retryAt = 0;
 let startGen = 0;
 let lastResetAt = 0;
 
+// 上一次请求具体栽在哪一步。executor 的合成 503 文案直接读它：以前所有失败都
+// 报同一句 "sidecar unavailable"，把 60s 连接超时、上游无首字节、socks 出口、
+// sidecar 启动失败全说成一件事，只能靠时间戳反推。只记录、不改变控制流。
+let lastFailure = null;
+function noteFailure(reason) {
+  lastFailure = reason;
+  return null;
+}
+
+export function peekTransportFailure() {
+  return lastFailure;
+}
+
 function available() {
   return OPENCODE_TRANSPORT_CONFIG.mode !== "off" && Date.now() >= retryAt;
 }
@@ -218,9 +231,9 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
   // 闸在 available() 之前：能不能发请求是配置问题，许不许发给这个目标不是。
   // 只装在 proxyFetch 里等于没装 —— auto 模式下 executor 先问 sidecar。
   await assertEgressTargetAllowed(typeof url === "string" ? url : url.toString());
-  if (!available()) return null;
-  if (normalizeString(proxyOptions?.vercelRelayUrl)) return null;
-  if (typeof options.body !== "string" || !options.body) return null;
+  if (!available()) return noteFailure(OPENCODE_TRANSPORT_CONFIG.mode === "off" ? "mode-off" : "sidecar-backoff");
+  if (normalizeString(proxyOptions?.vercelRelayUrl)) return noteFailure("vercel-relay");
+  if (typeof options.body !== "string" || !options.body) return noteFailure("body-not-string");
 
   const target = typeof url === "string" ? url : url.toString();
   const { url: proxyUrl } = resolveEffectiveProxyUrl(target, proxyOptions);
@@ -228,7 +241,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
   // TypeError UnsupportedProxyProtocol（2026-10-28 实测，http 目标会被当成
   // 直连所以旧测试没暴露）。这里返回 null 让调用方给出"配置不支持"的明确
   // 结果，而不是让它进 attempt 循环把 19s 超时重放两遍。
-  if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return null;
+  if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return noteFailure(`unsupported-proxy:${proxyUrl.split(":")[0]}`);
   const streamBody = typeof options.body === "string" && /"stream"\s*:\s*true/.test(options.body);
   const headerTimeoutMs = streamBody ? OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs : 0;
 
@@ -237,7 +250,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
   // same payload once before declaring the transport unavailable.
   for (let attempt = 0; attempt < 2; attempt++) {
     const transport = await ensure();
-    if (!transport) return null;
+    if (!transport) return noteFailure(available() ? "sidecar-start-failed" : "sidecar-backoff");
 
     try {
       const response = await forward(transport, {
@@ -270,7 +283,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
           } else {
             console.warn("[OpenCodeTransport] sidecar reported upstream timeout; reset throttled, fail fast");
           }
-          return null;
+          return noteFailure("upstream-timeout");
         }
         // sidecar 报的是上游 fetch 失败（非超时）。非流式没有 cleanup 需求，
         // 重试同一出口只会重复失败；只在 30s 冷却外重启一次以清池。
@@ -278,11 +291,24 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
           lastResetAt = Date.now();
           retire();
         }
-        return null;
+        return noteFailure("upstream-fetch-failed");
       }
       return response;
     } catch (error) {
-      if (options.signal?.aborted || error.name === "AbortError") return null;
+      // 调用方放弃 = base.execute 的 60s connect timeout，或客户端自己断开。
+      // 这条路上 sidecar 里一定还挂着那条不回头的 socket：以前这里直接 return null，
+      // 于是 a) executor 把「60s 没拿到响应头」说成 "sidecar unavailable"，
+      // b) 池子没人清，下一个请求继续复用死 socket，要等 Bun 的 idleTimeout 才自愈
+      // （实测一整段 2 分钟的同形态 503）。retire 掉，让下一条请求从干净进程开始。
+      // 冷却复用下面 transportTimeout 的 30s 节流，避免每个超时都 spawn 一次。
+      if (options.signal?.aborted || error.name === "AbortError") {
+        if (Date.now() - lastResetAt >= 30000) {
+          lastResetAt = Date.now();
+          console.warn("[OpenCodeTransport] caller aborted before headers; retiring sidecar to drop stale socket");
+          retire();
+        }
+        return noteFailure(options.signal?.aborted ? "caller-aborted" : "abort-error");
+      }
       // 响应头超时 = 出口路径死了（sidecar 本身活着）。不重启 sidecar 再试一次
       // （同一代理必然再挂），直接交给上层换另一条出口，把 60s 白等压到 20s。
       if (error.transportTimeout) {
@@ -296,23 +322,23 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null) 
         } else {
           console.warn(`[OpenCodeTransport] ${error.message}; sidecar reset throttled, fail fast`);
         }
-        return null;
+        return noteFailure("header-timeout");
       }
       console.warn(`[OpenCodeTransport] forward failed (attempt ${attempt + 1}/2): ${error.message}`);
       // socket hang up 多半是别的请求刚把共享 sidecar 退役了，不是本请求的
       // 上游有问题。此时重试会再开一个 sidecar，把一次失败放大成雪崩。
       if (error.code === "ECONNRESET" || error.code === "EPIPE") {
         if (attempt === 0) continue;
-        return null;
+        return noteFailure(`sidecar-socket-reset:${error.code}`);
       }
       if (attempt === 0) {
         retire();
         continue;
       }
-      return null;
+      return noteFailure(`forward-failed:${error.message}`);
     }
   }
-  return null;
+  return noteFailure("transport-exhausted");
 }
 
 const EXIT_HOOK = Symbol.for("ninerouter.opencodeTransport.exitHook");

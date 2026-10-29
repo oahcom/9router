@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import fs from "node:fs";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { MEMORY_CONFIG, OPENCODE_TRANSPORT_CONFIG } from "../config/runtimeConfig.js";
@@ -8,7 +9,7 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
-import { fetchViaTransport } from "../utils/opencodeTransport.js";
+import { fetchViaTransport, peekTransportFailure } from "../utils/opencodeTransport.js";
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
@@ -150,6 +151,24 @@ function syntheticTransportError(message) {
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
 // 开关在 runtimeConfig 里统一读：OPENCODE_TLS_FALLBACK=on 才开。
 const TLS_FALLBACK_ENABLED = OPENCODE_TRANSPORT_CONFIG.tlsFallback;
+
+// WB-DUMP（临时）：把发往 free lane 的请求体与请求头落盘，用于对比 DSH 与
+// Claude Code 的差异。定位完成后整段删除。
+function wbDump(url, options) {
+  try {
+    const body = typeof options?.body === "string" ? options.body : "";
+    if (!body) return;
+    const isDsh = body.includes("DeepSeek Harness");
+    if (!isDsh && !body.includes("Claude")) return;
+    const dir = "/tmp/ocdump";
+    fs.mkdirSync(dir, { recursive: true });
+    if (fs.readdirSync(dir).length > 300) return;
+    const kind = isDsh ? "dsh" : "cc";
+    const name = `${dir}/${Date.now()}-${kind}-${process.pid}.json`;
+    const parsed = (() => { try { return JSON.parse(body); } catch { return body.slice(0, 2000); } })();
+    fs.writeFileSync(name, JSON.stringify({ url, headers: options?.headers, body: parsed }, null, 1));
+  } catch {}
+}
 
 export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
@@ -903,6 +922,7 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   async fetchUpstream(url, options, proxyOptions = null) {
+    wbDump(url, options);
     const response = await fetchViaTransport(url, options, proxyOptions);
     if (response) return response;
     if (OPENCODE_TRANSPORT_CONFIG.mode === "off") {
@@ -949,8 +969,13 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (!configuredProxy && TLS_FALLBACK_ENABLED) {
       return this.fetchViaTlsFallback(url, options, proxyOptions);
     }
-    console.warn(`[OpenCode] Bun transport unavailable for ${url}; refusing Node fallback`);
-    return syntheticTransportError("OpenCode free lane requires the Bun transport; sidecar unavailable.");
+    // 具体原因由 transport 侧记录：60s 连接超时、上游无首字节、sidecar 启动失败
+    // 是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。
+    const transportFailure = peekTransportFailure() || "unknown";
+    console.warn(`[OpenCode] Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
+    return syntheticTransportError(
+      `OpenCode free lane requires the Bun transport; sidecar unavailable (${transportFailure}).`,
+    );
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

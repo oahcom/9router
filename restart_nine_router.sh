@@ -1,44 +1,58 @@
 #!/bin/bash
-# 9router 重启脚本。
+# 9router 重启脚本（2026-10-30 第三版）。
 #
-# 2026-10-28 校正：这里原来 `systemctl --user restart nine-router.service`，
-# 但 nine-router.service 与 auto-switch-ip.service 在本机都不存在（both inactive，
-# 无 unit 文件），脚本在 set -e 下第一条 restart 就中断，且探活还打在已废弃的
-# 20128 端口。真实运行方式是 system 级 nine-router-src.service
-# （ExecStart=custom-server.js，Restart=always）——脚本只驱动 unit，不再自己起进程。
-# 历史注记：曾有 setsid + npm run start 的写法，已废弃（不留孤儿进程）。
+# 真实部署：system 级 unit nine-router-src.service
+#   WorkingDirectory=/home/administrator/9router
+#   ExecStart=/opt/node-v22.23.4/bin/node custom-server.js --port 20127
+#   Restart=always / RestartUSec=10s
+# 所以这里只驱动 unit，不再自己 kill 进程再 setsid 起一个：脚本拉起的实例 systemd
+# 不认，10s 后 unit 重启还会撞 EADDRINUSE，结果是「在跑的没人管、unit 进 failed」。
+#
+# 删掉的历史写法：systemctl --user（本机无该 unit）、cd 数据目录 .9router（无
+# package.json）、setsid + npm run start（logs/ 不存在时静默失败却报「完成」）。
 set -e
 
 PORT=20127
-# 真实部署是 system 级 nine-router-src.service（WorkingDirectory 是仓库根，
-# ExecStart=custom-server.js）。之前 cd 到数据目录 .9router，那里没有 package.json，
-# 照这个脚本重启就是先 kill 再起不来（审查发现）。
-cd /home/administrator/9router
+REPO=/home/administrator/9router
+cd "$REPO"
+
+# system 级 unit 要 root。非 root 用 sudo -n —— 不带 -n 会在 polkit 上等交互、脚本
+# 悄悄挂住。鉴权单独判：「没权限」和「单元起不来」是两回事，不能都报成需要 root。
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return 0
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    echo "  需要 root 权限：请用 sudo 运行本脚本（或用 root 账户），要执行的是：$*" >&2
+    exit 1
+  fi
+  sudo -n "$@"
+}
 
 echo "=== 重启 9router（port $PORT） ==="
 
 if systemctl list-unit-files 2>/dev/null | grep -q '^auto-switch-ip\.service'; then
   echo "[1/3] 重启 auto-switch-ip.service"
-  systemctl restart auto-switch-ip.service
+  # 这一条也是 system 级，同样要 root：之前直接调，非 root 在 polkit 上就断在这里，
+  # 后面的 nine-router 根本没轮到（审查发现）。
+  if ! as_root systemctl restart auto-switch-ip.service; then
+    echo "  auto-switch-ip.service 重启失败" >&2
+    systemctl status auto-switch-ip.service --no-pager -n 20 >&2 || true
+    exit 1
+  fi
   sleep 2
-  systemctl is-active auto-switch-ip.service
+  systemctl is-active auto-switch-ip.service || true
 else
   echo "[1/3] 跳过 auto-switch-ip.service（本机无该 unit）"
 fi
 
-echo "[2/3] 重启 nine-router-src.service（system 级 unit）"
-# 不在这里 kill 端口上的进程再自己 setsid 起一个：真实部署由 unit 管，
-# 脚本拉起的实例 systemd 不认，10s 后 Restart=always 还会撞 EADDRINUSE，
-# 结果是「在跑的进程没人管、unit 进 failed」。
+echo "[2/3] 重启 nine-router-src.service"
 mkdir -p logs
-# system 级 unit：非 root 时用 sudo -n（不带 -n 会在 polkit 上卡住，脚本就悄悄挂掉）。
-if [ "$(id -u)" -eq 0 ]; then
-  systemctl restart nine-router-src.service
-else
-  sudo -n systemctl restart nine-router-src.service || {
-    echo "  需要 root：请用 sudo 运行，或手动 systemctl restart nine-router-src.service" >&2
-    exit 1
-  }
+if ! as_root systemctl restart nine-router-src.service; then
+  echo "  nine-router-src.service 重启失败（unit 起不来，不是权限问题）" >&2
+  systemctl status nine-router-src.service --no-pager -n 20 >&2 || true
+  exit 1
 fi
 
 for _ in $(seq 1 60); do
@@ -46,7 +60,7 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 if ! ss -ltn 2>/dev/null | grep -q ":$PORT "; then
-  echo "  启动失败：$PORT 没有在听（unit 起不来的话，日志在 journalctl -u nine-router-src）" >&2
+  echo "  启动失败：$PORT 没有在听（看 journalctl -u nine-router-src）" >&2
   systemctl status nine-router-src.service --no-pager -n 20 >&2 || true
   exit 1
 fi

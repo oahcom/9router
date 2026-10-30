@@ -212,22 +212,76 @@ export async function assertPublicUrlResolved(rawUrl) {
   }
 }
 
+// ── 凭据按信任域收敛 ─────────────────────────────────────────────────────
+// 凭据只发给「凭据所属主机」：调用方能改目的地（provider_options.baseUrl、
+// 上游 302），改目的地即改信任域，跨域那一次请求不再携带本机配置的 key。
+// 两条出站路径（proxyFetch 的跳转接管、search 的 builder 覆盖）共用这里的
+// 唯一一份判据，避免「改一处漏一处」。
+
+// 凭据头按「上游认得出是凭据」列举：search builder 用 x-api-key /
+// x-subscription-token 送 key，只列 authorization 会漏掉这两类。
+const CREDENTIAL_HEADERS = [
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "host",
+  "x-api-key",
+  "x-subscription-token",
+];
+
+// 凭据放在 query 里的 provider（google-pse 的 key=、searchapi 的 api_key=）。
+const CREDENTIAL_QUERY_PARAMS = ["key", "api_key", "apikey", "token", "access_token", "secret"];
+
+export function isCrossOrigin(fromUrl, toUrl) {
+  try {
+    return new URL(fromUrl).origin !== new URL(toUrl).origin;
+  } catch {
+    return true; // 解析不出受信基线 → 按跨域处理（失败关闭）
+  }
+}
+
+export function stripCredentialsForCrossOrigin(headers, fromUrl, toUrl) {
+  if (!isCrossOrigin(fromUrl, toUrl)) return headers;
+  const stripped = new Headers(headers || {});
+  for (const name of CREDENTIAL_HEADERS) stripped.delete(name);
+  return stripped;
+}
+
+export function stripCredentialQueryParams(url) {
+  const parsed = new URL(url);
+  let removed = false;
+  for (const name of CREDENTIAL_QUERY_PARAMS) {
+    if (parsed.searchParams.has(name)) {
+      parsed.searchParams.delete(name);
+      removed = true;
+    }
+  }
+  return removed ? parsed.toString() : url;
+}
+
 // fetch() with SSRF-safe manual redirect handling: each hop's target is
 // re-validated through assertPublicUrlResolved before being followed, so a
 // validated public URL can't 30x its way to an internal target. Bounded to
 // maxRedirects hops (fetch's own default following behavior has no bound
 // relevant here since we never let it auto-follow).
+// 跨源跳转另外剥掉凭据：原生 fetch 自己会剥（undici 的 CORS non-wildcard
+// 分支），接管跳转后就得自己剥，否则 A 回 302 到 B 时 Authorization/Cookie
+// 被原样送给第三方。同源跳转保持原 headers（自托管服务补斜杠的 302 不能丢 auth）。
 export async function fetchPublic(url, init = {}, { maxRedirects = 5 } = {}) {
   await assertPublicUrlResolved(url);
   let currentUrl = url;
+  let currentInit = { ...init, redirect: "manual" };
   for (let hop = 0; ; hop++) {
-    const res = await fetch(currentUrl, { ...init, redirect: "manual" });
+    const res = await fetch(currentUrl, currentInit);
     const isRedirect = res.status >= 300 && res.status < 400;
     const location = isRedirect ? res.headers.get("location") : null;
     if (!location) return res;
     if (hop >= maxRedirects) throw new Error("Blocked URL: too many redirects");
     const nextUrl = new URL(location, currentUrl).toString();
     await assertPublicUrlResolved(nextUrl);
+    // 按累积后的 headers 剥：连跳两次跨源时，第二跳起就不该还带着。
+    const nextHeaders = stripCredentialsForCrossOrigin(currentInit.headers, currentUrl, nextUrl);
+    if (nextHeaders !== currentInit.headers) currentInit = { ...currentInit, headers: nextHeaders };
     currentUrl = nextUrl;
   }
 }

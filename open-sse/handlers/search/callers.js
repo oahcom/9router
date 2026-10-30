@@ -29,7 +29,11 @@
  * @property {Record<string,unknown>} [providerSpecificData]
  */
 
-import { assertPublicUrl } from "../../../src/shared/utils/ssrfGuard.js";
+import {
+  assertPublicUrl,
+  stripCredentialsForCrossOrigin,
+  stripCredentialQueryParams,
+} from "../../../src/shared/utils/ssrfGuard.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -94,7 +98,30 @@ export function resolveBaseUrl(config, params) {
 }
 
 /**
- * Convert offset+maxResults to 1-indexed page number.
+ * 凭据只发给「凭据所属主机」：目的地被 `provider_options.baseUrl` 改到别的
+ * origin 时，这一次请求不再带凭据 —— header 与 query 两处都要剥（google-pse
+ * 的 `key=`、searchapi 的 `api_key=` 在 query 里，只剥 header 等于没剥）。
+ *
+ * 受信基线是 provider 自己配的 baseUrl（管理员配置，可信）；拿不到基线时
+ * 不剥，因为此时没有可比对的信任域，而请求 URL 也只可能来自配置本身。
+ */
+function confineCredentials(request, config) {
+  let trusted;
+  try {
+    trusted = new URL(config.baseUrl);
+  } catch {
+    return request;
+  }
+  if (trusted.origin === new URL(request.url).origin) return request;
+  const headers = stripCredentialsForCrossOrigin(request.init?.headers, config.baseUrl, request.url);
+  return {
+    ...request,
+    url: stripCredentialQueryParams(request.url),
+    init: { ...request.init, headers },
+  };
+}
+
+/**
  * @param {number|undefined} offset
  * @param {number} maxResults
  * @returns {number|undefined}
@@ -473,9 +500,9 @@ const BUILDERS = {
  */
 export function buildSearchRequest(provider, params) {
   const builder = BUILDERS[provider.id];
-  if (builder) return builder(provider, params);
+  if (builder) return confineCredentials(builder(provider, params), provider);
 
-  return {
+  return confineCredentials({
     url: resolveBaseUrl(provider, params),
     init: {
       method: provider.method || "POST",
@@ -489,5 +516,5 @@ export function buildSearchRequest(provider, params) {
         search_type: params.searchType,
       }),
     },
-  };
+  }, provider);
 }

@@ -14,7 +14,9 @@ import {
 } from "./proxyResolution.js";
 // 只有显式要求 strictRedirects 的调用方（远程可达的路由）才用这份全私有网段判据；
 // 其余调用方第 N 跳与首跳同判据，见下方 fetchFollowingSafeRedirects。
-import { assertPublicUrlResolved } from "../../src/shared/utils/ssrfGuard.js";
+// 凭据剥离的判据只此一份（ssrfGuard）：这里曾有一份同名副本，search 侧
+// 的 baseUrl 覆盖路径就没有，于是同一条缺陷要修两遍。
+import { assertPublicUrlResolved, stripCredentialsForCrossOrigin } from "../../src/shared/utils/ssrfGuard.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -382,18 +384,8 @@ function isReplayableBody(body) {
  * ssrfGuard 的全私有判据，用于「远程调用方可控 URL」的路由 —— 那里首跳的
  * 宽松判据本身就是被利用点，第 N 跳不该再沿用。
  */
-// 跨源跳转必须剥掉凭据：原生 fetch 在 redirect:manual 之外自己做了这件事
-// （undici index.js 的 "CORS non-wildcard request-header name" 分支），
-// 而我们接管跳转后只改 method/body，headers 整份沿用 —— 公网 A 回 302 到
-// 另一 origin 时，Authorization/Cookie 就被原样送给了第三方。
-const CREDENTIAL_HEADERS = ["authorization", "proxy-authorization", "cookie", "host"];
-
-function stripCredentialsForCrossOrigin(headers, fromUrl, toUrl) {
-  if (new URL(fromUrl).origin === new URL(toUrl).origin) return headers;
-  const stripped = new Headers(headers || {});
-  for (const name of CREDENTIAL_HEADERS) stripped.delete(name);
-  return stripped;
-}
+// 跨源跳转必须剥掉凭据，判据在 ssrfGuard.stripCredentialsForCrossOrigin
+// （与 search 的 baseUrl 覆盖路径共用同一份定义）。
 
 async function fetchFollowingSafeRedirects(send, url, options, maxRedirects = MAX_REDIRECTS) {
   const strict = options?.strictRedirects === true;

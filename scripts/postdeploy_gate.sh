@@ -8,13 +8,26 @@
 #
 # 用法：
 #   bash scripts/deploy_gate.sh          postbuild 语义：MISMATCH 是刚构建完的
-#                                        正常状态，大声警告但不让构建失败
+#                                        正常状态，大声警告但不让构建失败；
+#                                        此模式先写下源码戳 .next/SOURCE_STAMP
 #   bash scripts/deploy_gate.sh strict   重启后语义：MISMATCH = 重启没生效，失败
 #
 # UNAVAILABLE 一律只警告：判不了不等于一致，但也不该让构建/重启卡死
 # （服务恰好在构建窗口内停着，不是部署缺陷）。
-# STALE_SOURCE 在 postbuild 下不可能出现（刚构建完产物必比源码新）；出现即说明
-# 构建没有覆盖到这部分源码，strict 与非 strict 都按失败处理。
+runtime_paths="src open-sse next.config.js next.config.mjs package.json"
+
+if [ "${1:-}" != "strict" ]; then
+  # 产物已就位，把「这次构建覆盖的源码内容」记进 dist 目录，供 check_deploy_state
+  # 在每次启动后比对。内容哈希而非 mtime：mtime 会被 touch 推新而与内容脱节。
+  NEXT_DIST_DIR="${NEXT_DIST_DIR:-.next}"
+  if [ -d "$NEXT_DIST_DIR" ]; then
+    find $runtime_paths -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.ts' -o -name '*.tsx' -o -name '*.json' \) \
+         -not -path '*/node_modules/*' -print0 2>/dev/null \
+      | sort -z | xargs -0 -r sha256sum 2>/dev/null \
+      | sha256sum | cut -d' ' -f1 > "$NEXT_DIST_DIR/SOURCE_STAMP"
+  fi
+fi
+
 bash "$(dirname "$0")/check_deploy_state.sh"
 rc=$?
 case "$rc" in

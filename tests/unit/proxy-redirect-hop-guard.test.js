@@ -14,12 +14,15 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 const REAL_GET = "http://example.com/";
 const METADATA = "http://169.254.169.254/latest/meta-data/";
 const SAFE = "http://8.8.8.8/next"; // 公网 IP 字面量：不依赖 DNS，也不会撞 RFC1918
+// 另一个 origin 的公网地址：跨源跳转要剥凭据，同源要保留，两者都得有对照。
+const OTHER_ORIGIN = "http://1.1.1.1/elsewhere";
 // 局域网对等体：首跳闸门有意放行（proxyResolution.js 的 isPrivateHost 注释），
 // 第 N 跳必须与首跳同判据，否则同源 302 会把自托管服务整类掐断。
 const LAN = "http://192.168.1.97:20127/";
 const BLOCKED = /refused (link-local\/metadata|host resolving to link-local\/metadata)/;
 
 let sent;
+let sentInits; // 每一跳的 init，用来断言 headers 有没有被剥
 let nextHop; // (url) => Response
 let proxyAwareFetch;
 let realFetch;
@@ -27,9 +30,11 @@ let realFetch;
 beforeAll(async () => {
   realFetch = globalThis.fetch;
   sent = [];
+  sentInits = [];
   nextHop = () => new Response(null, { status: 302, headers: { location: METADATA } });
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, init) => {
     sent.push(String(url));
+    sentInits.push(init ?? {});
     return nextHop(String(url));
   };
   ({ proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js"));
@@ -41,7 +46,14 @@ afterAll(() => {
 
 function stub(impl) {
   sent.length = 0;
+  sentInits.length = 0;
   nextHop = impl;
+}
+
+function headerOf(hop, name) {
+  const h = sentInits[hop]?.headers;
+  if (!h) return null;
+  return h instanceof Headers ? h.get(name) : new Headers(h).get(name);
 }
 
 describe("proxyAwareFetch: 重定向逐跳复核", () => {
@@ -102,5 +114,59 @@ describe("proxyAwareFetch: 重定向逐跳复核", () => {
     const res = await proxyAwareFetch(REAL_GET, { redirect: "manual" });
     expect(res.status).toBe(302);
     expect(sent).toEqual([REAL_GET]);
+  });
+
+  // DEF-04：接管跳转后 headers 整份沿用，跨源 302 会把 Authorization/Cookie
+  // 送给第三方。原生 fetch 自己会剥（undici 的 CORS non-wildcard 分支），
+  // 我们绕过了它，就得自己剥。
+  it("strips credentials when a 302 crosses to another origin", async () => {
+    stub((u) => (u === REAL_GET
+      ? new Response(null, { status: 302, headers: { location: OTHER_ORIGIN } })
+      : new Response("ok", { status: 200 })));
+    await proxyAwareFetch(REAL_GET, {
+      headers: { authorization: "Bearer SECRET", cookie: "sid=secret", "x-trace": "keep-me" },
+    });
+    expect(sent).toEqual([REAL_GET, OTHER_ORIGIN]);
+    expect(headerOf(0, "authorization")).toBe("Bearer SECRET");
+    expect(headerOf(1, "authorization")).toBeNull();
+    expect(headerOf(1, "cookie")).toBeNull();
+    // 非凭据头照常转发：剥的是凭据，不是整个 headers。
+    expect(headerOf(1, "x-trace")).toBe("keep-me");
+  });
+
+  it("keeps credentials on a same-origin 302", async () => {
+    // 自托管服务补斜杠的 302 不能因此丢 auth（DEF-01 的回归护栏）。
+    stub((u) => (u === REAL_GET
+      ? new Response(null, { status: 302, headers: { location: "/v2/models" } })
+      : new Response("ok", { status: 200 })));
+    await proxyAwareFetch(REAL_GET, { headers: { authorization: "Bearer SECRET" } });
+    expect(sent).toEqual([REAL_GET, "http://example.com/v2/models"]);
+    expect(headerOf(1, "authorization")).toBe("Bearer SECRET");
+  });
+
+  it("strips credentials on a cross-origin 307 too", async () => {
+    // 307 保留 method/body，headers 走的是另一条分支，同样要剥。
+    stub((u) => (u === REAL_GET
+      ? new Response(null, { status: 307, headers: { location: OTHER_ORIGIN } })
+      : new Response("ok", { status: 200 })));
+    await proxyAwareFetch(REAL_GET, {
+      method: "POST",
+      body: "payload",
+      headers: { authorization: "Bearer SECRET" },
+    });
+    expect(sent).toEqual([REAL_GET, OTHER_ORIGIN]);
+    expect(headerOf(1, "authorization")).toBeNull();
+  });
+
+  it("accepts a Headers instance and still strips on cross-origin", async () => {
+    // 调用方传 Headers 实例时 `{...options}` 浅拷贝共用同一引用，改它等于改调用方的对象。
+    stub((u) => (u === REAL_GET
+      ? new Response(null, { status: 302, headers: { location: OTHER_ORIGIN } })
+      : new Response("ok", { status: 200 })));
+    const headers = new Headers({ authorization: "Bearer SECRET" });
+    await proxyAwareFetch(REAL_GET, { headers });
+    expect(headerOf(1, "authorization")).toBeNull();
+    // 调用方手里的对象不能被就地改掉。
+    expect(headers.get("authorization")).toBe("Bearer SECRET");
   });
 });

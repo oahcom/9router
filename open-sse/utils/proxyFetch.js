@@ -382,6 +382,19 @@ function isReplayableBody(body) {
  * ssrfGuard 的全私有判据，用于「远程调用方可控 URL」的路由 —— 那里首跳的
  * 宽松判据本身就是被利用点，第 N 跳不该再沿用。
  */
+// 跨源跳转必须剥掉凭据：原生 fetch 在 redirect:manual 之外自己做了这件事
+// （undici index.js 的 "CORS non-wildcard request-header name" 分支），
+// 而我们接管跳转后只改 method/body，headers 整份沿用 —— 公网 A 回 302 到
+// 另一 origin 时，Authorization/Cookie 就被原样送给了第三方。
+const CREDENTIAL_HEADERS = ["authorization", "proxy-authorization", "cookie", "host"];
+
+function stripCredentialsForCrossOrigin(headers, fromUrl, toUrl) {
+  if (new URL(fromUrl).origin === new URL(toUrl).origin) return headers;
+  const stripped = new Headers(headers || {});
+  for (const name of CREDENTIAL_HEADERS) stripped.delete(name);
+  return stripped;
+}
+
 async function fetchFollowingSafeRedirects(send, url, options, maxRedirects = MAX_REDIRECTS) {
   const strict = options?.strictRedirects === true;
   const gate = strict ? assertPublicUrlResolved : assertEgressTargetAllowed;
@@ -402,8 +415,12 @@ async function fetchFollowingSafeRedirects(send, url, options, maxRedirects = MA
     await gate(nextUrl);
     const keepMethod = res.status === 307 || res.status === 308;
     if (keepMethod && !isReplayableBody(options.body)) return res;
+    // 凭据按累积后的 headers 剥：连跳两次跨源时，第二跳起就不该还带着。
+    const nextHeaders = stripCredentialsForCrossOrigin(init.headers, currentUrl, nextUrl);
     currentUrl = nextUrl;
-    if (!keepMethod) init = { ...followed, method: "GET", body: undefined };
+    init = keepMethod
+      ? { ...followed, headers: nextHeaders }
+      : { ...followed, method: "GET", body: undefined, headers: nextHeaders };
   }
 }
 

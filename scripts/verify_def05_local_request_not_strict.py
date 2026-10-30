@@ -162,7 +162,10 @@ def main() -> int:
         f"/proc/{pid}/environ 中该变量出现 {len(inherited)} 次（0 = 由 JS 运行时生成）",
     )
 
-    # 9) 端到端：真的走一次包装层，看伪造头会不会被换掉
+    # 9) 端到端：真的走一次包装层，看伪造头会不会被换掉。
+    # envToken 一起打出来：isLocalRequest 比的是 process.env，不是包装层手里的
+    # 模块常量 —— 只断言「头被重写」的话，把 env 赋值挪进 require.main 分支
+    # 也能骗过去（实测该变异下此项仍绿，故单列一条断言）。
     e2e = subprocess.run(
         [
             "node",
@@ -177,7 +180,8 @@ def main() -> int:
             '"x-9r-peer-token":"forged","x-9r-real-ip":"8.8.8.8"}},res=>{'
             'res.resume();res.on("end",()=>{'
             'console.log(JSON.stringify({realIp:seen["x-9r-real-ip"],'
-            'token:seen["x-9r-peer-token"],viaProxy:seen["x-9r-via-proxy"]||null}));'
+            'token:seen["x-9r-peer-token"],viaProxy:seen["x-9r-via-proxy"]||null,'
+            'envToken:process.env.NINEROUTER_PEER_TOKEN||""}));'
             'srv.close();process.exit(0)})});r.end()})',
         ],
         cwd=ROOT,
@@ -197,6 +201,11 @@ def main() -> int:
         and len(got_e2e["token"] or "") == 48
         and got_e2e["viaProxy"] is None,
         f"发送 forged/8.8.8.8 → handler 收到 {json.dumps(got_e2e)}",
+    )
+    check(
+        "端到端：同一请求里 process.env 的 token 与盖章值一致（isLocalRequest 读的是 env）",
+        got_e2e["envToken"] == got_e2e["token"],
+        f'envToken 长度 {len(got_e2e["envToken"])}，盖章 token 长度 {len(got_e2e["token"] or "")}',
     )
 
     print()

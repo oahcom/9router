@@ -28,6 +28,12 @@ function sanitizeQuery(query) {
 // Strip non-ASCII chars from header values (HTTP headers must be ByteString).
 function sanitizeHeaders(headers) {
   if (!headers) return headers;
+  // Headers 没有可枚举自有属性，Object.entries 得到 {}，整排头连 Content-Type 一起丢。
+  // 跨源分支（confineCredentials 剥凭据后）返回的正是 Headers，于是「剥凭据」变成了
+  // 「剥光所有头」，POST 的 JSON body 失去 Content-Type。它的值必然已是 ByteString
+  // （否则构造函数就抛了），无需再净化——也不能先 new Headers(headers)：那会把中文头
+  // 直接抛成 TypeError，而这个函数存在的理由就是先剔掉非 ASCII。
+  if (headers instanceof Headers) return Object.fromEntries(headers);
   const out = {};
   for (const [k, v] of Object.entries(headers)) {
     out[k] = typeof v === "string" ? v.replace(/[^\x00-\xFF]/g, "").trim() : v;

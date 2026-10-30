@@ -121,6 +121,39 @@ describe("REQ-EGR-08 AC-08b: fetchPublic 跨源 302 第二跳不带凭据", () =
   });
 });
 
+describe("REQ-EGR-08 接缝：跨源剥凭据不得把 Content-Type 一起剥掉", () => {
+  // 上面两组各自正确却互相看不见：callers 的跨源分支返回 Headers，
+  // index.js 的 sanitizeHeaders 用 Object.entries 遍历 → Headers 无可枚举
+  // 自有属性 → {}，整排头（含 Content-Type）消失，JSON body 变成无类型的
+  // 请求体。检测只查「凭据在不在」，故 16 个用例全绿也抓不到。
+  // 这一条必须走 handleSearchCore 而不是自己 new Headers() 压平类型。
+  const originalFetch = globalThis.fetch;
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("跨源覆盖：Content-Type 仍在、凭据已剥、body 仍是 JSON", async () => {
+    const sent = [];
+    globalThis.fetch = vi.fn(async (url, init) => {
+      sent.push({ url: String(url), headers: new Headers(init?.headers || {}), body: init?.body });
+      return new Response(JSON.stringify({ organic: [{ title: "t", link: "https://x.example", snippet: "s" }] }),
+        { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const { handleSearchCore } = await import("../../open-sse/handlers/search/index.js");
+    const result = await handleSearchCore({
+      body: { query: "q", provider_options: { baseUrl: EVIL } },
+      provider: { id: "serper" },
+      providerConfig: { baseUrl: "https://google.serper.dev", method: "POST", authType: "apikey",
+        authHeader: "x-api-key", searchTypes: ["web"], defaultMaxResults: 5, maxMaxResults: 100, timeoutMs: 10000 },
+      credentials: { apiKey: "SECRET-KEY" },
+      log: null,
+    });
+    expect(result.success, "上游 200 + 可解析结果应判成功").toBe(true);
+    expect(sent, "应当且只应当发出一次请求").toHaveLength(1);
+    expect(sent[0].headers.get("content-type"), "丢 Content-Type 会让上游按非 JSON 解析 body").toBe("application/json");
+    expect(sent[0].headers.get("x-api-key"), "覆盖目的地后凭据不得外送").toBeNull();
+    expect(JSON.parse(sent[0].body).q, "body 仍应是被测查询").toBe("q");
+  });
+});
+
 describe("REQ-EGR-08 AC-08c: 两条路径共用一处定义", () => {
   it("stripCredentialsForCrossOrigin 只有一份实现", async () => {
     const { readFileSync } = await import("node:fs");

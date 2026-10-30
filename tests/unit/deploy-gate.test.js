@@ -61,9 +61,29 @@ describe("postdeploy_gate", () => {
   it("warns but succeeds on MISMATCH in postbuild mode", async () => {
     // 刚构建完必然 MISMATCH —— 让构建失败会把正常流程判成错误。
     writeFileSync(join(distDir, "BUILD_ID"), "BUILD-NEW\n");
-    const r = await run();
+    const r = await run("postbuild");
     expect(r.stderr).toContain("MISMATCH");
     expect(r.status).toBe(0);
+  });
+
+  it("bare invocation is a read-only status check, not a build", async () => {
+    // 无参写戳 = 把「此刻的源码」记成「已构建的源码」：任何一次人工查状态
+    // 都会让第三路输入变成 MATCH（实测改过源码未构建，跑一次即报 MATCH）。
+    const root2 = mkdtempSync(join(tmpdir(), "bare-gate-"));
+    mkdirSync(join(root2, "scripts"), { recursive: true });
+    copyFileSync(GATE, join(root2, "scripts/postdeploy_gate.sh"));
+    copyFileSync(join(ROOT, "scripts/check_deploy_state.sh"), join(root2, "scripts/check_deploy_state.sh"));
+    mkdirSync(join(root2, "src"), { recursive: true });
+    mkdirSync(join(root2, ".next"), { recursive: true });
+    writeFileSync(join(root2, ".next/BUILD_ID"), "BUILD-DISK\n");
+    writeFileSync(join(root2, "src/app.js"), "// edited, never built\n");
+    await runAsync("bash", [join(root2, "scripts/postdeploy_gate.sh")], {
+      cwd: root2,
+      encoding: "utf8",
+      env: { ...process.env, NEXT_DIST_DIR: join(root2, ".next"), HEALTH_URL: healthUrl },
+    }).catch(() => {});
+    expect(existsSync(join(root2, ".next/SOURCE_STAMP")), "无参调用不得写戳").toBe(false);
+    rmSync(root2, { recursive: true, force: true });
   });
 
   it("fails on MISMATCH in strict mode", async () => {
@@ -115,7 +135,7 @@ describe("check_deploy_state: 源码比产物新", () => {
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
   it("postbuild writes the source stamp for the tree it built", async () => {
-    const r = await runGate("");
+    const r = await runGate("postbuild");
     expect(r.stdout).toContain("MATCH");
     expect(existsSync(join(root, ".next/SOURCE_STAMP")), "postbuild 必须落戳").toBe(true);
   });
@@ -136,7 +156,7 @@ describe("check_deploy_state: 源码比产物新", () => {
 
   it("touch without a content change is not stale", async () => {
     // 实测踩过的误报：编辑后回退，内容逐字相同但 mtime 变新。
-    await runGate("");
+    await runGate("postbuild");
     const future = new Date(Date.now() + 3_600_000);
     utimesSync(join(root, "src/app.js"), future, future);
     const r = await runGate("strict");

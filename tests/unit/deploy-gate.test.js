@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer } from "node:http";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, copyFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -78,5 +78,56 @@ describe("postdeploy_gate", () => {
     const r = await run("strict", { HEALTH_URL: "http://127.0.0.1:1/api/health" });
     expect(r.stderr).toContain("UNAVAILABLE");
     expect(r.status).toBe(0);
+  });
+});
+
+// 第三条输入：源码比产物新。disk/runtime 两侧同源于同一次构建，所以上面四条
+// 用例在「改了源码没构建」时全是绿的 —— 实测 cee3b16c 与 3f25c8bf 都不在产物里
+// 而门禁报了 MATCH。这里用自建的临时仓库根复现那个状态（门禁按 $(dirname $0)/..
+// 定位仓库，所以 fixture 必须自带 scripts/ 与 src/）。
+describe("check_deploy_state: 源码比产物新", () => {
+  let root;
+
+  function runGate() {
+    return runAsync("bash", [join(root, "scripts/postdeploy_gate.sh"), "strict"], {
+      cwd: root,
+      encoding: "utf8",
+      env: { ...process.env, NEXT_DIST_DIR: join(root, ".next"), HEALTH_URL: healthUrl },
+    }).then(
+      ({ stdout, stderr }) => ({ status: 0, stdout, stderr }),
+      (e) => ({ status: e.code, stdout: e.stdout ?? "", stderr: e.stderr ?? "" }),
+    );
+  }
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "stale-source-"));
+    // 脚本要能按相对路径找到同级的 check_deploy_state.sh
+    mkdirSync(join(root, "scripts"), { recursive: true });
+    copyFileSync(GATE, join(root, "scripts/postdeploy_gate.sh"));
+    copyFileSync(join(ROOT, "scripts/check_deploy_state.sh"), join(root, "scripts/check_deploy_state.sh"));
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(join(root, ".next"), { recursive: true });
+    writeFileSync(join(root, ".next/BUILD_ID"), "BUILD-DISK\n");
+    writeFileSync(join(root, "src/app.js"), "// built\n");
+    // 产物比源码新 = 刚构建完，正常态
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(join(root, "src/app.js"), past, past);
+  });
+
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  it("passes when the artifact is newer than every source file", async () => {
+    const r = await runGate();
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toContain("MATCH");
+  });
+
+  it("fails with STALE_SOURCE when a source file is newer than the artifact", async () => {
+    writeFileSync(join(root, "src/app.js"), "// edited after build\n");
+    const r = await runGate();
+    expect(r.status, "改了源码没构建必须非 0").toBe(1);
+    expect(r.stderr).toContain("STALE_SOURCE");
+    // 文件清单由 check_deploy_state 打到 stdout，gate 只把结论打到 stderr
+    expect(r.stdout).toContain("src/app.js");
   });
 });

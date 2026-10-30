@@ -10,10 +10,13 @@
 # 得到 10:04 / 11:07 / 12:04，那条判据不可用。buildId 是常量字符串，不依赖时钟。
 #
 # 退出码：
-#   0  MATCH        磁盘与运行一致
+#   0  MATCH        磁盘与运行一致，且产物不比源码旧
 #   1  MISMATCH     构建了但没重启（或运行的是别的构建）
 #   2  UNAVAILABLE  判不了（读不到磁盘 BUILD_ID / 连不上服务 / 服务没报 buildId）
 #                   —— 连不上绝不能当「一致」返回 0。
+#   3  STALE_SOURCE 运行时源码比产物新 —— 改了代码没构建。disk/runtime 两侧都取自
+#                   同一次构建，因此对这一类**结构上看不见**（实测 cee3b16c 与
+#                   3f25c8bf 都不在产物里，而门禁报 MATCH）。
 #
 # 可用环境变量覆盖：NEXT_DIST_DIR（默认 .next）、HEALTH_URL。
 
@@ -40,10 +43,20 @@ if [ -z "$runtime" ]; then
   exit 2
 fi
 
-if [ "$disk" = "$runtime" ]; then
-  echo "disk=$disk runtime=$runtime MATCH"
-  exit 0
+if [ "$disk" != "$runtime" ]; then
+  echo "disk=$disk runtime=$runtime MISMATCH"
+  exit 1
 fi
 
-echo "disk=$disk runtime=$runtime MISMATCH"
-exit 1
+# 第三路输入：源码是否比产物新。BUILD_ID 两侧同源，只能发现「构建了没重启」，
+# 发现不了「改了源码没构建」—— 每一次 rebuild 之后它都照样 MATCH。
+stale=$(find src open-sse next.config.js next.config.mjs package.json \
+          -name node_modules -prune -o -newer "$DIST_DIR/BUILD_ID" -print 2>/dev/null | head -5)
+if [ -n "$stale" ]; then
+  echo "disk=$disk runtime=$runtime STALE_SOURCE —— 源码比产物新，需重新构建："
+  printf '  %s\n' $stale
+  exit 3
+fi
+
+echo "disk=$disk runtime=$runtime MATCH"
+exit 0

@@ -40,9 +40,11 @@ const { OpenCodeExecutor } = await import("open-sse/executors/opencode.js");
 const { OpenCodeGoExecutor } = await import("open-sse/executors/opencode-go.js");
 const { OpenCodeZenExecutor } = await import("open-sse/executors/opencode-zen.js");
 
+// 备选出口只收 testStatus === "active" 的池：未经探测的池（null/unknown）和探测失败的池
+// 都不是「比当前出口更可能成」的候选。fixture 必须带上状态，否则测试覆盖不到这条过滤。
 const POOLS = [
-  { id: "pool-a", proxyUrl: "http://a.example:8080", isActive: true },
-  { id: "pool-b", proxyUrl: "http://b.example:8080", isActive: true },
+  { id: "pool-a", proxyUrl: "http://a.example:8080", isActive: true, testStatus: "active" },
+  { id: "pool-b", proxyUrl: "http://b.example:8080", isActive: true, testStatus: "active" },
 ];
 
 describe("OpenCode free lane provider isolation", () => {
@@ -144,5 +146,19 @@ describe("no-auth credential shape isolation", () => {
     expect(mocks.getProxyPools).toHaveBeenCalledOnce();
     expect(mocks.pickProxyPoolId).toHaveBeenCalledWith(["pool-a", "pool-b"], "round-robin", "free-rotating");
     expect(credentials.providerSpecificData).not.toHaveProperty("connectionProxyAlternates");
+  });
+
+  // 负例：探测失败的池 / 从未探测的池都不得成为备选出口。没有这条，
+  // testStatus 过滤被删掉也没人会发现 —— 正例只证明「active 的池入选」。
+  it("drops alternates whose proxy pool never passed a probe", async () => {
+    mocks.getProxyPools.mockResolvedValue([
+      { id: "pool-a", proxyUrl: "http://a.example:8080", isActive: true, testStatus: "active" },
+      { id: "pool-dead", proxyUrl: "http://dead.example:8080", isActive: true, testStatus: "error" },
+      { id: "pool-untested", proxyUrl: "http://new.example:8080", isActive: true, testStatus: null },
+    ]);
+
+    const credentials = await getProviderCredentials("opencode");
+
+    expect(credentials.providerSpecificData.connectionProxyAlternates).toEqual([]);
   });
 });

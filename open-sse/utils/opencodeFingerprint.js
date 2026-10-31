@@ -455,6 +455,12 @@ export function applyEnvFingerprint(body, flat, { claude = false } = {}) {
  */
 export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   if (!body || typeof body !== "object") return new Map();
+  // The executor's retry / egress-failover branches call transformRequest again on
+  // the same body object. Re-running the pass aliases the alias (get_file ->
+  // fn_19omnbq -> fn_06c90ev) and overwrites the recorded map, so single-hop
+  // restore returns the FIRST alias — a name the client never declared.
+  const alreadyRenamed = renamedToolNames.get(body);
+  if (alreadyRenamed?.size) return alreadyRenamed;
 
   const { tools, map } = concealFingerprintToolNames(body.tools);
   const normalized = neutralizeCallerToolNames(Array.isArray(tools) ? tools : [], map, new Set(map.keys()));
@@ -501,6 +507,13 @@ export function restoreToolNames(payload, map) {
     out[key] = value;
   };
 
+  // SSE envelope `{event, data}`: formatSSE unwraps `data` and re-serialises it
+  // as the frame body, so restoring only the outer object loses every rename.
+  if (payload.data && typeof payload.data === "object") {
+    const restoredData = restoreToolNames(payload.data, map);
+    if (restoredData !== payload.data) put("data", restoredData);
+  }
+
   // Claude streaming content_block_start event.
   if (payload.type === "content_block_start") {
     const block = payload.content_block;
@@ -545,6 +558,14 @@ export function restoreToolNames(payload, map) {
       item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)
         ? { ...item, name: map.get(item.name) }
         : item));
+  }
+
+  // The terminal `response.completed` / `response.incomplete` event carries the
+  // whole response object, so its output[] sits one level down. Missing this
+  // handed codex the alias in the final event even when every delta was restored.
+  if (payload.response && typeof payload.response === "object") {
+    const restoredResponse = restoreToolNames(payload.response, map);
+    if (restoredResponse !== payload.response) put("response", restoredResponse);
   }
 
   // OpenAI Responses SSE events such as response.output_item.added/done.

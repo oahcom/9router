@@ -89,3 +89,18 @@ tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#502
 tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) keeps the same text request-scoped for provider openai
 tests/unit/codebuddy-block-backoff.test.js :: CodeBuddy Intl block backoff (#5024) still stops a combo on a malformed CodeBuddy request
 tests/unit/combo-credit-fallback.test.js :: combo credit fallback routes a 400 response correctly: Bad request
+
+# ── 2026-10-31 合并上游 master-oa (2cf10d3d) 后新红 ─────────────────────
+# 在干净的 origin/master-oa worktree 上同样红，不是本次合并引入的；按本文件约定
+# 记下来并写明缺什么。
+# proxyFetch 的 vi.mock 没带 clearProxyDispatchers：opencode.js 在 4 处换线点调它，
+# mock 里没有该导出，execute() 直接抛。要改的是测试的 mock，不是代码。
+tests/unit/opencode-egress.test.js :: OpenCode free-lane egress switching on 429: switches proxy + session and retries exactly once with the original body
+tests/unit/opencode-egress.test.js :: OpenCode free-lane egress switching on a FreeUsageLimitError: switches proxy without rotating the session
+tests/unit/opencode-session.test.js :: OpenCode Stable Session Reuse (429 follow-up) keeps the stable session on an IP-scoped 429
+tests/unit/opencode-session.test.js :: OpenCode Stable Session Reuse (429 follow-up) rotates and retries once on a session-scoped 429
+# 契约漂移：asip rotate 在 daemon 回 200 非 JSON 时现在报 socket（连接层分类先命中），
+# 测试仍期待 bad-response。哪边对要人拍板。
+tests/unit/asip-rotate-labels.test.js :: asip rotate error labels reports bad-response when the daemon answers 200 with non-JSON
+# live 网络：真打上游 mimo，上游现在回 400（同上面那条「Unsupported model」一组的成因）。
+tests/unit/mimo-free.live.test.js :: MiMo Free anti-abuse gate (live) chat WITH Chrome User-Agent → 200

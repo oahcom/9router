@@ -1,53 +1,84 @@
 #!/bin/bash
-# 9router 重启脚本。
+# 9router 重启脚本（2026-10-30 第三版）。
 #
-# 2026-10-28 校正：这里原来 `systemctl --user restart nine-router.service`，
-# 但 nine-router.service 与 auto-switch-ip.service 在本机都不存在（both inactive，
-# 无 unit 文件），脚本在 set -e 下第一条 restart 就中断，且探活还打在已废弃的
-# 20128 端口。9router 的真实运行方式是 setsid + npm run start（custom-server.js）。
-# 现在按真实进程管理重写：只有确实存在 unit 时才走 systemctl。
+# 真实部署：system 级 unit 9router.service
+#   WorkingDirectory=/home/administrator/.9router
+#   ExecStart=/home/administrator/.local/bin/npm run start   → custom-server.js --port 20127
+#   Restart=on-failure / RestartSec=5s
+# 所以这里只驱动 unit，不再自己 kill 进程再 setsid 起一个：脚本拉起的实例 systemd
+# 不认，5s 后 unit 重启还会撞 EADDRINUSE，结果是「在跑的没人管、unit 进 failed」。
+#
+# 删掉的历史写法：systemctl --user（本机无该 unit）、setsid + npm run start
+# （logs/ 不存在时静默失败却报「完成」）。
 set -e
 
 PORT=20127
-cd /home/administrator/.9router
+UNIT=9router.service
+REPO=/home/administrator/.9router
+cd "$REPO"
+
+# system 级 unit 要 root。非 root 用 sudo -n —— 不带 -n 会在 polkit 上等交互、脚本
+# 悄悄挂住。鉴权单独判：「没权限」和「单元起不来」是两回事，不能都报成需要 root。
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return 0
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    echo "  需要 root 权限：请用 sudo 运行本脚本（或用 root 账户），要执行的是：$*" >&2
+    exit 1
+  fi
+  sudo -n "$@"
+}
 
 echo "=== 重启 9router（port $PORT） ==="
 
-if systemctl --user list-unit-files 2>/dev/null | grep -q '^auto-switch-ip\.service'; then
+if systemctl list-unit-files 2>/dev/null | grep -q '^auto-switch-ip\.service'; then
   echo "[1/3] 重启 auto-switch-ip.service"
-  systemctl --user restart auto-switch-ip.service
+  # 这一条也是 system 级，同样要 root：之前直接调，非 root 在 polkit 上就断在这里，
+  # 后面的 nine-router 根本没轮到（审查发现）。
+  if ! as_root systemctl restart auto-switch-ip.service; then
+    echo "  auto-switch-ip.service 重启失败" >&2
+    systemctl status auto-switch-ip.service --no-pager -n 20 >&2 || true
+    exit 1
+  fi
   sleep 2
-  systemctl --user is-active auto-switch-ip.service
+  systemctl is-active auto-switch-ip.service || true
 else
   echo "[1/3] 跳过 auto-switch-ip.service（本机无该 unit）"
 fi
 
-echo "[2/3] 重启 9router 进程"
-OLD_PID=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1 || true)
-if [ -n "${OLD_PID:-}" ]; then
-  echo "  kill $OLD_PID"
-  kill "$OLD_PID" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    ss -ltn 2>/dev/null | grep -q ":$PORT " || break
-    sleep 0.5
-  done
+echo "[2/3] 重启 $UNIT"
+if ! as_root systemctl restart "$UNIT"; then
+  echo "  $UNIT 重启失败（unit 起不来，不是权限问题）" >&2
+  systemctl status "$UNIT" --no-pager -n 20 >&2 || true
+  exit 1
 fi
-LOG="logs/start-$(date +%Y%m%d-%H%M).log"
-setsid nohup npm run start > "$LOG" 2>&1 &
+
 for _ in $(seq 1 60); do
   ss -ltn 2>/dev/null | grep -q ":$PORT " && break
   sleep 0.5
 done
+if ! ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+  echo "  启动失败：$PORT 没有在听（看 journalctl -u $UNIT）" >&2
+  systemctl status "$UNIT" --no-pager -n 20 >&2 || true
+  exit 1
+fi
 # 启动事实落进日志：buildId 是本次启动实际服务的构建标识，pid 是和端口绑定的进程。
-# 文件名里的时刻只作人读线索 —— 本机时钟会漂，判据只能是文件内容。
+# 这条事实原来写在自建日志文件的尾部，现在日志归 journald，就作为一行输出留在终端。
 NEW_PID=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | head -1)
-echo "buildId=$(cat .next/BUILD_ID 2>/dev/null || echo unknown) pid=${NEW_PID:-unknown} at=$(date -Is)" | tee -a "$LOG"
-echo "  日志: $LOG"
+echo "  buildId=$(cat .next/BUILD_ID 2>/dev/null || echo unknown) pid=${NEW_PID:-unknown} at=$(date -Is)"
+echo "  systemctl is-active: $(systemctl is-active "$UNIT")"
 
 echo "[3/3] 验证"
-curl -s -o /dev/null -w "  /v1/models HTTP=%{http_code} t=%{time_total}s\n" --max-time 10 \
-  "http://127.0.0.1:$PORT/v1/models" \
-  -H "Authorization: Bearer ${HERMES_ROUTER_KEY:-9router-local}"
+# 探活要判结果：原来 curl 的退出码没人看，服务没起来也打印「完成」。
+KEY=$HERMES_ROUTER_KEY
+[ -n "$KEY" ] || KEY=9router-local
+if ! curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:$PORT/v1/models" -H "Authorization: Bearer $KEY"; then
+  echo "  探活失败：/v1/models 没回 2xx" >&2
+  exit 1
+fi
+echo "  /v1/models OK"
 
 # 部署态自检：刚重启过，磁盘与运行应当一致。strict 语义下 MISMATCH 让脚本失败 ——
 # 重启没生效就是这次重启的失败，不该以 0 收场等下次有人发现。

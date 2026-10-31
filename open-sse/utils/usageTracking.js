@@ -17,8 +17,15 @@ export const COLORS = {
   cyan: "\x1b[36m"
 };
 
-// Buffer tokens to prevent context errors
-const BUFFER_TOKENS = 2000;
+// Buffer tokens to prevent context errors.
+// Configurable because a billing relay must report what upstream actually
+// counted: a flat +2000 inflates short prompts several-fold, and only the
+// streaming path applies it while forced-SSE→JSON does not — the same request
+// then bills 915 (JSON) vs 2915 (stream). Set USAGE_BUFFER_TOKENS=0 there.
+const BUFFER_TOKENS = (() => {
+  const raw = Number(process.env.USAGE_BUFFER_TOKENS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2000;
+})();
 
 // Get HH:MM:SS timestamp
 function getTimeString() {

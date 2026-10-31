@@ -1,3 +1,6 @@
+// 需要 Bun sidecar 的用例：没有 bun 的机器上 skip，别变成「基线之外的新失败」。
+const HAS_BUN = globalThis.__HAS_BUN__ !== false;
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import http from "node:http";
 import path from "node:path";
@@ -38,7 +41,7 @@ function startStreamingUpstream(chunks, gapMs) {
   });
 }
 
-describe("sidecar retirement", () => {
+describe.skipIf(!HAS_BUN)("sidecar retirement", () => {
   let upstream;
 
   beforeEach(async () => {

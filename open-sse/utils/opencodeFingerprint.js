@@ -355,7 +355,11 @@ function noteUnavailableTools(body, flat, names, claude = false) {
 const ENV_TAG = "<env>";
 const ENV_HEADING = "Here is some useful information about the environment you are running in:";
 const ENV_TMP_DIR = path.join(os.tmpdir(), "opencode");
-const ENV_WORKING_DIR = process.cwd();
+// The gate only checks that the `<env>` marker exists — it never compares the
+// path. process.cwd() put the gateway host's real directory into every upsteam
+// prompt, and the model repeated it to end users ("I'm in
+// /home/administrator/9router"), leaking the host layout. Keep it neutral.
+const ENV_WORKING_DIR = process.env.OPENCODE_ENV_WORKING_DIR || "/home/user/project";
 const ENV_FINGERPRINT_PROMPT = [
   ENV_HEADING,
   ENV_TAG,

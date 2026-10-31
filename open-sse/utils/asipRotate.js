@@ -24,6 +24,11 @@ const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 2000);
 // 线上出口换掉，而且结果取决于当时网络。测试里由 tests/setup.js 置 1。
 const DISABLED = process.env.ASIP_DISABLED === "1";
 
+// 调用方据此决定「要不要为一次可能的重试先克隆 body」：asip 关着时克隆纯属浪费。
+export function asipRotationEnabled() {
+  return !DISABLED;
+}
+
 let lastToken = null;
 
 function readToken() {
@@ -37,46 +42,74 @@ function readToken() {
   }
 }
 
-function callAsip(path, payload) {
+function callAsip(path, payload, signal = null) {
   return new Promise((resolve) => {
-    if (DISABLED) return resolve(null);
+    if (DISABLED) return resolve({ error: "disabled" });
     const token = readToken();
-    if (!token) return resolve(null);
+    if (!token) return resolve({ error: "no-token" });
     const body = payload ? JSON.stringify(payload) : "";
-    const req = http.request(
-      {
-        socketPath: SOCKET_PATH,
-        path,
-        method: payload ? "POST" : "GET",
-        timeout: TIMEOUT_MS,
-        headers: {
-          "X-Asip-Token": token,
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body),
+    let req;
+    try {
+      req = http.request(
+        {
+          socketPath: SOCKET_PATH,
+          path,
+          method: payload ? "POST" : "GET",
+          timeout: TIMEOUT_MS,
+          headers: {
+            "X-Asip-Token": token,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
         },
-      },
-      (res) => {
-        let buf = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          buf += chunk;
-        });
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(buf));
-          } catch {
-            resolve(null);
+        (res) => {
+          // asip 换线途中被 systemd 重启 / OOM 时，响应会半截断掉：
+          // res 只发 aborted + error，req 只发 close，end 永远不来。
+          // 之前这里只挂 data/end，Promise 就永久 pending —— 而两处 await 外层
+          // 没有超时，请求直接挂死（审查发现，实测 3s 仍未 settle）。
+          res.on("aborted", () => resolve({ error: "bad-response" }));
+          res.on("error", () => resolve({ error: "socket" }));
+          if (res.statusCode >= 400) {
+            res.resume();
+            resolve({ error: "bad-status-" + res.statusCode });
+            return;
           }
-        });
-      }
-    );
+          let buf = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            buf += chunk;
+          });
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(buf));
+            } catch {
+              resolve({ error: "bad-response" });
+            }
+          });
+        }
+      );
+    } catch {
+      // http.request 自身会同步抛（header 里有非法字符，比如 token 文件写坏、
+      // 带进了控制字符）。这里若让它 reject，异常会穿出 execute()，
+      // 用户请求变成 500 —— 而这个客户端的原则是「失败只降级，不拖垮请求」。
+      return resolve({ error: "socket" });
+    }
     // 超时/连不上都当作「这次没换」：接口是增强，不能让它拖垮请求本身。
     req.on("timeout", () => {
       req.destroy();
-      resolve(null);
+      resolve({ error: "timeout" });
     });
-    req.on("error", () => resolve(null));
+    // 客户端自己走了（abort）和 asip 连不上是两回事：前者不该触发重试。
+    req.on("error", () => resolve({ error: signal?.aborted ? "aborted" : "socket" }));
+    // 兜底：任何让上面几条路径都没走到的收尾，都不许让 await 挂着。
+    req.on("close", () => resolve({ error: "socket" }));
     if (body) req.write(body);
+    // 头已到、body 没写完时 abort：req 不会发 error，只有 close —— 所以这里直接
+    // resolve，别指望下面的兜底去猜（审查发现，实测 12s 仍未 settle）。
+    if (signal) signal.addEventListener("abort", () => {
+      req.destroy();
+      resolve({ error: "aborted" });
+    }, { once: true });
     req.end();
   });
 }
@@ -89,8 +122,13 @@ function callAsip(path, payload) {
  * 之前确实有人换过线，本次请求照样值得重试。所以判断一律用 switchedAt 与请求
  * 发起时刻比较：只要换线发生在请求发出之后，旧连接上的 429 就和新隧道无关。
  */
-export async function rotateEgress(reason = "rate429") {
-  const res = await callAsip("/rotate", { reason });
+export async function rotateEgress(reason = "rate429", { signal = null } = {}) {
+  // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
+  if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted" };
+  const res = await callAsip("/rotate", { reason }, signal);
+  // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
+  // 调用方要据此提前重建连接（审查发现）。
+  if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error };
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable" };
   return {
     switched: Boolean(res.switched),

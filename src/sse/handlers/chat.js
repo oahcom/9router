@@ -43,11 +43,16 @@ export async function handleChat(request, clientRawRequest = null) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
   }
 
-  // Build clientRawRequest for logging (if not provided)
+  // Build clientRawRequest for logging (if provided)
   if (!clientRawRequest) {
     const url = new URL(request.url);
+    // Some clients are configured with a base URL that already ends in /v1 and
+    // still append /v1/messages, producing /v1/v1/messages. next.config.mjs
+    // rewrites it to the same handler, so the request works, but the usage log
+    // recorded the doubled path and split the stats across two endpoints.
+    const pathname = url.pathname.replace(/^\/v1\/v1(?=\/|$)/, "/v1");
     clientRawRequest = {
-      endpoint: url.pathname,
+      endpoint: pathname,
       body,
       headers: Object.fromEntries(request.headers.entries())
     };

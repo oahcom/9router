@@ -1,3 +1,6 @@
+// 需要 Bun sidecar 的用例：没有 bun 的机器上 skip，别变成「基线之外的新失败」。
+const HAS_BUN = globalThis.__HAS_BUN__ !== false;
+
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +34,7 @@ function spawnCount() {
   return readFileSync(spawnLog, "utf8").trim().split("\n").filter(Boolean).length;
 }
 
-describe("OpenCode transport upstream-timeout cooldown", () => {
+describe.skipIf(!HAS_BUN)("OpenCode transport upstream-timeout cooldown", () => {
   it("fails fast on a sidecar 504 timeout without retrying the same egress", async () => {
     const body = JSON.stringify({ stream: true, messages: [] });
     const first = await transport.fetchViaTransport("https://upstream.invalid/v1/chat/completions", { body, headers: {} }, null);

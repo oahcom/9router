@@ -4,6 +4,7 @@ import { createErrorResult } from "../../utils/error.js";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { FORMATS } from "../../translator/formats.js";
 import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
+import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
@@ -346,7 +347,22 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     // on both sides). Whatever drops it between assembly and serialisation, the client
     // must not be left unable to account for its own token spend: a caller cannot tell
     // a 90%-cached request from a cheap one without this.
-    if (usage && Object.keys(usage).length > 0) parsed.usage = usage;
+    //
+    // Same buffer as the streaming path: this handler serves a NON-stream client
+    // whose provider forces streaming, so without it the identical request reports
+    // prompt_tokens 915 here and 2915 when streamed — a relay that bills from these
+    // numbers charged stream users ~3x on short prompts. Buffered copy is for the
+    // client only; saveUsageStats above already logged the unbuffered value.
+    //
+    // Filter by the field family the upstream actually sent, not by the client's
+    // format: the converters below (openAICompletionToClaudeMessage /
+    // chatCompletionToResponses) read prompt_tokens || input_tokens, so filtering
+    // a Claude-shaped usage as OpenAI (or the reverse) would leave the response
+    // with an empty usage object.
+    if (usage && Object.keys(usage).length > 0) {
+      const family = usage.prompt_tokens !== undefined ? FORMATS.OPENAI : FORMATS.CLAUDE;
+      parsed.usage = filterUsageForFormat(addBufferToUsage(usage), family);
+    }
 
     // Strip reasoning_content only when content is non-empty.
     // When content is empty (e.g. thinking models that used all tokens for reasoning),

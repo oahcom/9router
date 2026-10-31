@@ -272,9 +272,12 @@ describe("criterion L — decrypt failure errors the session but keeps the serve
     expect(session.status).toBe("error");
     expect(session.error).toMatch(/decrypt/i);
 
-    // Server must still be alive (same port) for the live attempt.
-    const again = await startZedProxy(0);
-    expect(again.port).toBe(started.port);
+    // Server must still be alive for the live attempt. 原来是再 startZedProxy(0)
+    // 然后断言「又拿到同一个临时端口」—— 内核不保证回收同一个 ephemeral port，
+    // 全量并行时被别的用例抢走就随机变红（审查发现，门禁因此绿红不定）。
+    // 直接对同一地址再发一次，能证明 listener 还活着，且与端口分配无关。
+    const alive = await realFetch(cb.toString());
+    expect(alive.status).toBe(200);
     clearZedSession(state);
   });
 });

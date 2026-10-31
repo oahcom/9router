@@ -8,6 +8,8 @@ const { transportMock } = vi.hoisted(() => {
 
 vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
   fetchViaTransport: transportMock,
+  peekTransportFailure: vi.fn(() => null),
+  bumpTransportGeneration: vi.fn(),
   resetTransport: vi.fn(),
 }));
 

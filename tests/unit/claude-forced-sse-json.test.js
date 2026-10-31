@@ -73,7 +73,10 @@ describe("Claude JSON clients behind forced-stream upstreams", () => {
     const json = await result.response.json();
     expect(json.content).toEqual([{ type: "text", text: "partial" }]);
     expect(json.stop_reason).toBe("max_tokens");
-    expect(json.usage).toEqual({ input_tokens: 8, output_tokens: 2 });
+    // Same 2000-token headroom buffer the streaming path applies (stream.js),
+    // so a forced-stream provider reports identical usage to a JSON client and a
+    // streaming one. Previously this path passed usage through unbuffered.
+    expect(json.usage).toEqual({ input_tokens: 2008, output_tokens: 2 });
   });
 
   it("keeps an empty output as empty text rather than inventing a decision", async () => {

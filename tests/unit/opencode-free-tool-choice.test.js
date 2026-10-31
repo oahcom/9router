@@ -7,7 +7,11 @@ vi.hoisted(() => {
 import { PROVIDERS } from "../../open-sse/config/providers.js";
 import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
 import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
-import { OPENCODE_FINGERPRINT_TOOLS } from "../../open-sse/utils/opencodeFingerprint.js";
+import {
+  OPENCODE_FINGERPRINT_TOOLS,
+  restoreToolNames,
+  takeRenamedToolNames,
+} from "../../open-sse/utils/opencodeFingerprint.js";
 
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => "" } })),
@@ -19,9 +23,15 @@ const FREE_13 = "muse-spark-1.3-contributor-free";
 const CREDS = { connectionId: "opencode-free-tool-choice-test" };
 const INPUT = [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }];
 const TOOLS = [{ type: "function", name: "get_weather", description: "w", parameters: { type: "object", properties: {} } }];
-// Free-tier gate: client tools pass through verbatim, then the fingerprint
-// read/shell definitions are appended or upstream answers 403 FreeTierError.
-const WIRE_TOOLS = [...TOOLS, ...OPENCODE_FINGERPRINT_TOOLS.map((name) => expect.objectContaining({ type: "function", name }))];
+// Free-tier gate: caller tools are renamed to a stable neutral alias
+// (fn_<7 base36 chars of a name hash>, see neutralizeCallerToolNames), then the
+// fingerprint read/shell definitions are appended under their original names or
+// upstream answers 403 FreeTierError. Assert the alias contract, never a hash.
+const ALIAS = /^fn_[0-9a-z]{7}$/;
+const WIRE_TOOLS = [
+  ...TOOLS.map((tool) => ({ ...tool, name: expect.stringMatching(ALIAS) })),
+  ...OPENCODE_FINGERPRINT_TOOLS.map((name) => expect.objectContaining({ type: "function", name })),
+];
 
 function responsesBody(model, tool_choice) {
   const body = { model, input: structuredClone(INPUT), tools: structuredClone(TOOLS) };
@@ -41,13 +51,17 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
     ["required", "required"],
     ["none", "none"],
   ])("demote %s sang auto (plain và max)", (_label, choice) => {
+    const aliases = [];
     for (const model of [FREE_13, `${FREE_13}(max)`]) {
       const body = responsesBody(model, structuredClone(choice));
       const out = new OpenCodeExecutor().transformRequest(model, body, true, CREDS);
       expect(out.tool_choice).toBe("auto");
       expect(out.tools).toEqual(WIRE_TOOLS);
       expect(out.input).toEqual(INPUT);
+      aliases.push(out.tools[0].name);
     }
+    // Cùng tên caller -> cùng alias ở mọi lượt (hash theo tên, không theo vị trí).
+    expect(aliases[0]).toBe(aliases[1]);
   });
 
   it("giữ auto và absent; tools/input nguyên vẹn", () => {
@@ -72,11 +86,19 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
     ["future 1.4-Free", "muse-spark-1.4-contributor-free"],
     ["Go id", "muse-spark-1.3-contributor"],
     ["non-Muse", "big-pickle"],
-  ])("không đổi tool_choice của %s", (_label, model) => {
+  ])("giữ tool_choice named (không demote) cho %s", (_label, model) => {
     const choice = { type: "function", name: "get_weather" };
     const body = responsesBody(model, structuredClone(choice));
     const out = new OpenCodeExecutor().transformRequest(model, body, true, CREDS);
-    expect(out.tool_choice).toEqual(choice);
+    // Hợp đồng mới: ngoài 1.3-Free vẫn giữ choice dạng named (không demote sang
+    // "auto"), nhưng tên được retarget sang alias neutral của chính caller tool —
+    // nếu không, model sẽ gọi một cái tên không còn trên wire.
+    expect(out.tool_choice).toEqual({ ...choice, name: expect.stringMatching(ALIAS) });
+    // Chat lane mang tên trong function.name, Responses lane ở name.
+    expect(out.tools.map((tool) => tool.name ?? tool.function?.name)).toEqual([
+      out.tool_choice.name,
+      ...OPENCODE_FINGERPRINT_TOOLS,
+    ]);
   });
 
   it("wire: execute gửi choice auto tới /inference/v1/responses", async () => {
@@ -96,5 +118,23 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
     expect(sent.model).toBe(FREE_13);
     expect(sent.tools).toEqual(WIRE_TOOLS);
     expect(sent.input).toEqual(INPUT);
+
+    // Đối xứng bắt buộc của hợp đồng alias: tên trên wire phải restore được về
+    // tên caller gốc, còn read/shell giữ nguyên nên không nằm trong map.
+    const map = takeRenamedToolNames(body);
+    const alias = sent.tools.find((tool) => ALIAS.test(tool.name))?.name;
+    expect(alias).toMatch(ALIAS);
+    expect(map.get(alias)).toBe("get_weather");
+    expect(map.has("read")).toBe(false);
+    const restored = restoreToolNames(
+      { output: [{ type: "function_call", name: alias, arguments: "{}" }] },
+      map,
+    );
+    expect(restored.output[0].name).toBe("get_weather");
+    const untouched = restoreToolNames(
+      { output: [{ type: "function_call", name: "read", arguments: "{}" }] },
+      map,
+    );
+    expect(untouched.output[0].name).toBe("read");
   });
 });

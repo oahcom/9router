@@ -15,13 +15,37 @@ const flat = (names) => names.map((name) => ({ type: "function", name }));
 const chat = (names) => names.map((name) => ({ type: "function", function: { name } }));
 const namesOf = (tools) => tools.map((tool) => tool.name ?? tool.function?.name);
 
+// f1d05c24: non-fingerprint caller tool names are neutralized to stable
+// fn_<7 base36 chars> aliases. Assert the shape, never a concrete hash.
+const ALIAS = /^fn_[0-9a-z]{7}$/;
+
 describe("opencodeFingerprint — request side", () => {
-  it("appends exact read/shell definitions and leaves case variants untouched", () => {
+  // f1d05c24: the free lane now rejects caller tool names, so every
+  // non-fingerprint caller name travels as a stable `fn_<hash>` alias and is
+  // restored response-side; only read/shell keep their real names.
+  it("appends exact read/shell definitions and aliases every caller name, case variants included", () => {
     const body = { tools: flat(CC_TOOLS) };
     const map = applyFingerprintTools(body, true);
 
-    expect(namesOf(body.tools)).toEqual([...CC_TOOLS, ...OPENCODE_FINGERPRINT_TOOLS]);
-    expect(map.size).toBe(0);
+    expect(namesOf(body.tools)).toEqual([
+      ...CC_TOOLS.map(() => expect.stringMatching(ALIAS)),
+      ...OPENCODE_FINGERPRINT_TOOLS,
+    ]);
+    expect(map.size).toBe(CC_TOOLS.length);
+    const aliases = namesOf(body.tools).slice(0, CC_TOOLS.length);
+    expect(aliases.map((alias) => map.get(alias))).toEqual(CC_TOOLS);
+    expect(new Set(aliases).size).toBe(CC_TOOLS.length);
+    // The same caller name hashes to the same alias on the next round.
+    const again = { tools: flat(CC_TOOLS) };
+    applyFingerprintTools(again, true);
+    expect(namesOf(again.tools)).toEqual(namesOf(body.tools));
+    // Response-side restoration still gets the caller's original spelling back,
+    // including case variants such as "Read" that must not collide with "read".
+    const restored = restoreToolNames(
+      { output: aliases.map((name) => ({ type: "function_call", name })) },
+      takeRenamedToolNames(body),
+    );
+    expect(restored.output.map((item) => item.name)).toEqual(CC_TOOLS);
     const shell = body.tools.find((tool) => tool.name === "shell");
     expect(shell.description).toMatch(/^Execute a shell command/);
     expect(shell.parameters.required).toEqual(["command"]);
@@ -30,9 +54,10 @@ describe("opencodeFingerprint — request side", () => {
 
   it("handles the nested chat shape without dropping .function", () => {
     const body = { tools: chat(["Edit"]) };
-    applyFingerprintTools(body, false);
+    const map = applyFingerprintTools(body, false);
 
-    expect(namesOf(body.tools)).toEqual(["Edit", "read", "shell"]);
+    expect(namesOf(body.tools)).toEqual([expect.stringMatching(ALIAS), "read", "shell"]);
+    expect(map.get(namesOf(body.tools)[0])).toBe("Edit");
     const read = body.tools.find((tool) => tool.function?.name === "read");
     expect(read.function.parameters.required).toEqual(["path"]);
   });
@@ -40,9 +65,20 @@ describe("opencodeFingerprint — request side", () => {
   it("aliases a caller tool that reuses an exact fingerprint name", () => {
     const body = { tools: flat(["read", "read_client", "Edit"]) };
     const map = applyFingerprintTools(body, true);
+    const names = namesOf(body.tools);
 
-    expect(namesOf(body.tools)).toEqual(["read_client2", "read_client", "Edit", "read", "shell"]);
+    // The fingerprint collision still gets the concrete read_client2 alias
+    // (read_client was taken), while ordinary caller names are neutralized.
+    expect(names).toEqual([
+      "read_client2",
+      expect.stringMatching(ALIAS),
+      expect.stringMatching(ALIAS),
+      "read",
+      "shell",
+    ]);
     expect(map.get("read_client2")).toBe("read");
+    expect(map.get(names[1])).toBe("read_client");
+    expect(map.get(names[2])).toBe("Edit");
   });
 
   it("keeps a caller tool that already carries OpenCode's exact definition", () => {
@@ -152,13 +188,21 @@ describe("opencodeFingerprint — in-place normalization", () => {
   });
   const windowsShell = () => shellTool("Windows", "pwsh");
 
-  it("keeps the caller's name and adopts OpenCode's definition when arguments line up", () => {
+  it("adopts OpenCode's definition in place and neutralizes the other caller names", () => {
     const body = { tools: [windowsShell(), { type: "function", name: "Edit" }] };
     const map = applyFingerprintTools(body, true);
+    const names = namesOf(body.tools);
 
-    expect(namesOf(body.tools)).toEqual(["shell", "Edit", "read"]);
-    expect(map.size).toBe(0);
-    expect(takeRenamedToolNames(body)).toBeNull();
+    // `shell` keeps its name because it is a fingerprint tool; Edit is an
+    // ordinary caller name and now travels under a neutral alias.
+    expect(names).toEqual(["shell", expect.stringMatching(ALIAS), "read"]);
+    expect(map.size).toBe(1);
+    expect(map.get(names[1])).toBe("Edit");
+    expect(takeRenamedToolNames(body)).toBe(map);
+    expect(restoreToolNames(
+      { output: [{ type: "function_call", name: names[1] }] },
+      map,
+    ).output[0].name).toBe("Edit");
     // Only the genuinely absent `read` is still advertised as a placeholder; the
     // CLI's <env> marker rides along on the same instructions field.
     expect(body.instructions).toContain("Do not call the `read` tool; it is a placeholder that does nothing.");
@@ -190,7 +234,7 @@ describe("opencodeFingerprint — in-place normalization", () => {
     expect(body.messages).toBeUndefined();
   });
 
-  it("no longer invents alias names that a client plugin may already own", () => {
+  it("neutralizes plugin tool names instead of reusing client alias names", () => {
     const pluginTool = (name) => ({
       type: "function",
       name,
@@ -199,9 +243,21 @@ describe("opencodeFingerprint — in-place normalization", () => {
     });
     const body = { tools: [pluginTool("shell_client"), pluginTool("shell_client2"), windowsShell()] };
     const map = applyFingerprintTools(body, true);
+    const names = namesOf(body.tools);
 
-    expect(namesOf(body.tools)).toEqual(["shell_client", "shell_client2", "shell", "read"]);
-    expect(map.size).toBe(0);
+    // These caller names used to pass through untouched. Now every one of them
+    // is neutralized, so none can squat on a concrete shell_client alias or
+    // collide with the real shell/read tools.
+    expect(names).toEqual([
+      expect.stringMatching(ALIAS),
+      expect.stringMatching(ALIAS),
+      "shell",
+      "read",
+    ]);
+    expect(new Set(names).size).toBe(names.length);
+    expect(map.size).toBe(2);
+    expect([map.get(names[0]), map.get(names[1])]).toEqual(["shell_client", "shell_client2"]);
+    expect(body.tools[2].description).toContain("Commands run on Linux using bash.");
   });
 
   it("still conceals a fingerprint name whose arguments do not line up", () => {

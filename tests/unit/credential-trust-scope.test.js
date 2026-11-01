@@ -151,7 +151,7 @@ describe("REQ-EGR-08 接缝：跨源剥凭据不得把 Content-Type 一起剥掉
     expect(sent[0].headers.get("content-type"), "丢 Content-Type 会让上游按非 JSON 解析 body").toBe("application/json");
     expect(sent[0].headers.get("x-api-key"), "覆盖目的地后凭据不得外送").toBeNull();
     expect(JSON.parse(sent[0].body).q, "body 仍应是被测查询").toBe("q");
-  });
+  }, 15000); // 接缝走 handleSearchCore 全链路，16 worker 下实测 5095.8ms 超 5000ms 默认值；单跑 0.7~0.9s
 });
 
 describe("REQ-EGR-08 AC-08c: 两条路径共用一处定义", () => {

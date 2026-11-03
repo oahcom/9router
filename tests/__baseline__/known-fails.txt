@@ -99,8 +99,7 @@ tests/unit/opencode-egress.test.js :: OpenCode free-lane egress switching on 429
 tests/unit/opencode-egress.test.js :: OpenCode free-lane egress switching on a FreeUsageLimitError: switches proxy without rotating the session
 tests/unit/opencode-session.test.js :: OpenCode Stable Session Reuse (429 follow-up) keeps the stable session on an IP-scoped 429
 tests/unit/opencode-session.test.js :: OpenCode Stable Session Reuse (429 follow-up) rotates and retries once on a session-scoped 429
-# 契约漂移：asip rotate 在 daemon 回 200 非 JSON 时现在报 socket（连接层分类先命中），
-# 测试仍期待 bad-response。哪边对要人拍板。
-tests/unit/asip-rotate-labels.test.js :: asip rotate error labels reports bad-response when the daemon answers 200 with non-JSON
 # live 网络：真打上游 mimo，上游现在回 400（同上面那条「Unsupported model」一组的成因）。
 tests/unit/mimo-free.live.test.js :: MiMo Free anti-abuse gate (live) chat WITH Chrome User-Agent → 200
+# cloud/ 目录不在本仓库（tests 里 import cloud/src/handlers/embeddings.js），永远是 suite load 失败。
+tests/unit/embeddings.cloud.test.js :: <suite failed to load>

@@ -24,7 +24,15 @@ const SPECIALIZED = new Set([
 ]);
 
 // Per-process / per-request values: kimi's random device name, minimax's session UUID.
-const VOLATILE_HEADERS = new Set(["x-msh-device-name", "x-mavis-session-id"]);
+const VOLATILE_HEADERS = new Set([
+  "x-msh-device-name",
+  "x-mavis-session-id",
+  // codebuddy 的渠道校验要求插件级 request/conversation id，每次请求随机生成。
+  "x-request-id",
+  "x-conversation-id",
+  "x-conversation-request-id",
+  "x-conversation-message-id",
+]);
 
 // Sanitize header: khử token + field thời gian động (kimi X-Msh-Device-Id) để snapshot ổn định.
 function sanitize(headers) {

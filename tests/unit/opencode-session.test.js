@@ -13,6 +13,10 @@ const { fetchMock } = vi.hoisted(() => {
 
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: fetchMock,
+  // 生产代码在 429 换线后要丢 keep-alive 池（opencode.js 的分支会调它）。
+  // 这个 mock 缺这个导出时，任何走到该分支的用例都会以「No ... export is defined
+  // on the mock」失败 —— 报的是 mock 的缺口，不是被测行为。
+  clearProxyDispatchers: vi.fn(),
 }));
 
 vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({

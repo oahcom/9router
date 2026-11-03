@@ -180,18 +180,28 @@ export function generateSessionId(timestamp = Date.now()) {
 const translatedOpencodeSessions = new Map();
 const MAX_TRANSLATED_SESSIONS = 1000;
 
-function syntheticTransportError(message) {
+function syntheticTransportError(message, failure = null) {
   const headers = {
     "content-type": "application/json",
     "retry-after": "1",
     "x-transport-error-type": "synthetic",
   };
+  // 具体是哪一种传输失败随响应带走，而不是让下游去读模块级的 peekTransportFailure()：
+  // 那是全局的「最后一次失败」，并发下拿到的是别人的。
+  // 只放行纯 ASCII 短标签：Head 值里混进中文或换行会让 Response 构造直接抛，
+  // 一次 503 就变成 502。
+  if (failure && /^[a-z0-9:_.-]{1,64}$/i.test(failure)) headers["x-transport-failure"] = failure;
   return new Response(JSON.stringify({
     type: "error",
     error: { type: "UpstreamTransportError", message },
   }), { status: 503, headers });
 }
 
+
+// 两种说法是同一种故障：无首字节超时。sidecar 自己的 19s 定时器先到就是
+// upstream-timeout，父进程的 20s 定时器先到就是 header-timeout —— 谁赢这场竞速
+// 取决于当时机器负载。分开处理会让同一次隧道悬挂有时重试、有时不重试。
+const HEADER_STALL_FAILURES = new Set(["header-timeout", "upstream-timeout"]);
 
 // 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
@@ -237,12 +247,11 @@ function nativeSession(headers) {
   return null;
 }
 
-// Upstream free-tier quota is accounted per session. Minting a fresh
-// x-opencode-session on every request burns through it and surfaces as
-// 429 FreeUsageLimitError with growing reset-after delays, while the real
-// CLI reuses one long-lived canonical session per conversation. Mirror
-// that: one stable canonical session per downstream identity, evicted
-// after MEMORY_CONFIG.sessionTtlMs like the other session stores.
+// One stable x-opencode-session per downstream identity, evicted after
+// MEMORY_CONFIG.sessionTtlMs like the other session stores. Production 429
+// bodies carry no timing, so a fresh session per request was assumed to be
+// the cost driver; that assumption is unverified — see the 08:00 wall-clock
+// window measured in asip's ledger (`.warp_ip_used.json`).
 const stableOpencodeSessions = new Map();
 const opencodeSessionEpochs = new Map();
 const MAX_STABLE_SESSIONS = 1000;
@@ -662,7 +671,54 @@ export class OpenCodeExecutor extends BaseExecutor {
   // relay 分支在解析 proxyUrl 之前就 return，directFetch 会被忽略 —— 那种情况下这条
   // 兜底并没有生效，请求仍以 undici 的 ClientHello 走 relay。
   async execute(args) {
+    // 在 transformRequest 之前留一份原始 body：无首字节超时的重试要重放请求，
+    // 而 transformRequest 是就地改（打指纹、改工具名），拿改过的再跑一次会二次打指纹 → 403。
+    const replayBody = cloneRequestBody(args.body);
+    // executeInner 里才解析得出出口，会话 id 又依赖出口（translateSessionId 的 key 含
+    // egressId）。用 holder 把它实际用过的凭据带出来，重试才不会换一个新会话 ——
+    // 上游按会话+指纹双重校验，换会话可能直接 403。
+    const usedCredentials = {};
+    const result = await this.executeInner({ ...args, usedCredentials });
+    const replayCredentials = usedCredentials.value || args.credentials;
+    // 重试用 executeInner 包过的 logger：那条 warn 必须带同一个 req= 才能串起来。
+    const replayArgs = { ...args, log: usedCredentials.log || args.log, body: replayBody, credentials: replayCredentials };
+    return (await this.retryOnceAfterStall(result, replayArgs)) ?? result;
+  }
+
+  /**
+   * 无首字节超时：出口还活着，只是 sidecar 池里那条连接死了。
+   * 单池部署（两个 proxy pool 同指 127.0.0.1:7890）选不出备选出口，唯一能做的是
+   * 换一条新连接再试一次 —— 不换线是刻意的，换线归 429/403 那条路径管。
+   *
+   * 谁调用都行，但只能从这里出：executeInner 有四五条 return 路径（早退、429 换线后
+   * 重试、failover、末尾重试），逐个补必漏。实测 10:33:18 换线成功 → 10:33:20 撞 429
+   * → 重试 → 10:33:38 header timeout → 直接 503 回客户端，就是漏在 429 那条路上。
+   *
+   * 为什么必须 bump：retire() 有 30s 节流，窗口内 sidecar 不会重启；不换 generation
+   * 的话重试骑着同一条死 socket，只是把 20s 再等一遍。
+   *
+   * 为什么只对「无首字节」这一类：出口限流（429）、指纹被拒（403 FreeTierError）、
+   * 结构性不支持（socks5）重试一万次也是同一个结果，白等 20s。
+   */
+  async retryOnceAfterStall(result, args) {
+    if (result?.response?.status !== 503) return null;
+    if (result.response.headers.get("x-transport-error-type") !== "synthetic") return null;
+    const failure = result.response.headers.get("x-transport-failure") || "";
+    if (!HEADER_STALL_FAILURES.has(failure)) return null;
+    if (!args?.body) return null;
+    bumpTransportGeneration();
+    args.log?.warn?.("EGRESS", `transport stall (${failure}) -> retry once on a fresh connection`);
+    // 直接走 BaseExecutor：再回 executeInner 会把整段 429/asip 逻辑重跑一遍，
+    // 一次超时能放大成多次换线。
+    return await super.execute(args);
+  }
+
+  async executeInner(args) {
     const { model, stream, credentials } = args;
+    // 请求发出时刻。asip 拿它回溯「这条 429 发出时走的是哪条线」，避免把坏账
+    // 记到换线之后的新线上。定义在方法开头：下面两个 rotateEgress 调用点都要用，
+    // 定义在原处（约 130 行之后）会让前面那处拿不到。
+    const requestStartedAt = Date.now();
     // Every warn this request emits carries its short id, so the EGRESS lines
     // (rotate / cooling / no-alternate) and the final ERROR can be stitched
     // together without guessing from timestamps. Call sites stay untouched.
@@ -710,13 +766,18 @@ export class OpenCodeExecutor extends BaseExecutor {
         // （都指向 127.0.0.1:7890），selectAlternateProxy 永远返回 null，这里
         // 一旦拒绝就是「回带 retry-after 数十小时」的死锁 —— 后续请求全被本地
         // 拦掉，根本走不到下面 429 重试分支。实测这就是服务不可用的直接原因。
-        const rotated = await rotateEgress("rate429", { signal: args?.signal });
-        // 判据不能只看 switched：no_warm_standby / too_frequent 时 asip 没换线，
-        // 但冷却已经过期、请求本来也发不出去，重试一次成本极低，而放弃必然 429。
-        // 白名单而不是黑名单：reason 是 asip 那边的开放词表（还有 ok / coalesced /
-        // too_frequent / no_warm_standby / unauthorized / internal_error / unknown…），
-        // 黑名单每漏一个就等于「没换线也当换过了」——清冷却、bump、白打一次上游。
-        const ROTATED_REASONS = ["ok", "coalesced", "too_frequent", "no_warm_standby"];
+        const rotated = await rotateEgress("rate429", { signal: args?.signal, requestStartedAt });
+        // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
+        //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
+        //   gap = rate429_guard_sec / 线数）。手里这条连接挂在刚被换下的旧线上，
+        //   必须重建后再试一次。
+        //   no_warm_standby —— 这次一条线都没换，连接还在原来的隧道上。清冷却等于
+        //   抹掉「这个出口刚被拦」的记录，重试必然再 429，只是多烧一次上游。
+        //   放它落下去走下面返回 429 + 封顶 retry-after。
+        // 白名单而不是黑名单：reason 是 asip 那边的开放词表（还有 timeout /
+        // unauthorized / internal_error / unknown…），黑名单每漏一个就等于
+        // 「没换线也当换过了」。
+        const ROTATED_REASONS = ["ok", "coalesced", "too_frequent"];
         const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
         if (rotateHappened) {
           clearProxyDispatchers();
@@ -742,6 +803,12 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 和主路径那处 timeout 的处理保持一致。
           clearProxyDispatchers();
           bumpTransportGeneration();
+        } else if (rotated.lineChanged) {
+          // asip 自己换的线：主循环读库、探测判死、定时轮换这三条路都不经过本进程，
+          // 我们手里池化的连接还挂在换下来那条隧道上。不重建就会一直骑到它被重启，
+          // 期间每条请求都拿旧出口的 429。
+          clearProxyDispatchers();
+          bumpTransportGeneration();
         }
         // upstream 的 retry-after 可能是数万秒（实测见过 34842s = 9.7 小时）。
         // 原样透传等于一次 429 就把服务锁死大半天，这才是服务不可用的直接原因。
@@ -765,7 +832,12 @@ export class OpenCodeExecutor extends BaseExecutor {
     }
 
     const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
-    const requestStartedAt = Date.now();
+    // 交给 execute() 做无首字节重试用：它必须在**原出口、原会话**上重放，
+    // 拿 args.credentials 重新 prepare 会因缺 egressId 算出另一个会话 id。
+    if (args.usedCredentials) {
+      args.usedCredentials.value = prepared;
+      args.usedCredentials.log = log;
+    }
     // 克隆的触发条件是「这次请求有可能需要重放 body」，不是「有没有备选代理池」：
     // asip 换线跟备选池是两条独立的路，单池部署一样要靠它绕 429。transformRequest
     // 会就地改 body（打指纹、改工具名），不先克隆就重放等于二次改指纹 → 403。
@@ -808,6 +880,7 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 排除集还会把重试送回刚回 429 的那条。egress 本来就是 let，后面 probe 也会改它。
           egress = attemptEgress;
         }
+        // 选不出备选出口时由 execute 兜底重试（单池部署就是这种情况）。
       }
     }
     if (!result?.response) return result;
@@ -839,7 +912,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       );
     }
     if (retryBody || typeof args.body === "string") {
-      const asip = await rotateEgress(rotateReason, { signal: args?.signal });
+      const asip = await rotateEgress(rotateReason, { signal: args?.signal, requestStartedAt });
       if (asip.switchedAt >= requestStartedAt) {
         clearProxyDispatchers();
         // 主路径也必须 bump：sidecar 的 session key 是 proxy|generation，只清 undici
@@ -867,11 +940,17 @@ export class OpenCodeExecutor extends BaseExecutor {
         logDecline(args?.log, asip.reason);
         // 超时是「asip 已经在换、只是没等它回话」：那条隧道确实要换了，bump 一次，
         // 免得下一条请求继续骑着它（审查发现）。
-        if (asip.reason === "timeout") {
-          // 超时 = asip 已经在换；sidecar 的 session 和 undici 的 keep-alive 池
-          // 都得丢，否则下一条请求还拴在旧隧道上（和上面早退分支保持一致）。
+        // 同样要 bump 的还有「asip 说这次没换，但出口线和上次不一样」——
+        // 合并/节流只说明这一次调用没换线，不代表线没被别处换过（主循环、探测判死）。
+        if (asip.reason === "timeout" || asip.lineChanged) {
+          // sidecar 的 session 和 undici 的 keep-alive 池都得丢，否则下一条请求
+          // 还拴在旧隧道上（和上面早退分支保持一致）。
           clearProxyDispatchers();
           bumpTransportGeneration();
+          // bump 本身不打日志，而这条路径正是「没人通知我们、我们自己发现的」——
+          // 不留一行就分不清它是真没触发还是触发了但看不见。按 reason 限流复用
+          // 同一个聚合器，避免 429 风暴里刷屏。
+          logDecline(args?.log, asip.lineChanged ? "line-moved" : "timeout-rebuild");
         }
       }
     }
@@ -1041,6 +1120,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     warnTransport(log, `Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
     return syntheticTransportError(
       `OpenCode free lane requires the Bun transport; sidecar unavailable (${transportFailure}).`,
+      transportFailure,
     );
   }
 

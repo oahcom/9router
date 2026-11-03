@@ -142,3 +142,7 @@ machine-id
 # 手工备份 / 编辑器残留不许进仓库（opencode.js.bak-20261030-0125 教训）
 *.bak-*
 *.bak
+
+# headroom 运行时目录（proxy.log/install.log/proxy.pid）：进程自己追加写，不入库。
+# 历史里曾跟踪过 proxy.log，HEAD 只有 2.3KB 而工作区涨到 59MB。
+/headroom/

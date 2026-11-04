@@ -6,7 +6,6 @@ const mocks = vi.hoisted(() => ({
   getProviderConnections: vi.fn(),
   resolveConnectionProxyConfig: vi.fn(),
   pickProxyPoolId: vi.fn(),
-  proxyConfigFromPool: vi.fn(),
 }));
 
 vi.mock("@/lib/localDb", () => ({
@@ -20,7 +19,6 @@ vi.mock("@/lib/localDb", () => ({
 vi.mock("@/lib/network/connectionProxy", () => ({
   resolveConnectionProxyConfig: mocks.resolveConnectionProxyConfig,
   pickProxyPoolId: mocks.pickProxyPoolId,
-  proxyConfigFromPool: mocks.proxyConfigFromPool,
 }));
 
 vi.mock("@/shared/constants/providers.js", () => ({
@@ -40,8 +38,9 @@ const { OpenCodeExecutor } = await import("open-sse/executors/opencode.js");
 const { OpenCodeGoExecutor } = await import("open-sse/executors/opencode-go.js");
 const { OpenCodeZenExecutor } = await import("open-sse/executors/opencode-zen.js");
 
-// 备选出口只收 testStatus === "active" 的池：未经探测的池（null/unknown）和探测失败的池
-// 都不是「比当前出口更可能成」的候选。fixture 必须带上状态，否则测试覆盖不到这条过滤。
+// 备选出口机制已整个删除（单池布局下恒为空集，见 opencode-503-429-branch-map）。
+// 这里只留「哪些 provider 会去读池子」的行为：opencode 走指定池，其他 free provider
+// 按 rotateStrategy 轮换。
 const POOLS = [
   { id: "pool-a", proxyUrl: "http://a.example:8080", isActive: true, testStatus: "active" },
   { id: "pool-b", proxyUrl: "http://b.example:8080", isActive: true, testStatus: "active" },
@@ -99,66 +98,19 @@ describe("no-auth credential shape isolation", () => {
       vercelRelayUrl: "",
       strictProxy: false,
     }));
-    mocks.proxyConfigFromPool.mockImplementation((pool) => ({
-      proxyPoolId: pool.id,
-      connectionProxyEnabled: true,
-      connectionProxyUrl: pool.proxyUrl,
-      connectionNoProxy: "",
-      vercelRelayUrl: "",
-      strictProxy: false,
-    }));
   });
 
-  it("adds proxy alternates for opencode", async () => {
-    const credentials = await getProviderCredentials("opencode");
-
-    expect(mocks.getProxyPools).toHaveBeenCalledOnce();
-    expect(credentials.providerSpecificData.connectionProxyAlternates).toEqual([
-      {
-        proxyPoolId: "pool-b",
-        connectionProxyEnabled: true,
-        connectionProxyUrl: "http://b.example:8080",
-        connectionNoProxy: "",
-        vercelRelayUrl: "",
-        strictProxy: false,
-      },
-    ]);
-  });
-
-  it("resolves the oc alias to the opencode path", async () => {
-    const credentials = await getProviderCredentials("oc");
-
-    expect(mocks.getProxyPools).toHaveBeenCalledOnce();
-    expect(credentials.providerSpecificData.connectionProxyAlternates).toHaveLength(1);
-  });
-
-  it("keeps other free providers free of opencode proxy alternates", async () => {
+  it("keeps other free providers off the opencode-only path", async () => {
     const credentials = await getProviderCredentials("mimo-free");
 
-    expect(mocks.getProxyPools).not.toHaveBeenCalled();
-    expect(credentials.providerSpecificData).not.toHaveProperty("connectionProxyAlternates");
     expect(credentials.providerSpecificData.connectionProxyPoolId).toBe("pool-b");
   });
 
-  it("keeps pool rotation for other free providers without adding alternates", async () => {
+  it("keeps pool rotation for other free providers", async () => {
     const credentials = await getProviderCredentials("free-rotating");
 
     expect(mocks.getProxyPools).toHaveBeenCalledOnce();
     expect(mocks.pickProxyPoolId).toHaveBeenCalledWith(["pool-a", "pool-b"], "round-robin", "free-rotating");
-    expect(credentials.providerSpecificData).not.toHaveProperty("connectionProxyAlternates");
-  });
-
-  // 负例：探测失败的池 / 从未探测的池都不得成为备选出口。没有这条，
-  // testStatus 过滤被删掉也没人会发现 —— 正例只证明「active 的池入选」。
-  it("drops alternates whose proxy pool never passed a probe", async () => {
-    mocks.getProxyPools.mockResolvedValue([
-      { id: "pool-a", proxyUrl: "http://a.example:8080", isActive: true, testStatus: "active" },
-      { id: "pool-dead", proxyUrl: "http://dead.example:8080", isActive: true, testStatus: "error" },
-      { id: "pool-untested", proxyUrl: "http://new.example:8080", isActive: true, testStatus: null },
-    ]);
-
-    const credentials = await getProviderCredentials("opencode");
-
-    expect(credentials.providerSpecificData.connectionProxyAlternates).toEqual([]);
+    expect(credentials.providerSpecificData.connectionProxyPoolId).toBe("pool-a");
   });
 });

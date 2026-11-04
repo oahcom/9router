@@ -289,57 +289,6 @@ export function hasActiveDirectCooldown(now = Date.now()) {
   return false;
 }
 
-export function hasAlternateEgresses(proxyOptions = null) {
-  const alternates = proxyOptions?.connectionProxyAlternates;
-  if (!Array.isArray(alternates)) return false;
-  return alternates.some((alt) => alt && (alt.connectionProxyUrl || alt.vercelRelayUrl || alt.url));
-}
-
-export function alternateToProxyOptions(proxyOptions, alternate) {
-  const enabled = alternate?.connectionProxyEnabled === true;
-  const proxyUrl = normalizeString(alternate?.connectionProxyUrl ?? alternate?.url);
-  const noProxy = normalizeString(alternate?.connectionNoProxy ?? alternate?.noProxy);
-
-  return {
-    ...(proxyOptions || {}),
-    enabled,
-    connectionProxyEnabled: enabled,
-    url: proxyUrl,
-    connectionProxyUrl: proxyUrl,
-    noProxy,
-    connectionNoProxy: noProxy,
-    vercelRelayUrl: normalizeString(alternate?.vercelRelayUrl),
-    proxyPoolId: alternate?.proxyPoolId || null,
-    strictProxy: alternate?.strictProxy === true,
-    connectionProxyAlternates: proxyOptions?.connectionProxyAlternates || [],
-  };
-}
-
-export function selectAlternateProxy(proxyOptions, targetUrl, excludeIds = new Set(), now = Date.now()) {
-  const alternates = Array.isArray(proxyOptions?.connectionProxyAlternates)
-    ? proxyOptions.connectionProxyAlternates
-    : [];
-
-  let earliestCooldownMs = null;
-  for (const alternate of alternates) {
-    const merged = alternateToProxyOptions(proxyOptions, alternate);
-    const egress = identifyFixedEgress(targetUrl, merged);
-    if (!egress || excludeIds.has(egress.id)) continue;
-
-    const cooldown = getEgressCooldown(egress, now);
-    if (cooldown) {
-      earliestCooldownMs = earliestCooldownMs == null
-        ? cooldown.retryAfterMs
-        : Math.min(earliestCooldownMs, cooldown.retryAfterMs);
-      continue;
-    }
-
-    return { alternate: { proxyOptions: merged, egress }, earliestCooldownMs };
-  }
-
-  return { alternate: null, earliestCooldownMs };
-}
-
 function headerValue(headers, name) {
   if (!headers) return null;
   const target = name.toLowerCase();

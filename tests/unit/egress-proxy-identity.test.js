@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { canonicalProxyKey } from "../../open-sse/utils/proxyResolution.js";
-import { identifyFixedEgress, selectAlternateProxy } from "../../open-sse/utils/egress.js";
+import { identifyFixedEgress } from "../../open-sse/utils/egress.js";
 
 const TARGET = "https://opencode.ai/inference/v1/chat/completions";
 
@@ -42,25 +42,5 @@ describe("proxy egress identity", () => {
   it("keeps hosts and ports that really differ apart", () => {
     expect(canonicalProxyKey("http://127.0.0.1:7890")).not.toBe(canonicalProxyKey("http://127.0.0.1:7891"));
     expect(canonicalProxyKey("http://127.0.0.1:7890")).not.toBe(canonicalProxyKey("http://127.0.0.2:7890"));
-  });
-
-  it("does not report an alternate that is the same downstream respelled", () => {
-    const primary = pool("http://127.0.0.1:7890");
-    const respelled = { ...pool("http://127.0.0.1:7890/"), proxyPoolId: "respelled" };
-    const current = identifyFixedEgress(TARGET, primary);
-    const same = selectAlternateProxy(
-      { ...primary, connectionProxyAlternates: [respelled] },
-      TARGET,
-      new Set([current.id])
-    );
-    expect(same.alternate).toBeNull();
-
-    const real = { ...pool("http://127.0.0.1:7891"), proxyPoolId: "real" };
-    const other = selectAlternateProxy(
-      { ...primary, connectionProxyAlternates: [real] },
-      TARGET,
-      new Set([current.id])
-    );
-    expect(other.alternate?.egress.proxyUrl).toContain("7891");
   });
 });

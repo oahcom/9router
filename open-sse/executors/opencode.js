@@ -8,16 +8,12 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
-import { bumpTransportGeneration, fetchViaTransport, peekTransportFailure } from "../utils/opencodeTransport.js";
+import { bumpTransportGeneration, fetchViaTransport } from "../utils/opencodeTransport.js";
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { asipRotationEnabled, rotateEgress } from "../utils/asipRotate.js";
 import { classifyRotateReason } from "../utils/egressClassify.js";
-
-// 同一出口的「没有备选」每分钟最多落一行；被压掉的次数在下一行末尾追报。
-const NO_ALTERNATE_LOG_INTERVAL_MS = 60_000;
-const noAlternateLogState = new Map();
 
 function tagWarnWithRequest(log, reqId) {
   if (!log || typeof log.warn !== "function" || !reqId) return log;
@@ -72,31 +68,11 @@ function logDecline(log, reason, now = Date.now()) {
   else console.warn("[OpenCode] EGRESS " + line);
 }
 
-function logNoAlternateEgress(log, egress, configured, now = Date.now()) {
-  const key = egress?.id || "unknown";
-  const state = noAlternateLogState.get(key) || { at: 0, suppressed: 0 };
-  if (now - state.at < NO_ALTERNATE_LOG_INTERVAL_MS) {
-    state.suppressed += 1;
-    noAlternateLogState.set(key, state);
-    return;
-  }
-  const suffix = state.suppressed > 0 ? ` (+${state.suppressed} suppressed)` : "";
-  if (!noAlternateLogState.has(key) && noAlternateLogState.size >= 64) {
-    noAlternateLogState.delete(noAlternateLogState.keys().next().value);
-  }
-  noAlternateLogState.set(key, { at: now, suppressed: 0 });
-  log?.warn?.(
-    "EGRESS",
-    `${describeEgress(egress)} 429, no alternate egress (${configured} configured, all excluded as this url or cooling)${suffix}`
-  );
-}
 import {
   resolveEgress,
   markEgressCooling,
   getEgressCooldown,
   hasActiveDirectCooldown,
-  hasAlternateEgresses,
-  selectAlternateProxy,
   parseRetryAfterMs,
   syntheticRateLimitResponse,
   describeEgress,
@@ -186,8 +162,8 @@ function syntheticTransportError(message, failure = null) {
     "retry-after": "1",
     "x-transport-error-type": "synthetic",
   };
-  // 具体是哪一种传输失败随响应带走，而不是让下游去读模块级的 peekTransportFailure()：
-  // 那是全局的「最后一次失败」，并发下拿到的是别人的。
+  // 具体是哪一种传输失败随响应带走，而不是写进某个模块级变量：
+  // 那种「最后一次失败」在并发下是别人的。
   // 只放行纯 ASCII 短标签：Head 值里混进中文或换行会让 Response 构造直接抛，
   // 一次 503 就变成 502。
   if (failure && /^[a-z0-9:_.-]{1,64}$/i.test(failure)) headers["x-transport-failure"] = failure;
@@ -687,11 +663,11 @@ export class OpenCodeExecutor extends BaseExecutor {
 
   /**
    * 无首字节超时：出口还活着，只是 sidecar 池里那条连接死了。
-   * 单池部署（两个 proxy pool 同指 127.0.0.1:7890）选不出备选出口，唯一能做的是
-   * 换一条新连接再试一次 —— 不换线是刻意的，换线归 429/403 那条路径管。
+   * 单池部署下没有第二条出口可换，唯一能做的是换一条新连接再试一次 ——
+   * 不换线是刻意的，换线归 429/403 那条路径管。
    *
    * 谁调用都行，但只能从这里出：executeInner 有四五条 return 路径（早退、429 换线后
-   * 重试、failover、末尾重试），逐个补必漏。实测 10:33:18 换线成功 → 10:33:20 撞 429
+   * 重试、末尾重试），逐个补必漏。实测 10:33:18 换线成功 → 10:33:20 撞 429
    * → 重试 → 10:33:38 header timeout → 直接 503 回客户端，就是漏在 429 那条路上。
    *
    * 为什么必须 bump：retire() 有 30s 节流，窗口内 sidecar 不会重启；不换 generation
@@ -720,10 +696,10 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 定义在原处（约 130 行之后）会让前面那处拿不到。
     const requestStartedAt = Date.now();
     // Every warn this request emits carries its short id, so the EGRESS lines
-    // (rotate / cooling / no-alternate) and the final ERROR can be stitched
-    // together without guessing from timestamps. Call sites stay untouched.
+    // (rotate / cooling) and the final ERROR can be stitched together without
+    // guessing from timestamps. Call sites stay untouched.
     const log = tagWarnWithRequest(args.log, args.reqId);
-    let proxyOptions = args.proxyOptions || null;
+    const proxyOptions = args.proxyOptions || null;
 
     let targetUrl;
     try {
@@ -753,82 +729,67 @@ export class OpenCodeExecutor extends BaseExecutor {
 
     const cooldown = getEgressCooldown(egress);
     if (cooldown && egress.confirmed) {
-      const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
-      if (selection.alternate) {
-        log?.debug?.(
-          "EGRESS",
-          `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s → ${describeEgress(selection.alternate.egress)}`
-        );
-        proxyOptions = selection.alternate.proxyOptions;
-        egress = selection.alternate.egress;
-      } else {
-        // 本地拒绝之前先换一次出口。9router 的两个 proxy pool 内容完全相同
-        // （都指向 127.0.0.1:7890），selectAlternateProxy 永远返回 null，这里
-        // 一旦拒绝就是「回带 retry-after 数十小时」的死锁 —— 后续请求全被本地
-        // 拦掉，根本走不到下面 429 重试分支。实测这就是服务不可用的直接原因。
-        const rotated = await rotateEgress("rate429", { signal: args?.signal, requestStartedAt });
-        // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
-        //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
-        //   gap = rate429_guard_sec / 线数）。手里这条连接挂在刚被换下的旧线上，
-        //   必须重建后再试一次。
-        //   no_warm_standby —— 这次一条线都没换，连接还在原来的隧道上。清冷却等于
-        //   抹掉「这个出口刚被拦」的记录，重试必然再 429，只是多烧一次上游。
-        //   放它落下去走下面返回 429 + 封顶 retry-after。
-        // 白名单而不是黑名单：reason 是 asip 那边的开放词表（还有 timeout /
-        // unauthorized / internal_error / unknown…），黑名单每漏一个就等于
-        // 「没换线也当换过了」。
-        const ROTATED_REASONS = ["ok", "coalesced", "too_frequent"];
-        const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
-        if (rotateHappened) {
-          clearProxyDispatchers();
-          // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
-          // 换一个 generation 让它重建 session，否则重试还走旧隧道。
-          bumpTransportGeneration();
-          resetEgressState();
-          log?.warn?.(
-            "EGRESS",
-            "asip rotated (" + rotated.reason + ") before local 429 -> retry on fresh egress"
-          );
-          const retryPrepared = this.prepareRequestCredentials({ ...args, egressId: "asip-rotated" });
-          const retried = await super.execute({
-            ...args,
-            log,
-            credentials: retryPrepared,
-            proxyOptions,
-          });
-          if (retried?.response && retried.response.status !== 429) return retried;
-        } else if (rotated.reason === "timeout") {
-          // 超时 = asip 已经在换、只是没等到回话：这次不重试（结果不确定），
-          // 但那条隧道确实在换，必须让 sidecar 重建 —— 否则下一条请求继续骑着它，
-          // 和主路径那处 timeout 的处理保持一致。
-          clearProxyDispatchers();
-          bumpTransportGeneration();
-        } else if (rotated.lineChanged) {
-          // asip 自己换的线：主循环读库、探测判死、定时轮换这三条路都不经过本进程，
-          // 我们手里池化的连接还挂在换下来那条隧道上。不重建就会一直骑到它被重启，
-          // 期间每条请求都拿旧出口的 429。
-          clearProxyDispatchers();
-          bumpTransportGeneration();
-        }
-        // upstream 的 retry-after 可能是数万秒（实测见过 34842s = 9.7 小时）。
-        // 原样透传等于一次 429 就把服务锁死大半天，这才是服务不可用的直接原因。
-        // 封顶 60s：宁可让调用方多试几次，也不要静默挂死。
-        const retryAfterMs = Math.min(
-          cooldown.retryAfterMs,
-          selection.earliestCooldownMs ?? Infinity,
-          MAX_LOCAL_COOLDOWN_MS
-        );
+      // 本地拒绝之前先换一次出口。这里一旦拒绝就是「回带 retry-after 数十小时」
+      // 的死锁 —— 后续请求全被本地拦掉，根本走不到下面 429 重试分支。
+      // 实测这就是服务不可用的直接原因。
+      const rotated = await rotateEgress("rate429", { signal: args?.signal, requestStartedAt });
+      // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
+      //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
+      //   gap = rate429_guard_sec / 线数）。手里这条连接挂在刚被换下的旧线上，
+      //   必须重建后再试一次。
+      //   no_warm_standby —— 这次一条线都没换，连接还在原来的隧道上。清冷却等于
+      //   抹掉「这个出口刚被拦」的记录，重试必然再 429，只是多烧一次上游。
+      //   放它落下去走下面返回 429 + 封顶 retry-after。
+      // 白名单而不是黑名单：reason 是 asip 那边的开放词表（还有 timeout /
+      // unauthorized / internal_error / unknown…），黑名单每漏一个就等于
+      // 「没换线也当换过了」。
+      const ROTATED_REASONS = ["ok", "coalesced", "too_frequent"];
+      const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
+      if (rotateHappened) {
+        clearProxyDispatchers();
+        // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
+        // 换一个 generation 让它重建 session，否则重试还走旧隧道。
+        bumpTransportGeneration();
+        resetEgressState();
         log?.warn?.(
           "EGRESS",
-          `${describeEgress(egress)} cooling ${Math.ceil(retryAfterMs / 1000)}s; no alternate — local 429`
+          "asip rotated (" + rotated.reason + ") before local 429 -> retry on fresh egress"
         );
-        return {
-          response: syntheticRateLimitResponse(retryAfterMs),
-          url: targetUrl,
-          headers: {},
-          transformedBody: args.body,
-        };
+        const retryPrepared = this.prepareRequestCredentials({ ...args, egressId: "asip-rotated" });
+        const retried = await super.execute({
+          ...args,
+          log,
+          credentials: retryPrepared,
+          proxyOptions,
+        });
+        if (retried?.response && retried.response.status !== 429) return retried;
+      } else if (rotated.reason === "timeout") {
+        // 超时 = asip 已经在换、只是没等到回话：这次不重试（结果不确定），
+        // 但那条隧道确实在换，必须让 sidecar 重建 —— 否则下一条请求继续骑着它，
+        // 和主路径那处 timeout 的处理保持一致。
+        clearProxyDispatchers();
+        bumpTransportGeneration();
+      } else if (rotated.lineChanged) {
+        // asip 自己换的线：主循环读库、探测判死、定时轮换这三条路都不经过本进程，
+        // 我们手里池化的连接还挂在换下来那条隧道上。不重建就会一直骑到它被重启，
+        // 期间每条请求都拿旧出口的 429。
+        clearProxyDispatchers();
+        bumpTransportGeneration();
       }
+      // upstream 的 retry-after 可能是数万秒（实测见过 34842s = 9.7 小时）。
+      // 原样透传等于一次 429 就把服务锁死大半天，这才是服务不可用的直接原因。
+      // 封顶 60s：宁可让调用方多试几次，也不要静默挂死。
+      const retryAfterMs = Math.min(cooldown.retryAfterMs, MAX_LOCAL_COOLDOWN_MS);
+      log?.warn?.(
+        "EGRESS",
+        `${describeEgress(egress)} cooling ${Math.ceil(retryAfterMs / 1000)}s; local 429`
+      );
+      return {
+        response: syntheticRateLimitResponse(retryAfterMs),
+        url: targetUrl,
+        headers: {},
+        transformedBody: args.body,
+      };
     }
 
     const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
@@ -838,51 +799,11 @@ export class OpenCodeExecutor extends BaseExecutor {
       args.usedCredentials.value = prepared;
       args.usedCredentials.log = log;
     }
-    // 克隆的触发条件是「这次请求有可能需要重放 body」，不是「有没有备选代理池」：
-    // asip 换线跟备选池是两条独立的路，单池部署一样要靠它绕 429。transformRequest
-    // 会就地改 body（打指纹、改工具名），不先克隆就重放等于二次改指纹 → 403。
-    const mayReplay = hasAlternateEgresses(proxyOptions) || asipRotationEnabled();
-    const retryBody = mayReplay ? cloneRequestBody(args.body) : null;
+    // 克隆的触发条件是「这次请求有可能需要重放 body」：asip 换线后要重放一次请求。
+    // transformRequest 会就地改 body（打指纹、改工具名），不先克隆就重放等于二次改指纹 → 403。
+    const retryBody = asipRotationEnabled() ? cloneRequestBody(args.body) : null;
 
     let result = await super.execute({ ...args, log, credentials: prepared, proxyOptions });
-    // 这条响应实际来自哪条出口：503 failover 会把 result 换成另一条出口的结果，
-    // 所以下面那句诊断日志要跟着 attempt 走，不能拿第一条出口的对象去猜。
-    let attemptEgress = egress;
-
-    // 传输层悬挂（出口隧道中途重连 → 无首字节 → 上层超时合成为 503）时，
-    // 换另一条出口透明重试一次。与 429 路径不同，这里**不标记任何冷却**：
-    // 503 不是出口限流/信誉证据，标记会误烧正常 IP（INC-008/INC-009）。
-    if (result?.response?.status === 503 && retryBody) {
-      const synthetic = result.response.headers.get("x-transport-error-type") === "synthetic";
-      const failureText = synthetic ? "UpstreamTransportError" : await readResponsePrefixText(result.response.clone());
-      if (/UpstreamTransportError/.test(failureText)) {
-        const failover = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
-        if (failover.alternate) {
-          const failoverCredentials = this.prepareRequestCredentials({
-            ...args,
-            body: retryBody,
-            egressId: failover.alternate.egress.id,
-          });
-          log?.warn?.(
-            "EGRESS",
-            `transport failure on ${describeEgress(egress)} → retry once on ${describeEgress(failover.alternate.egress)}`
-          );
-          result = await super.execute({
-            ...args,
-            log,
-            body: retryBody,
-            credentials: failoverCredentials,
-            proxyOptions: failover.alternate.proxyOptions,
-          });
-          attemptEgress = failover.alternate.egress;
-          // 从这里起「这次响应的出口」就是 alternate：冷却、会话轮换、候选排除集、
-          // 重试日志都得跟着它走，否则会把从没被限流的第一条出口误烧（INC-008/INC-009），
-          // 排除集还会把重试送回刚回 429 的那条。egress 本来就是 let，后面 probe 也会改它。
-          egress = attemptEgress;
-        }
-        // 选不出备选出口时由 execute 兜底重试（单池部署就是这种情况）。
-      }
-    }
     if (!result?.response) return result;
     const upstreamStatus = result.response.status;
     if (upstreamStatus !== 429 && upstreamStatus !== 403) return result;
@@ -896,19 +817,18 @@ export class OpenCodeExecutor extends BaseExecutor {
     );
     if (!rotateReason) return result;
 
-    // asip sync rotate: 9router 的两个 proxy pool 内容完全相同（都指向 127.0.0.1:7890），
-    // selectAlternateProxy 换不出任何东西，这里的 429 只能靠 asip 切 sing-box 选择器解决。
-    // 切完必须丢掉复用连接，否则重试走的还是旧隧道。
+    // asip sync rotate: 出口只是个指向 sing-box 的固定 proxy URL，换 IP 只能靠
+    // asip 切 sing-box 选择器。切完必须丢掉复用连接，否则重试走的还是旧隧道。
     // 直连出口（含 wreq 兜底）时，切 sing-box 选择器不一定改得了这条请求的去路：
     // 主机把流量交给 sing-box（TUN）时有效，纯粹本机直出时无效。两种情况都可能，
     // 所以这里不跳过重试，只补一句说明 —— 免得日志把「重试后还是 429」说成
     // 「换了出口就好了」，让人去追一个不存在的因果。
     // 路径用 egress.kind 判（direct/proxy/relay 三态，resolveEgress 已经算好），
     // 不拿 resolveEffectiveProxyUrl 的空值去猜：它不认识 vercel relay。
-    if (attemptEgress?.kind === "direct") {
+    if (egress.kind === "direct") {
       log?.warn?.(
         "EGRESS",
-        `${upstreamStatus} on ${describeEgress(attemptEgress)} (${rotateReason}); rotation only helps when the host routes through sing-box`
+        `${upstreamStatus} on ${describeEgress(egress)} (${rotateReason}); rotation only helps when the host routes through sing-box`
       );
     }
     if (retryBody || typeof args.body === "string") {
@@ -968,45 +888,23 @@ export class OpenCodeExecutor extends BaseExecutor {
       }
     }
 
-    const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
+    // 只有在直连出口上换会话重试才有意义：proxy 出口的 IP 由 asip 在固定 URL 底下换，
+    // 这里能做过的已经做过了，再打一次必然还是同一个结果。
     const retrySameEgress = rotated && egress.kind === "direct";
-
-    if (!selection.alternate && !retrySameEgress) {
+    if (!retrySameEgress) {
+      // 不重试才标冷却。反过来在同一个出口上重试、又把它标成冷却，两者互相矛盾。
       const cooling = markEgressCooling(egress, retryAfterMs);
       if (cooling) {
         log?.warn?.(
           "EGRESS",
           `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
         );
-      } else {
-        // Fixed proxy egresses are never cooled (the sing-box selector is swapped
-        // out-of-band by the rotation manager, so a URL-keyed cooldown can outlive
-        // the exit it was recorded against), so the branch above stays silent for
-        // them and the whole switch path logs nothing. That makes "no alternate
-        // exists" read exactly like "switched and failed". Name the condition, but
-        // throttle it: while WARP quota is exhausted every request is a 429 and the
-        // first version of this line produced 585 identical entries in 39 minutes.
-        const configured = Array.isArray(proxyOptions?.connectionProxyAlternates)
-          ? proxyOptions.connectionProxyAlternates.length
-          : 0;
-        // 60s 聚合行覆盖多个请求，贴单个 req= 会误导归属，所以给它未包装的 logger。
-        logNoAlternateEgress(args?.log, egress, configured);
       }
       return result;
     }
 
-    if (selection.alternate) {
-      const cooling = markEgressCooling(egress, retryAfterMs);
-      if (cooling) {
-        log?.warn?.(
-          "EGRESS",
-          `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
-        );
-      }
-    }
-
-    const retryEgress = retrySameEgress ? egress : (selection.alternate?.egress || egress);
-    const retryProxyOptions = retrySameEgress ? proxyOptions : (selection.alternate?.proxyOptions ?? proxyOptions);
+    const retryEgress = egress;
+    const retryProxyOptions = proxyOptions;
     const retryCredentials = this.prepareRequestCredentials({
       ...args,
       body: retryBody || args.body,
@@ -1114,9 +1012,10 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (!configuredProxy && TLS_FALLBACK_ENABLED) {
       return this.fetchViaTlsFallback(url, options, proxyOptions, log);
     }
-    // 具体原因由 transport 侧记录：60s 连接超时、上游无首字节、sidecar 启动失败
-    // 是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。
-    const transportFailure = peekTransportFailure() || "unknown";
+    // 具体原因由 transport 侧写在这次调用自己的 options 上：60s 连接超时、上游无首字节、
+    // sidecar 启动失败是三种完全不同的故障，之前都报同一句 "sidecar unavailable"。
+    // 不读模块级变量：那种单值在并发下是别人的失败。
+    const transportFailure = options.transportFailure || "unknown";
     warnTransport(log, `Bun transport unavailable for ${url} (${transportFailure}); refusing Node fallback`);
     return syntheticTransportError(
       `OpenCode free lane requires the Bun transport; sidecar unavailable (${transportFailure}).`,

@@ -1,14 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { fetchMock } = vi.hoisted(() => {
+const { fetchMock, rotateMock } = vi.hoisted(() => {
   process.env.EGRESS_PROBE_MODE = "off";
   process.env.OPENCODE_TRANSPORT = "off";
-  return { fetchMock: vi.fn() };
+  return { fetchMock: vi.fn(), rotateMock: vi.fn() };
 });
 
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: fetchMock,
+  clearProxyDispatchers: vi.fn(),
   default: fetchMock,
+}));
+
+vi.mock("../../open-sse/utils/asipRotate.js", () => ({
+  rotateEgress: rotateMock,
+  asipRotationEnabled: () => true,
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";
@@ -77,16 +83,23 @@ function run(executor, { body, proxyOptions, providerSessionId, credentials = { 
 
 beforeEach(() => {
   fetchMock.mockReset();
+  rotateMock.mockReset();
   resetEgressState();
 });
 
+// 备选出口机制已整个删除（单池布局下恒为空集）。429 之后唯一还能换来新出口的
+// 动作是 asip 换线，所以这一组用例断言的都是「asip 换了 / 没换」两条路。
+function asipRotated() {
+  rotateMock.mockImplementation(async () => ({ switched: true, switchedAt: Date.now(), reason: "ok" }));
+}
+
 describe("OpenCode free-lane egress switching", () => {
-  it("on 429: switches proxy + session and retries exactly once with the original body", async () => {
+  it("on 429: asks asip, then retries exactly once with the original body", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
     const body = makeBody("retry-body");
+    asipRotated();
 
     fetchMock
       .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", headers: { "retry-after": "120" } }))
@@ -96,32 +109,35 @@ describe("OpenCode free-lane egress switching", () => {
 
     expect(result.response.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(rotateMock).toHaveBeenCalledTimes(1);
 
     const first = fetchMock.mock.calls[0];
     const second = fetchMock.mock.calls[1];
+    // 出口没有第二个可选，两次都必须落在同一条 proxy 上 —— 变的只有隧道。
     expect(first[2].connectionProxyUrl).toBe("http://proxy-a.example:8080");
-    expect(second[2].connectionProxyUrl).toBe("http://proxy-b.example:8080");
+    expect(second[2].connectionProxyUrl).toBe("http://proxy-a.example:8080");
 
     const firstSession = first[1].headers["x-opencode-session"];
     const secondSession = second[1].headers["x-opencode-session"];
     expect(firstSession).toMatch(OPENCODE_SESSION_RE);
     expect(secondSession).toMatch(OPENCODE_SESSION_RE);
-    expect(secondSession).not.toBe(firstSession);
+    // 换的是隧道不是出口：出口 id 没变，会话也就没必要换。会话按 (对话, 出口) 铸造，
+    // 出口没变化时换会话只会让上游看到一个凭空出现的新身份。
+    expect(secondSession).toBe(firstSession);
 
     expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
 
     // Fixed proxy egresses are not cooled here: sing-box owns the exit IP and
     // rotates it underneath the same proxy URL.
     expect(getEgressCooldown(identifyFixedEgress(TARGET, primary))).toBeNull();
-    expect(getEgressCooldown(identifyFixedEgress(TARGET, alternate))).toBeNull();
   });
 
-  it("on a FreeUsageLimitError: switches proxy without rotating the session", async () => {
+  it("on a FreeUsageLimitError: still asks asip, and the session follows the egress", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
     const body = makeBody("ip-scoped");
+    asipRotated();
 
     fetchMock
       .mockResolvedValueOnce(rateLimitedResponse())
@@ -133,18 +149,16 @@ describe("OpenCode free-lane egress switching", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const first = fetchMock.mock.calls[0];
     const second = fetchMock.mock.calls[1];
-    // The IP is quota-limited; switch the proxy. The session is scoped to the
-    // egress, so it changes with the proxy, but no epoch rotation is forced.
+    // The IP is quota-limited; asip swaps it underneath the same proxy URL.
     expect(first[2].connectionProxyUrl).toBe("http://proxy-a.example:8080");
-    expect(second[2].connectionProxyUrl).toBe("http://proxy-b.example:8080");
+    expect(second[2].connectionProxyUrl).toBe("http://proxy-a.example:8080");
     expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
   });
 
 
-  it("on a direct-egress FreeUsageLimitError: keeps the body, moves to the pool in one retry", async () => {
+  it("on a direct-egress FreeUsageLimitError: keeps the body and retries on the same egress", async () => {
     const executor = getExecutor("opencode");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    // Direct primary with a pool on standby: no connectionProxyUrl, alternates set.
+    // Direct primary: no connectionProxyUrl.
     const proxyOptions = {
       proxyPoolId: null,
       connectionProxyEnabled: false,
@@ -152,9 +166,9 @@ describe("OpenCode free-lane egress switching", () => {
       connectionNoProxy: "",
       vercelRelayUrl: "",
       strictProxy: false,
-      connectionProxyAlternates: [alternate],
     };
     const body = makeBody("direct-quota");
+    asipRotated();
 
     fetchMock
       .mockResolvedValueOnce(rateLimitedResponse())
@@ -166,9 +180,8 @@ describe("OpenCode free-lane egress switching", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const first = fetchMock.mock.calls[0];
     const second = fetchMock.mock.calls[1];
-    // Attempt 1 left from the host directly, attempt 2 from the standby pool.
     expect(first[2].connectionProxyUrl || "").toBe("");
-    expect(second[2].connectionProxyUrl).toBe("http://proxy-b.example:8080");
+    expect(second[2].connectionProxyUrl || "").toBe("");
     expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
     // The retry carries a well-formed session; it differs from attempt 1 only
     // because sessions are scoped to the egress (sessionScopeKey = identity +
@@ -180,10 +193,10 @@ describe("OpenCode free-lane egress switching", () => {
   it("tags every EGRESS warn with the request id it was given", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
     const warn = vi.fn();
     const log = { warn, debug: vi.fn(), info: vi.fn() };
+    asipRotated();
 
     fetchMock.mockResolvedValueOnce(rateLimitedResponse()).mockResolvedValueOnce(okResponse());
 
@@ -211,13 +224,13 @@ describe("OpenCode free-lane egress switching", () => {
     // #<Object> which has only a getter，每个请求直接 502。普通对象 {warn} 测不出来。
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
     const warn = vi.fn();
     const namespaceLog = Object.create(null);
     Object.defineProperty(namespaceLog, "warn", { get: () => warn, enumerable: true });
     Object.defineProperty(namespaceLog, "debug", { value: vi.fn(), enumerable: true });
     Object.defineProperty(namespaceLog, "info", { value: vi.fn(), enumerable: true });
+    asipRotated();
 
     fetchMock.mockResolvedValueOnce(rateLimitedResponse()).mockResolvedValueOnce(okResponse());
 
@@ -240,10 +253,10 @@ describe("OpenCode free-lane egress switching", () => {
   it("leaves warn lines untagged when no request id is supplied", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
     const warn = vi.fn();
     const log = { warn, debug: vi.fn(), info: vi.fn() };
+    asipRotated();
 
     fetchMock.mockResolvedValueOnce(rateLimitedResponse()).mockResolvedValueOnce(okResponse());
 
@@ -263,11 +276,11 @@ describe("OpenCode free-lane egress switching", () => {
     expect(messages.length).toBeGreaterThan(0);
     expect(messages.every((message) => !message.includes("req="))).toBe(true);
   });
-  it("retries only once when the alternate is also rate-limited", async () => {
+  it("retries only once when asip rotation does not fix the 429", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
+    asipRotated();
 
     fetchMock
       .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", headers: { "retry-after": "60" } }))
@@ -278,14 +291,12 @@ describe("OpenCode free-lane egress switching", () => {
     expect(result.response.status).toBe(429);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(getEgressCooldown(identifyFixedEgress(TARGET, primary))).toBeNull();
-    expect(getEgressCooldown(identifyFixedEgress(TARGET, alternate))).toBeNull();
   });
 
   it("keeps a fixed proxy when asked to cool it (the rotation manager owns the exit IP)", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const alternate = pool("b", "http://proxy-b.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [alternate] };
+    const proxyOptions = { ...primary };
 
     markEgressCooling(identifyFixedEgress(TARGET, primary), 120_000);
     fetchMock.mockResolvedValueOnce(okResponse());
@@ -300,9 +311,12 @@ describe("OpenCode free-lane egress switching", () => {
   it("returns the 429 without cooling a fixed proxy when Retry-After is only in the body", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [] };
+    const proxyOptions = { ...primary };
+    asipRotated();
 
-    fetchMock.mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", body: { retry_after: 90 } }));
+    fetchMock
+      .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", body: { retry_after: 90 } }))
+      .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", body: { retry_after: 90 } }));
 
     const result = await run(executor, { body: makeBody(), proxyOptions, providerSessionId: "conv-body-retry" });
 
@@ -314,7 +328,7 @@ describe("OpenCode free-lane egress switching", () => {
     const executor = getExecutor("opencode");
     const native = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
     const primary = pool("a", "http://proxy-a.example:8080");
-    const proxyOptions = { ...primary, connectionProxyAlternates: [] };
+    const proxyOptions = { ...primary };
 
     fetchMock.mockResolvedValueOnce(okResponse());
 

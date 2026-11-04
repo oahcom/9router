@@ -86,6 +86,10 @@ export const OPENCODE_TRANSPORT_CONFIG = {
   // 中止（实测 60s），期间没有首字节。超时即判定该出口不可用，交给上层换线。
   // 非流式不设限：长生成在响应头返回前就可能超过该值，会误杀。
   headerTimeoutMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS", 20 * 1000),
+  // 被节流的重置：一次上游超时后就 30s 不许重启 sidecar，这期间撞死 socket 的
+  // 请求全部直接 503（6h 实测 11 次重启 vs 20 次节流）。5s 只够挡住同一批并发
+  // 请求一起 retire 造成的 spawn 风暴，又不会把后面独立的失败一起挡在门外。
+  retryCooldownMs: envMs("OPENCODE_TRANSPORT_RETRY_COOLDOWN_MS", 5 * 1000),
   // 上游 ce060c79 的 wreq-js 兜底（sidecar 不在、又没配代理时才用得上）。
   // 默认 off：那条路从本机 IP 直出，wreq-js 缺失时还会在请求里 npm install。
   tlsFallback: envChoice("OPENCODE_TLS_FALLBACK", ["off", "on"], "off") === "on",

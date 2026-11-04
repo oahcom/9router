@@ -9,6 +9,11 @@ export default defineConfig({
     environment: "node",
     globals: true,
     include: ["**/*.test.js"],
+    // setup.js 必须有：它置 ASIP_DISABLED=1。少了它，任何走到 429 分支的用例
+    // 都会真的调生产 asip 的 /rotate —— 那是同步切 sing-box 选择器。
+    // 实测代价：一次 `npx vitest run unit/opencode-session.test.js` 让 asip 的
+    // switched 从 1 涨到 13，即测试运行本身换了 12 次线上出口。
+    setupFiles: ["./setup.js"],
     // Don't scan into git worktrees nested under .claude/ — they carry their
     // own copies of the test files but lack an installed node_modules (open-sse,
     // etc.), which makes provider imports fail during collection.

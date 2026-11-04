@@ -31,9 +31,10 @@ function responseHeaders(input) {
   return headers;
 }
 
-// 响应头超时由父进程按请求类型下发（payload.timeoutMs）：流式给 19s（小于
-// 9router 的 20s，留 1s 让 sidecar 先回错误），非流式给 0 = 不设限，因为长
-// 生成可能在响应头返回前就超过 19s。
+// 响应头超时由父进程按请求类型下发（payload.timeoutMs）：流式给 20s，非流式给 0 =
+// 不设限，因为长生成可能在响应头返回前就超过 20s。
+// 父进程自己也在同一个 20s 上掐一次，哪个先响取决于事件循环，所以两种超时在
+// 上游看起来是同一件事，只在失败标签上分家。
 // Bun 的全局 fetch 池会在隧道静默失效后继续复用半开连接，直到内置 ~5min 上限
 // （oven-sh/bun#31894）；`keepalive:false` 与裸 Connection: close 都拦不住
 // （#14538、#46027）。FetchSession 的 idleTimeout 是唯一有文档的淘汰口：

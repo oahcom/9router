@@ -56,6 +56,11 @@ function callAsip(path, payload, signal = null) {
           path,
           method: payload ? "POST" : "GET",
           timeout: TIMEOUT_MS,
+          // 不复用连接。Node 的全局 agent 默认 keepAlive，第一次 /rotate 的连接会
+          // 进池；asip 重启或服务端关掉它之后，下一次请求拿到的是一条已死的 socket
+          // → 直接报 socket，等于这次换线白问。换线本来就是低频动作（实测 468 次/
+          // 进程生命周期），每次新开一条 UDS 的代价可以忽略。
+          agent: false,
           headers: {
             "X-Asip-Token": token,
             "Content-Type": "application/json",
@@ -122,18 +127,52 @@ function callAsip(path, payload, signal = null) {
  * 之前确实有人换过线，本次请求照样值得重试。所以判断一律用 switchedAt 与请求
  * 发起时刻比较：只要换线发生在请求发出之后，旧连接上的 429 就和新隧道无关。
  */
-export async function rotateEgress(reason = "rate429", { signal = null } = {}) {
+export async function rotateEgress(reason = "rate429", { signal = null, requestStartedAt = 0 } = {}) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted" };
-  const res = await callAsip("/rotate", { reason }, signal);
+  // requestStartedAt 让 asip 把坏账记到**发出这条请求时**的那条线。
+  // 429 迟到几十秒，期间出口可能已经换过，此刻的活动线没承载过它。
+  const res = await callAsip("/rotate", {
+    reason,
+    ...(requestStartedAt > 0 ? { request_started_at: requestStartedAt / 1000 } : {}),
+  }, signal);
   // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
   // 调用方要据此提前重建连接（审查发现）。
-  if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error };
-  if (!res) return { switched: false, switchedAt: 0, reason: "unavailable" };
+  if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error, lineChanged: false };
+  if (!res) return { switched: false, switchedAt: 0, reason: "unavailable", lineChanged: false };
   return {
     switched: Boolean(res.switched),
     switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
     reason: res.reason || (res.switched ? "ok" : "unknown"),
+    lineChanged: noteActiveLine(res.active_tag, res.active_egress),
   };
+}
+
+// 上一次见到的出口身份。换线是异步的：asip 换完之后，本进程还在旧连接上发请求，
+// 那些请求的结果被 asip 当成「新出口不好」的证据，于是好线被切走。
+//
+// 身份是「线名 + 出口地址」两项，不是一个。只比线名会漏掉原地重连 ——
+// asip 重启当前隧道换会话地址时 selector 不动、线名不变，但连接全断过、
+// 地址也换了。那种换法必须也算「变了」。
+//
+// 只在 /rotate 时比对，不在每个请求前比对：/rotate 是唯一与换线相关的时机，
+// 而正常的 429/503 路径在拿到回复后本来就会重建连接。多问一次的成本是发给
+// 本机 socket 的一个小 JSON，收益是能看见「没有人通知过我们」的那类换线。
+let lastSeenLine = null;
+
+/** 记下这次看到的出口身份；返回「和上次不同」。 */
+export function noteActiveLine(tag, egress) {
+  // 两个都是空值也照样算一次观测：落池到 proxy 时 asip 就是回两个 null，
+  // 而「从某条线变成不是任何线」正是必须重置连接的那一次。只有「从没观测过」
+  // 才不构成变化 —— 进程刚起，没有可比的基准。
+  const seen = String(tag || "") + "|" + String(egress || "");
+  const changed = lastSeenLine !== null && lastSeenLine !== seen;
+  lastSeenLine = seen;
+  return changed;
+}
+
+/** 忘掉见过的身份（测试隔离用；进程里不需要）。 */
+export function forgetActiveLine() {
+  lastSeenLine = null;
 }
 

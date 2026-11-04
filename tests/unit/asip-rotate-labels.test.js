@@ -14,7 +14,7 @@ const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "asip-labels-"));
 const SOCK = path.join(DIR, "rotate.sock");
 const TOKEN_FILE = path.join(DIR, "api-token");
 
-const { rotateEgress } = await (async () => {
+const { rotateEgress, forgetActiveLine } = await (async () => {
   process.env.ASIP_SOCKET = SOCK;
   process.env.ASIP_TOKEN_FILE = TOKEN_FILE;
   process.env.ASIP_TIMEOUT_MS = "300";
@@ -40,6 +40,8 @@ function listen(handler) {
 
 beforeEach(() => {
   fs.writeFileSync(TOKEN_FILE, "test-token", { mode: 0o600 });
+  // 出口身份是模块级状态，不重置就会让上一条用例的结论决定下一条。
+  forgetActiveLine();
 });
 
 afterEach(() => {
@@ -142,5 +144,64 @@ describe("asip rotate error labels", () => {
     setTimeout(() => controller.abort(), 50);
     const result = await rotateEgress("rate429", { signal: controller.signal });
     expect(result.reason).toBe("aborted");
+  });
+});
+
+describe("active line identity", () => {
+  // asip 报回来的身份是「线名 + 出口地址」两项。只比线名会漏掉原地重连：
+  // 那种换法 selector 不动、线名不变，但隧道被重启过、地址也换了。
+  // 一个 server 按顺序回答，不在用例中间重开监听：listen() 会 unlink 再 bind，
+  // 而上一个 server 的 close 是异步的，同一用例里重开就会撞 EADDRINUSE ——
+  // 请求拿不到回话，lineChanged 恒 false，用例反而「通过」得莫名其妙。
+  async function serveSequence(payloads) {
+    let i = 0;
+    return listen((socket) => {
+      socket.on("data", () => {
+        const body = JSON.stringify(payloads[Math.min(i++, payloads.length - 1)]);
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+            Buffer.byteLength(body) + "\r\n\r\n" + body
+        );
+      });
+    });
+  }
+
+  it("first sighting never counts as a change", async () => {
+    await serveSequence([{ ok: false, reason: "too_frequent", active_tag: "WG-7", active_egress: "1.1.1.1" }]);
+    const result = await rotateEgress("rate429");
+    expect(result.lineChanged).toBe(false);
+  });
+
+  it("detects a different egress address on the same line", async () => {
+    // 原地重连：线名一样，地址变了 —— 连接全断过，必须算变了。
+    await serveSequence([
+      { ok: false, reason: "too_frequent", active_tag: "WG-7", active_egress: "1.1.1.1" },
+      { ok: false, reason: "too_frequent", active_tag: "WG-7", active_egress: "2.2.2.2" },
+    ]);
+    await rotateEgress("rate429");
+    const result = await rotateEgress("rate429");
+    expect(result.lineChanged).toBe(true);
+  });
+
+  it("stays quiet when neither line nor address moved", async () => {
+    await serveSequence([
+      { ok: false, reason: "too_frequent", active_tag: "WG-7", active_egress: "1.1.1.1" },
+      { ok: false, reason: "too_frequent", active_tag: "WG-7", active_egress: "1.1.1.1" },
+    ]);
+    await rotateEgress("rate429");
+    const result = await rotateEgress("rate429");
+    expect(result.lineChanged).toBe(false);
+  });
+
+  it("detects falling back to the proxy pool as a change", async () => {
+    // 落池后 asip 两个字段都是 null。此时连接还挂在被换下那条隧道上，
+    // 必须算变了，否则调用方什么都不做、继续骑在它上面。
+    await serveSequence([
+      { ok: false, reason: "too_frequent", active_tag: "WG-7", active_egress: "1.1.1.1" },
+      { ok: false, reason: "too_frequent", active_tag: null, active_egress: null },
+    ]);
+    await rotateEgress("rate429");
+    const result = await rotateEgress("rate429");
+    expect(result.lineChanged).toBe(true);
   });
 });

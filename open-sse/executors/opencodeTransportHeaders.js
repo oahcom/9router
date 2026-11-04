@@ -9,11 +9,8 @@
  * debugging impossible.
  *
  * `x-opencode-project` is derived *deterministically* from the downstream
- * identity rather than randomised per request: session-scoped quota is
- * accounted upstream, and minting fresh identities on every call burns through
- * it (see the note above `stableOpencodeSessions` in `opencode.js`). One
- * identity maps to one project, so a conversation keeps a stable attribution
- * while distinct downstreams stay isolated.
+ * identity rather than randomised per request, so a conversation keeps a
+ * stable attribution while distinct downstreams stay isolated.
  *
  * Trace headers are per-request by definition; they carry no quota meaning.
  */

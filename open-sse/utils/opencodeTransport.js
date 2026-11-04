@@ -17,13 +17,18 @@ let retryAt = 0;
 let startGen = 0;
 let lastResetAt = 0;
 
-// 上一次请求具体栽在哪一步。executor 的合成 503 文案直接读它：以前所有失败都
-// 报同一句 "sidecar unavailable"，把 60s 连接超时、上游无首字节、socks 出口、
-// sidecar 启动失败全说成一件事，只能靠时间戳反推。只记录、不改变控制流。
-let lastFailure = null;
-function noteFailure(reason) {
-  lastFailure = reason;
-  return null;
+// 同一批并发请求会同时撞上坏 socket，各自 retire 一次就是一场 spawn 风暴
+// （实测一次失败放大成 95 次 spawn）。冷却窗把这一批压成一次重启；窗宽取
+// retryCooldownMs，默认 5s —— 足够覆盖同一批，又不至于把几十秒后一条独立
+// 的失败一起挡在门外干等满超时才 503。
+//
+// 名字带 take 是因为它会占掉这个窗口：返回 true 的同时把 lastResetAt 推到 now，
+// 别让调用方以为这是个纯判断。
+function takeResetSlot() {
+  const now = Date.now();
+  if (now - lastResetAt < OPENCODE_TRANSPORT_CONFIG.retryCooldownMs) return false;
+  lastResetAt = now;
+  return true;
 }
 
 // sidecar 按 (proxy, generation) 分桶复用 socket：换线后 bump 一次，
@@ -32,10 +37,6 @@ let transportGeneration = 0;
 export function bumpTransportGeneration() {
   transportGeneration += 1;
   return transportGeneration;
-}
-
-export function peekTransportFailure() {
-  return lastFailure;
 }
 
 function available() {
@@ -245,6 +246,12 @@ function transportWarn(log, message) {
 }
 
 export async function fetchViaTransport(url, options = {}, proxyOptions = null, log = null) {
+  // 失败原因写进本次调用自己的 options，调用方读自己的那份。
+  // 不能用模块级变量：并发下读到的是别人的失败。
+  const noteFailure = (reason) => {
+    options.transportFailure = reason;
+    return null;
+  };
   // 闸在 available() 之前：能不能发请求是配置问题，许不许发给这个目标不是。
   // 只装在 proxyFetch 里等于没装 —— auto 模式下 executor 先问 sidecar。
   await assertEgressTargetAllowed(typeof url === "string" ? url : url.toString());
@@ -293,9 +300,8 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
         if (upstreamTimeout) {
           // 同一出口（同一 proxyUrl）重试必然再等满一次超时：attempt 1 只是把
           // 20s 变成 40s。这里只负责清掉可能僵死的池化 socket，请求本身直接
-          // 交回上层换出口；30s 冷却避免大批量超时时把 sidecar 反复杀穿。
-          if (Date.now() - lastResetAt >= 30000) {
-            lastResetAt = Date.now();
+          // 交回上层换出口；冷却避免同一批并发超时把 sidecar 反复杀穿。
+          if (takeResetSlot()) {
             transportWarn(log, "sidecar reported upstream timeout; restarting sidecar to drop stale socket");
             retire();
           } else {
@@ -304,9 +310,8 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
           return noteFailure("upstream-timeout");
         }
         // sidecar 报的是上游 fetch 失败（非超时）。非流式没有 cleanup 需求，
-        // 重试同一出口只会重复失败；只在 30s 冷却外重启一次以清池。
-        if (Date.now() - lastResetAt >= 30000) {
-          lastResetAt = Date.now();
+        // 重试同一出口只会重复失败；只在冷却外重启一次以清池。
+        if (takeResetSlot()) {
           retire();
         }
         return noteFailure("upstream-fetch-failed");
@@ -318,10 +323,9 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
       // 于是 a) executor 把「60s 没拿到响应头」说成 "sidecar unavailable"，
       // b) 池子没人清，下一个请求继续复用死 socket，要等 Bun 的 idleTimeout 才自愈
       // （实测一整段 2 分钟的同形态 503）。retire 掉，让下一条请求从干净进程开始。
-      // 冷却复用下面 transportTimeout 的 30s 节流，避免每个超时都 spawn 一次。
+      // 冷却复用下面 transportTimeout 的节流，避免每个超时都 spawn 一次。
       if (options.signal?.aborted || error.name === "AbortError") {
-        if (Date.now() - lastResetAt >= 30000) {
-          lastResetAt = Date.now();
+        if (takeResetSlot()) {
           transportWarn(log, "caller aborted before headers; retiring sidecar to drop stale socket");
           retire();
         }
@@ -332,9 +336,8 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
       if (error.transportTimeout) {
         // 超时的常见成因是 Bun 的池化 socket 已死（隧道静默断开、本地仍 ESTAB），
         // 同一 sidecar 会一直复用它 → 后续每条请求都白等满超时。重启 sidecar 才
-        // 能清池；30s 冷却避免大批量超时时把 sidecar 反复杀穿。
-        if (Date.now() - lastResetAt >= 30000) {
-          lastResetAt = Date.now();
+        // 能清池；冷却避免同一批并发超时把 sidecar 反复杀穿。
+        if (takeResetSlot()) {
           transportWarn(log, `${error.message}; restarting sidecar to drop stale socket`);
           retire();
         } else {

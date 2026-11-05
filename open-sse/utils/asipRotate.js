@@ -138,22 +138,34 @@ function callAsip(path, payload, signal = null) {
  */
 export async function rotateEgress(
   reason = "rate429",
-  { signal = null, requestStartedAt = 0, failedEgress = null } = {},
+  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null } = {},
 ) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted", lineChanged: false };
   // requestStartedAt 让 asip 把坏账记到**发出这条请求时**的那条线。
   // 429 迟到几十秒，期间出口可能已经换过，此刻的活动线没承载过它。
   // failedEgress 让 asip 判断这条 429 追的地址是不是已经被换走了。
+  // failedEgressSince 是那个地址的接入时刻：asip 用它判断客户端的缓存值在
+  // 请求发出时是否已经就位 —— 只有就位过的地址，「已换走」才是可下的结论。
   const res = await callAsip("/rotate", {
     reason,
     ...(requestStartedAt > 0 ? { request_started_at: requestStartedAt / 1000 } : {}),
     ...(failedEgress ? { egress_ip: failedEgress } : {}),
+    ...(failedEgressSince > 0 ? { egress_since: failedEgressSince } : {}),
   }, signal);
   // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
   // 调用方要据此提前重建连接（审查发现）。
   if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error, lineChanged: false };
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable", lineChanged: false };
+  // 接入时刻单独存：`noteActiveLine` 只在身份变化时才该改变 `lineChanged` 的
+  // 判定，而 since 每次都要跟新 —— 同一个地址可能被 asip 重新确认过多次。
+  if (typeof res.active_egress_since === "number" && res.active_egress_since > 0) {
+    lastEgressSince = res.active_egress_since;
+  } else if (res.active_egress) {
+    // asip 说这个地址还在，但给不出接入时刻（早于它的记录窗口）。留 null 而不是
+    // 沿用上一个地址的时刻：那个时刻属于另一个地址，拿来判断只会得到错误结论。
+    lastEgressSince = null;
+  }
   return {
     switched: Boolean(res.switched),
     switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
@@ -174,9 +186,20 @@ export async function rotateEgress(
 // 本机 socket 的一个小 JSON，收益是能看见「没有人通知过我们」的那类换线。
 let lastSeenLine = null;
 
+// 出口地址 + 它是什么时候接上的（asip 给的 active_egress_since，epoch 秒）。
+// 只缓存地址不够：`已经切走` 与 `切走之前发出的 429` 是两件相反的事，而单看
+// 地址分不出来。带上接入时刻，调用方才能回答「我这条请求发出时，这个地址是否
+// 已经就位」。
+let lastEgressSince = null;
+
 /** 本进程最近一次从 asip 那里看到的出口地址。 */
 export function currentAsipEgress() {
   return lastSeenLine ? lastSeenLine.split("|")[1] || null : null;
+}
+
+/** 那个地址是什么时候接上的（epoch 秒）；未知时为 null。 */
+export function currentAsipEgressSince() {
+  return lastEgressSince;
 }
 
 /** 记下这次看到的出口身份；返回「和上次不同」。 */
@@ -193,5 +216,6 @@ export function noteActiveLine(tag, egress) {
 /** 忘掉见过的身份（测试隔离用；进程里不需要）。 */
 export function forgetActiveLine() {
   lastSeenLine = null;
+  lastEgressSince = null;
 }
 

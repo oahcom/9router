@@ -29,6 +29,7 @@ vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   // 执行器每次请求都会读一次「当前出口地址」，429 时交给 asip 判断是否已被
   // 换走。白盒替换漏了它整个 executeInner 会抛 TypeError。
   currentAsipEgress: () => null,
+  currentAsipEgressSince: () => null,
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";

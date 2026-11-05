@@ -12,7 +12,12 @@ import { bumpTransportGeneration, fetchViaTransport } from "../utils/opencodeTra
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
-import { asipRotationEnabled, rotateEgress, currentAsipEgress } from "../utils/asipRotate.js";
+import {
+  asipRotationEnabled,
+  rotateEgress,
+  currentAsipEgress,
+  currentAsipEgressSince,
+} from "../utils/asipRotate.js";
 import { classifyRotateReason } from "../utils/egressClassify.js";
 
 function tagWarnWithRequest(log, reqId) {
@@ -700,6 +705,10 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 是就不用再烧一条新线，重连即可。proxy 模式下客户端探不到这个地址
     // （identifyFixedEgress 对 proxy/relay 一律 ip:null），只能由 asip 给。
     const requestEgress = currentAsipEgress();
+    // 那个地址是什么时候接上的。单有地址分不清「已经切走」和「切走之前发出的
+    // 429」—— 前者重连即可，后者必须真换线。带上接入时刻，asip 才能判断这个
+    // 缓存值在请求发出时是否已经就位。
+    const requestEgressSince = currentAsipEgressSince();
     // Every warn this request emits carries its short id, so the EGRESS lines
     // (rotate / cooling) and the final ERROR can be stitched together without
     // guessing from timestamps. Call sites stay untouched.
@@ -741,6 +750,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         signal: args?.signal,
         requestStartedAt,
         failedEgress: requestEgress,
+        failedEgressSince: requestEgressSince,
       });
       // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
       //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
@@ -847,6 +857,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         signal: args?.signal,
         requestStartedAt,
         failedEgress: requestEgress,
+        failedEgressSince: requestEgressSince,
       });
       // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。

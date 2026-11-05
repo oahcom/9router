@@ -12,7 +12,7 @@ import { bumpTransportGeneration, fetchViaTransport } from "../utils/opencodeTra
 import { opencodeTlsFetch } from "../services/opencodeTlsClient.js";
 import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
-import { asipRotationEnabled, rotateEgress } from "../utils/asipRotate.js";
+import { asipRotationEnabled, rotateEgress, currentAsipEgress } from "../utils/asipRotate.js";
 import { classifyRotateReason } from "../utils/egressClassify.js";
 
 function tagWarnWithRequest(log, reqId) {
@@ -695,6 +695,11 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 记到换线之后的新线上。定义在方法开头：下面两个 rotateEgress 调用点都要用，
     // 定义在原处（约 130 行之后）会让前面那处拿不到。
     const requestStartedAt = Date.now();
+    // 这条请求打通的那个出口地址（asip 上一次回给我们的）。429 时原样带回，
+    // 让 asip 对照自己的换线表判断「它是不是在本次请求之后被换走了」 ——
+    // 是就不用再烧一条新线，重连即可。proxy 模式下客户端探不到这个地址
+    // （identifyFixedEgress 对 proxy/relay 一律 ip:null），只能由 asip 给。
+    const requestEgress = currentAsipEgress();
     // Every warn this request emits carries its short id, so the EGRESS lines
     // (rotate / cooling) and the final ERROR can be stitched together without
     // guessing from timestamps. Call sites stay untouched.
@@ -732,7 +737,11 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 本地拒绝之前先换一次出口。这里一旦拒绝就是「回带 retry-after 数十小时」
       // 的死锁 —— 后续请求全被本地拦掉，根本走不到下面 429 重试分支。
       // 实测这就是服务不可用的直接原因。
-      const rotated = await rotateEgress("rate429", { signal: args?.signal, requestStartedAt });
+      const rotated = await rotateEgress("rate429", {
+        signal: args?.signal,
+        requestStartedAt,
+        failedEgress: requestEgress,
+      });
       // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
       //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
       //   gap = rate429_guard_sec / 线数）。手里这条连接挂在刚被换下的旧线上，
@@ -743,7 +752,9 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 白名单而不是黑名单：reason 是 asip 那边的开放词表（还有 timeout /
       // unauthorized / internal_error / unknown…），黑名单每漏一个就等于
       // 「没换线也当换过了」。
-      const ROTATED_REASONS = ["ok", "coalesced", "too_frequent"];
+      // already_retired 是同一件事的另一面：asip 没换线，但那条隧道**已经**在
+      // 这条请求之后被换掉了，手里这条连接还挂在它上面，重连一次就够。
+      const ROTATED_REASONS = ["ok", "coalesced", "too_frequent", "already_retired"];
       const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
       if (rotateHappened) {
         clearProxyDispatchers();
@@ -832,8 +843,14 @@ export class OpenCodeExecutor extends BaseExecutor {
       );
     }
     if (retryBody || typeof args.body === "string") {
-      const asip = await rotateEgress(rotateReason, { signal: args?.signal, requestStartedAt });
-      if (asip.switchedAt >= requestStartedAt) {
+      const asip = await rotateEgress(rotateReason, {
+        signal: args?.signal,
+        requestStartedAt,
+        failedEgress: requestEgress,
+      });
+      // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
+      // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。
+      if (asip.switchedAt >= requestStartedAt || asip.reason === "already_retired") {
         clearProxyDispatchers();
         // 主路径也必须 bump：sidecar 的 session key 是 proxy|generation，只清 undici
         // dispatcher 不影响 Bun 那边池化的 socket（原请求刚回 429，socket 还在池里）。

@@ -21,6 +21,8 @@ vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: () => true,
+  // 执行器每个请求读一次当前出口地址，429 时交给 asip 查换线表。
+  currentAsipEgress: () => null,
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";

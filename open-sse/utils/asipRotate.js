@@ -126,15 +126,29 @@ function callAsip(path, payload, signal = null) {
  * 并发时 asip 会把重复请求合并（reason=coalesced, switched=false），但那次合并
  * 之前确实有人换过线，本次请求照样值得重试。所以判断一律用 switchedAt 与请求
  * 发起时刻比较：只要换线发生在请求发出之后，旧连接上的 429 就和新隧道无关。
+ *
+ * `failedEgress` 是这条 429 打通的那个出口地址（请求发出时从
+ * currentAsipEgress() 取）。asip 拿它对照自己的换线表：若这个地址是在本条请求
+ * **发出之后**被换掉的，说明请求骑的是一条已下线的隧道，回 already_retired ——
+ * 重连即可，不必再烧一条新线。
+ *
+ * 地址必须由 asip 给，客户端探不了：proxy 模式下 identifyFixedEgress 对
+ * proxy/relay 一律返回 ip:null，只有 direct 才探测，而 direct 探到的是本机
+ * 直连地址，与经 sing-box 的代理链路没有关系。
  */
-export async function rotateEgress(reason = "rate429", { signal = null, requestStartedAt = 0 } = {}) {
+export async function rotateEgress(
+  reason = "rate429",
+  { signal = null, requestStartedAt = 0, failedEgress = null } = {},
+) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
-  if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted" };
+  if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted", lineChanged: false };
   // requestStartedAt 让 asip 把坏账记到**发出这条请求时**的那条线。
   // 429 迟到几十秒，期间出口可能已经换过，此刻的活动线没承载过它。
+  // failedEgress 让 asip 判断这条 429 追的地址是不是已经被换走了。
   const res = await callAsip("/rotate", {
     reason,
     ...(requestStartedAt > 0 ? { request_started_at: requestStartedAt / 1000 } : {}),
+    ...(failedEgress ? { egress_ip: failedEgress } : {}),
   }, signal);
   // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
   // 调用方要据此提前重建连接（审查发现）。
@@ -159,6 +173,11 @@ export async function rotateEgress(reason = "rate429", { signal = null, requestS
 // 而正常的 429/503 路径在拿到回复后本来就会重建连接。多问一次的成本是发给
 // 本机 socket 的一个小 JSON，收益是能看见「没有人通知过我们」的那类换线。
 let lastSeenLine = null;
+
+/** 本进程最近一次从 asip 那里看到的出口地址。 */
+export function currentAsipEgress() {
+  return lastSeenLine ? lastSeenLine.split("|")[1] || null : null;
+}
 
 /** 记下这次看到的出口身份；返回「和上次不同」。 */
 export function noteActiveLine(tag, egress) {

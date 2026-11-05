@@ -26,6 +26,9 @@ vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: enabledMock,
+  // 执行器每次请求都会读一次「当前出口地址」，429 时交给 asip 判断是否已被
+  // 换走。白盒替换漏了它整个 executeInner 会抛 TypeError。
+  currentAsipEgress: () => null,
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";
@@ -99,6 +102,38 @@ describe("asip rotation without an alternate pool", () => {
     // 只清 undici dispatcher 不够：Bun sidecar 的 session 是 proxy|generation 分桶的，
     // 换线后不 bump 就等于还骑在旧隧道上（审查发现）。
     expect(bumpMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries when asip says the 429 tracked a tunnel that was already replaced", async () => {
+    // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后被换掉了。
+    // switchedAt 是更早的时刻，只看它会当成「没换、不重试」—— 而这条 429 恰好
+    // 证明手里这条连接已经骑在一条下线的隧道上，重连一次就能绕开。
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({
+      switched: false,
+      switchedAt: Date.now() - 60_000,
+      reason: "already_retired",
+      lineChanged: false,
+    });
+
+    const result = await run("retired");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(200);
+    expect(bumpMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("hands asip the egress this request went out on", async () => {
+    // 没有这个地址，asip 只能靠时刻回溯猜；带上它是一次查表。
+    fetchMock.mockResolvedValueOnce(rateLimited());
+    rotateMock.mockResolvedValueOnce({ switched: false, switchedAt: 0, reason: "too_frequent" });
+
+    await run("passthrough");
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    const opts = rotateMock.mock.calls[0][1];
+    expect(opts).toHaveProperty("requestStartedAt");
+    expect(opts).toHaveProperty("failedEgress");
   });
 
   it("does not retry when asip declines the rotation", async () => {

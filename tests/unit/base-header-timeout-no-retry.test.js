@@ -8,6 +8,11 @@ import { BaseExecutor } from "../../open-sse/executors/base.js";
  * 所以改成"直接换 fallback URL，没有就抛"。
  *
  * 用 config.timeoutMs 把 60s 压到 120ms，让这条断言跑在毫秒级。
+ *
+ * 2026-11-09 补充：这条「不重试」现在只有一个例外 —— 请求确实经本机 sing-box
+ * （proxyOptions.url 指向 127.0.0.1:7890）时，base.js 会先让 asip 换一条出口，
+ * 再重放一次（严格一次）。判据与用例见 base-connect-timeout-rotate.test.js。
+ * 本文件不传 proxyOptions，走的就是「直连、没有第二条出口可换」那条老路。
  */
 class HangingExecutor extends BaseExecutor {
   constructor() {

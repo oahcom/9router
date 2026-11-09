@@ -4,6 +4,26 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
+import { asipRotationEnabled, rotateEgress } from "../utils/asipRotate.js";
+
+// 只有经本机 sing-box 出去的流量才受 asip 换线影响 —— 换的是 sing-box 里那条
+// WARP 线的 selector。局域网里另一台机器的 7890（192.168.100.104:7890）是别人
+// 的 sing-box，直连的 provider 更是碰都不碰 sing-box；对这些流量 /rotate 只是
+// 白烧一条本地出口，还会把好线换走。
+const ASIP_PROXY_PORT = process.env.ASIP_LOCAL_PROXY_PORT || "7890";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+// 连接超时换线的冷却。一条真的坏掉的端点（域名写错、对端长期不可达）会持续
+// 连接失败，每个请求都换一次线就是把出口池当消耗品烧。15s 内只换一次：真正
+// 的隧道故障也远慢于这个节奏，而 429/quota 那条路径另有 asip 自己的合并与
+// 最小间隔（coalesce 800ms / min_gap 1.5s）兜着。
+const CONNECT_TIMEOUT_ROTATE_COOLDOWN_MS = 15000;
+let lastConnectTimeoutRotateAt = 0;
+
+/** 测试隔离用：进程里不需要。 */
+export function resetConnectTimeoutRotateState() {
+  lastConnectTimeoutRotateAt = 0;
+}
 
 /**
  * BaseExecutor - Base class for provider executors
@@ -84,6 +104,52 @@ export class BaseExecutor {
     return status === HTTP_STATUS.RATE_LIMITED && urlIndex + 1 < this.getFallbackCount();
   }
 
+  /**
+   * 连接阶段超时是否值得换一次出口。
+   *
+   * 判据是「这条请求实际是不是经本机 sing-box 出去」：连响应头都建不起来说明
+   * 问题在出口链路而不是上游业务慢，这类超时换线后重试有意义；直连、或走局域网
+   * 里另一台机器的 7890 时，换本机 WARP 线改变不了任何东西，只会白烧一条好线。
+   */
+  shouldRotateOnConnectTimeout(proxyOptions) {
+    if (!asipRotationEnabled()) return false;
+    const rawUrl = proxyOptions?.url ?? proxyOptions?.connectionProxyUrl;
+    if (!rawUrl) return false;
+    try {
+      const parsed = new URL(String(rawUrl));
+      if (!LOOPBACK_HOSTS.has(parsed.hostname)) return false;
+      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+      return port === ASIP_PROXY_PORT;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 连接超时后换一次出口；换成功才允许重试。
+   *
+   * 返回 false 的三种情况都当作「没换」：asip 关着、代理不是本机 sing-box、
+   * 冷却窗口内已经换过。此时保持原来「直接抛」的行为，不再白等第二个 60s。
+   */
+  async rotateEgressForConnectTimeout({ url, proxyOptions, log, signal }) {
+    if (!this.shouldRotateOnConnectTimeout(proxyOptions)) return false;
+    const now = Date.now();
+    if (now - lastConnectTimeoutRotateAt < CONNECT_TIMEOUT_ROTATE_COOLDOWN_MS) {
+      log?.debug?.("EGRESS", `connect timeout on ${url}: rotation in cooldown, not rotating`);
+      return false;
+    }
+    lastConnectTimeoutRotateAt = now;
+    const res = await rotateEgress("transport", { signal });
+    // switched=false 可能只是并发合并（别人刚换过），switchedAt 才能证明「确实换过」。
+    const rotated = Boolean(res?.switched) || Number(res?.switchedAt || 0) > 0;
+    log?.warn?.(
+      "EGRESS",
+      `connect timeout on ${url} -> asip rotate ${rotated ? res.reason : res?.reason || "unavailable"}`
+        + (rotated ? ", retry once" : ", no retry"),
+    );
+    return rotated;
+  }
+
   // Override in subclass for provider-specific refresh
   async refreshCredentials(credentials, log, proxyOptions = null) {
     return null;
@@ -108,6 +174,9 @@ export class BaseExecutor {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
+    // 连接超时换线只能发生一次：置位后再超时就照直抛，不让「换线→重试→再换线」
+    // 滚成重试风暴（一次请求最多多等一个 60s 窗口）。
+    let connectTimeoutRotated = false;
     const retryAttemptsByUrl = {};
 
     // Merge default retry config with provider-specific config
@@ -184,6 +253,15 @@ export class BaseExecutor {
         if (isConnectTimeout) {
           if (urlIndex + 1 < fallbackCount) {
             log?.debug?.("RETRY", `header timeout on ${url}, trying fallback ${urlIndex + 1}`);
+            continue;
+          }
+          // 最后一个 URL 也建不起连接：出口链路大概率已经不通（WARP 线被烧、
+          // 隧道半死），换一条出口再试一次，比把 502 直接甩给客户端有用。
+          // 只换一次 —— 见 connectTimeoutRotated 的注释。
+          if (!connectTimeoutRotated
+              && await this.rotateEgressForConnectTimeout({ url, proxyOptions, log, signal })) {
+            connectTimeoutRotated = true;
+            urlIndex--;
             continue;
           }
           throw error;

@@ -236,6 +236,23 @@ function forward(transport, payload, signal, headerTimeoutMs = 0) {
   });
 }
 
+/**
+ * 等响应头的预算。非流式给 0（不设限）：长生成可能在响应头返回前就超过该值。
+ *
+ * 流式分两档：
+ *   - 首次 = headerTimeoutMs(20s)：这是「当前出口还行不行」的快速判据。
+ *   - 换线后的重放 = headerTimeoutReplayMs(45s)：出口可能压根没变（asip 判
+ *     「出口正常」就不换），再按 20s 判一次等于把同一次失败重演一遍。
+ *     实测 43s = 20+20 两次同出口超时后 503，而同一出口的首字节随体量增长
+ *     （1000KB≈7.1s、2000KB≈10s），重放多给一点预算就能把请求救回来。
+ */
+export function resolveHeaderTimeoutMs(streamBody, replayBudget) {
+  if (!streamBody) return 0;
+  const base = OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs;
+  if (!replayBudget) return base;
+  return Math.max(base, OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs);
+}
+
 // log 由执行器递进来（可为空）：传输层失败也要能按会话/tag/req= 归档，
 // 之前这里全是裸 console.warn，线上只能看到时间戳（审查发现）。
 function transportWarn(log, message) {
@@ -265,7 +282,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
   // 结果，而不是让它进 attempt 循环把 19s 超时重放两遍。
   if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return noteFailure(`unsupported-proxy:${proxyUrl.split(":")[0]}`);
   const streamBody = typeof options.body === "string" && /"stream"\s*:\s*true/.test(options.body);
-  const headerTimeoutMs = streamBody ? OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs : 0;
+  const headerTimeoutMs = resolveHeaderTimeoutMs(streamBody, options.replayBudget === true);
 
   // A sidecar whose upstream fetch failed may hold a stale pooled socket or a
   // proxy that just reset. Restarting Bun is cheap and clears both; retry the

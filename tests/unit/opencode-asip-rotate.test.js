@@ -245,6 +245,20 @@ describe("asip rotation without an alternate pool", () => {
     expect(result.response.status).toBe(503);
   });
 
+  it("gives the rotated replay a longer header budget", async () => {
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("stall-budget");
+
+    expect(result.response.status).toBe(200);
+    // 首次尝试必须保持快判：不加预算，20s 判死坏出口。
+    expect(fetchMock.mock.calls[0][1].replayBudget).toBeUndefined();
+    // 重放是「换线后的第二次机会」：asip 常回「出口正常不换线」，出口地址没变，
+    // 再用 20s 判死就是把同一次失败重演一遍（实测 43s = 20+20 后 503）。
+    expect(fetchMock.mock.calls[1][1].replayBudget).toBe(true);
+  });
+
   it("retries a stall on a fresh connection when asip is disabled", async () => {
     enabledMock.mockReturnValue(false);
     fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(ok());

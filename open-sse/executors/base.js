@@ -170,7 +170,9 @@ export class BaseExecutor {
     return proxyAwareFetch(url, options, proxyOptions);
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null }) {
+  // replayBudget 只在「传输层卡死后换线重放」那一次为 true：给首字节多留时间。
+  // 首次尝试必须保持快判（20s），否则一条死出口会白白拖满 45s。
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null, replayBudget = false }) {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
@@ -224,6 +226,7 @@ export class BaseExecutor {
           headers,
           body: bodyStr,
           signal: mergedSignal,
+          ...(replayBudget ? { replayBudget: true } : {}),
         }, proxyOptions, log);
         clearTimeout(connectTimer);
         const ct = response.headers?.get?.("content-type") || "";

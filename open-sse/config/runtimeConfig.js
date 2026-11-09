@@ -86,6 +86,14 @@ export const OPENCODE_TRANSPORT_CONFIG = {
   // 中止（实测 60s），期间没有首字节。超时即判定该出口不可用，交给上层换线。
   // 非流式不设限：长生成在响应头返回前就可能超过该值，会误杀。
   headerTimeoutMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS", 20 * 1000),
+  // 换线重放的等待上限。首次 20s 是「快速判死当前出口」的探针，重放再用同一个
+  // 20s 就是把同一次失败原样重演一遍：实测 43s = 20s + 20s，两次都撞同一个死
+  // 出口后回 503。而重放时 asip 往往回「出口正常，不换线」（它的探针是
+  // max_tokens:1 的小请求，小请求能过、大请求挂着），出口地址根本没变 ——
+  // 这时唯一能救回请求的就是「多等一会儿」。
+  // 实测同一出口首字节随请求体线性增长：1000KB≈7.1s、2000KB≈10s，真实请求
+  // p50 就有 452KB，叠上并发排队很容易越 20s。45s 仍在 base 的 60s 连接超时内。
+  headerTimeoutReplayMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_REPLAY_MS", 45 * 1000),
   // 被节流的重置：一次上游超时后就 30s 不许重启 sidecar，这期间撞死 socket 的
   // 请求全部直接 503（6h 实测 11 次重启 vs 20 次节流）。5s 只够挡住同一批并发
   // 请求一起 retire 造成的 spawn 风暴，又不会把后面独立的失败一起挡在门外。

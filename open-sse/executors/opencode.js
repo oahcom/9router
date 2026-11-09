@@ -699,10 +699,14 @@ export class OpenCodeExecutor extends BaseExecutor {
     args.log?.warn?.(
       "EGRESS",
       `transport stall (${failure}) -> retry once on fresh connection`
-      + (rotation ? ` after asip rotation (${rotation.reason})` : " (asip unavailable)"),
+      + (rotation ? ` after asip rotation (${rotation.reason})` : " (asip unavailable)")
+      + ` with ${Math.round(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs / 1000)}s header budget`,
     );
     // 直接走 BaseExecutor：再回 executeInner 会把 429/asip 逻辑重跑一遍。
-    return await super.execute(args);
+    // replayBudget：这一趟是「换线后的第二次机会」，asip 经常判「出口正常」不换
+    // 线（它的探针是小请求，小请求能过、大请求挂着），于是出口地址没变；再按
+    // 首次的 20s 判死就是把同一次失败重演一遍（实测 43s = 20+20 后 503）。
+    return await super.execute({ ...args, replayBudget: true });
   }
 
   async executeInner(args) {

@@ -22,6 +22,7 @@
  */
 import os from "node:os";
 import path from "node:path";
+import { randomInt } from "node:crypto";
 
 /** Names required by the upstream free-tier gate. */
 export const OPENCODE_FINGERPRINT_TOOLS = ["read", "shell"];
@@ -359,26 +360,32 @@ const ENV_TMP_DIR = path.join(os.tmpdir(), "opencode");
 // path. process.cwd() put the gateway host's real directory into every upsteam
 // prompt, and the model repeated it to end users ("I'm in
 // /home/administrator/9router"), leaking the host layout. Keep it neutral.
-// 与 asip probe_warp.py 的 ENV_WORKDIR_POOL / 取模算法逐字一致：探测必须与
-// 生产发同一个值，否则测的不是同一条腿（2026-11-10 的教训：探测用家目录路径
-// 被判 429，生产用默认路径正常，asip 把整池线都判死）。
-// 按 epoch 小时取模轮换，不做每请求随机：真实 CLI 会话内工作目录固定，逐请求
-// 变化本身就是异常特征，且两端独立随机后探测永远追不上生产的取值。
-const ENV_WORKDIR_POOL = [
+// 每次请求现生成一条随机路径（node:crypto randomInt，CSPRNG）。base 只提供
+// 「看起来像真实项目」的前缀，后缀 2~3 位随机字符 —— 目的是让路径永远不落进
+// 上游的静态黑名单（2026-11-10 的 INC-018 就是 /home/administrator/.9router
+// 被精确字符串拉黑，任何固定值都可能哪天被收进去）。
+// 代价：探测与生产不再发同一个值。若上游只看「路径是否在黑名单」，两边都能过；
+// 若校验路径存在性/格式，随机后缀是破绽。需要钉死单值时用
+// OPENCODE_ENV_WORKING_DIR。
+const ENV_WORKDIR_BASES = [
   "/home/user/project",
   "/home/user/workspace",
   "/home/user/src",
   "/workspace/app",
   "/srv/app",
-  "/opt/9router",
 ];
-const ENV_WORKDIR_SLOT_MS = 3600 * 1000;
+const ENV_RAND_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
 const ENV_WORKDIR_PIN = process.env.OPENCODE_ENV_WORKING_DIR || "";
 
 export function envWorkdir(now = Date.now()) {
   if (ENV_WORKDIR_PIN) return ENV_WORKDIR_PIN;
-  const slot = Math.floor(now / ENV_WORKDIR_SLOT_MS);
-  return ENV_WORKDIR_POOL[slot % ENV_WORKDIR_POOL.length];
+  const base = ENV_WORKDIR_BASES[randomInt(ENV_WORKDIR_BASES.length)];
+  const width = 2 + randomInt(2);
+  let suffix = "";
+  for (let i = 0; i < width; i += 1) {
+    suffix += ENV_RAND_ALPHABET[randomInt(ENV_RAND_ALPHABET.length)];
+  }
+  return `${base}-${suffix}`;
 }
 
 export function envFingerprintPrompt(now = Date.now()) {

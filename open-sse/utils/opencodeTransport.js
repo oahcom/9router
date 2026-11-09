@@ -107,6 +107,7 @@ function start() {
     let settled = false;
     let output = "";
     let stderr = "";
+    let runtimeStderr = "";
     const timer = setTimeout(() => finish(new Error("sidecar did not report ready")), OPENCODE_TRANSPORT_CONFIG.readyTimeoutMs);
 
     function finish(error, port) {
@@ -136,7 +137,17 @@ function start() {
       if (match) finish(null, Number(match[1]));
     });
     child.stderr.on("data", (chunk) => {
-      stderr = `${stderr}${chunk}`.slice(-2000);
+      const text = chunk.toString();
+      stderr = `${stderr}${text}`.slice(-2000);
+      if (!settled) return;
+      // READY 之后 sidecar 的运行期诊断不能再只留在 2KB 启动错误缓存里：
+      // 中途断流发生在响应头之后，父进程这里原本看不到任何日志。
+      runtimeStderr += text;
+      const lines = runtimeStderr.split(/\r?\n/);
+      runtimeStderr = lines.pop() || "";
+      for (const line of lines) {
+        if (line.trim()) console.error(line);
+      }
     });
     child.on("error", (error) => finish(new Error(`spawn failed: ${error.message}`)));
     child.on("exit", (code, signal) => {
@@ -297,6 +308,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
         method: options.method || "POST",
         headers: headerObject(options.headers),
         body: options.body,
+        reqId: log?.opencodeRequestId || undefined,
         proxy: proxyUrl || null,
         sessionGeneration: transportGeneration,
         // 0 = 不设上限（非流式：长生成可能在响应头返回前就超过 19s）

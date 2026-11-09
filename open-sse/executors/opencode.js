@@ -41,6 +41,13 @@ function tagWarnWithRequest(log, reqId) {
       configurable: true,
       enumerable: false,
     });
+    // sidecar 在响应头之后断流时也要能按 reqId 对回本次请求；通过日志
+    // 上下文传递，保持 fetchViaTransport 的四参数签名与既有调用契约不变。
+    Object.defineProperty(wrapped, "opencodeRequestId", {
+      value: reqId,
+      configurable: true,
+      enumerable: false,
+    });
     return wrapped;
   } catch {
     return log;

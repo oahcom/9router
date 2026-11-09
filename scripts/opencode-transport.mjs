@@ -62,6 +62,50 @@ function sessionFor(proxy, generation = 0) {
   return session;
 }
 
+// 响应头之后，fetch 已经成功，上游 socket 再被重置只会体现为 body 流
+// 读失败；直接透传 upstream.body 时这里没有任何日志。包一层 reader，
+// 把断流时已读字节数和 reqId 留下来，供父进程转发到 journal。
+function observeUpstreamBody(upstream, reqId) {
+  if (!upstream.body) return null;
+  const reader = upstream.body.getReader();
+  const expected = Number(upstream.headers.get("content-length")) || 0;
+  const target = String(upstream.url || "").replace(/[\r\n]/g, " ").slice(0, 300);
+  let bytes = 0;
+  let cancelled = false;
+  const detail = () => `req=${reqId} url=${target} bytes=${bytes}${expected ? `/${expected}` : ""}`;
+  const release = () => {
+    try { reader.releaseLock(); } catch { }
+  };
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (expected > 0 && bytes !== expected) {
+            console.error(`[OpenCodeTransport] upstream body short read (${detail()})`);
+          }
+          release();
+          controller.close();
+          return;
+        }
+        bytes += value.byteLength;
+        controller.enqueue(value);
+      } catch (error) {
+        if (!cancelled) {
+          console.error(`[OpenCodeTransport] upstream body interrupted: ${error?.message || error} (${detail()})`);
+        }
+        release();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      cancelled = true;
+      try { await reader.cancel(reason); } finally { release(); }
+    },
+  });
+}
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port,
@@ -119,7 +163,8 @@ const server = Bun.serve({
       clearTimeout(timeoutId);
     }
 
-    return new Response(upstream.body, {
+    const reqId = String(payload.reqId || "-").replace(/[\r\n]/g, " ").slice(0, 80);
+    return new Response(observeUpstreamBody(upstream, reqId), {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders(upstream.headers),

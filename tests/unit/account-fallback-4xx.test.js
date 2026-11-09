@@ -56,4 +56,19 @@ describe("checkFallbackError — request-scoped vs account-scoped failures", () 
     expect(result.shouldFallback).toBe(true);
     expect(result.cooldownMs).toBeGreaterThan(0);
   });
+
+  // 2026-11-09: 502/503/504 从 30s transient 改为指数退避 —— 中继 502 的
+  // 失败请求本身要跑 21~252s，固定 30s 冷却先到期，风暴期每个新请求都再撞
+  // 一次死中继。退避从 2s 起随连续失败翻倍。
+  it("backs off exponentially on 5xx gateway errors", () => {
+    expect(checkFallbackError(502, "bad gateway", 0)).toEqual({
+      shouldFallback: true, cooldownMs: 2000, newBackoffLevel: 1,
+    });
+    expect(checkFallbackError(503, "service unavailable", 2)).toEqual({
+      shouldFallback: true, cooldownMs: 8000, newBackoffLevel: 3,
+    });
+    expect(checkFallbackError(504, "gateway timeout", 15)).toEqual({
+      shouldFallback: true, cooldownMs: 5 * 60 * 1000, newBackoffLevel: 15,
+    });
+  });
 });

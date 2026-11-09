@@ -79,6 +79,14 @@ export const ERROR_RULES = [
   { status: 403, cooldownMs: COOLDOWN.long },
   { status: 404, cooldownMs: COOLDOWN.long },
   { status: 429, backoff: true },
+  // 5xx 也走指数退避（2026-11-09）：中继 502 的失败请求本身要跑 21~252s
+  // 才回错，默认 TRANSIENT_COOLDOWN_MS(30s) 先到期 —— 风暴期每个新请求都
+  // 再撞一次死中继（实测 08:53 90s 内 14 连 502）。退避从 2s 起翻倍、上限
+  // 5min（BACKOFF_CONFIG.max），连续失败才升级：偶发一次 502 的代价只是
+  // 与 429 同源的 2s 冷却。
+  { status: 502, backoff: true },
+  { status: 503, backoff: true },
+  { status: 504, backoff: true },
 ];
 
 // Backward compat: COOLDOWN_MS object (used by index.js re-export)

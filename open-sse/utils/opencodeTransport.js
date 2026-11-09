@@ -8,8 +8,6 @@ import { assertEgressTargetAllowed, normalizeString, resolveEffectiveProxyUrl } 
 
 const TRANSPORT_PATH = "/forward";
 const SIDECAR = path.join("scripts", "opencode-transport.mjs");
-// 退役的 sidecar 最多再活这么久：在途请求若挂住不结束，兜底回收进程。
-const RETIRE_MAX_MS = 30000;
 
 let active = null;
 let starting = null;
@@ -68,16 +66,16 @@ function stop() {
 }
 
 // 单个请求失败不代表共享 sidecar 该被砍：其余在途的 SSE 还在它上面跑。
-// 只摘掉 active（新请求开新进程），旧进程等在途归零再杀。直接 SIGKILL
-// 会把并发请求全打成 socket hang up，它们各自重试又各开一个 sidecar ——
-// 实测一次失败放大成整分钟 95 次 spawn。
+// 只摘掉 active（新请求开新进程），旧进程等在途归零再杀。不能按时长强杀：
+// 正常大上下文流可持续数分钟，30s 兜底会把健康响应连同挂死请求一起截断。
+// 挂死请求由响应头超时、调用方 abort 和流式 stall 超时负责收尾；父进程退出时
+// sidecar 的 ppid 看门狗负责回收，因而不需要定时 SIGKILL 兜底。
 function retire() {
   const current = active;
   active = null;
   if (!current) return;
   if (current.inflight > 0) {
     current.retired = true;
-    setTimeout(() => killChild(current), RETIRE_MAX_MS).unref?.();
     return;
   }
   killChild(current);

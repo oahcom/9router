@@ -179,10 +179,12 @@ function syntheticTransportError(message, failure = null) {
 }
 
 
-// 两种说法是同一种故障：无首字节超时。sidecar 自己的 19s 定时器先到就是
-// upstream-timeout，父进程的 20s 定时器先到就是 header-timeout —— 谁赢这场竞速
-// 取决于当时机器负载。分开处理会让同一次隧道悬挂有时重试、有时不重试。
-const HEADER_STALL_FAILURES = new Set(["header-timeout", "upstream-timeout"]);
+// 都发生在上游首字节之前，可以安全重放：sidecar 的 19s 定时器先到是
+// upstream-timeout，父进程 20s 定时器先到是 header-timeout；连接失败则记为
+// upstream-fetch-failed。三者都可能是死 socket，也可能是出口悬挂。
+const TRANSPORT_REPLAY_FAILURES = new Set([
+  "header-timeout", "upstream-timeout", "upstream-fetch-failed",
+]);
 
 // 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
@@ -663,34 +665,43 @@ export class OpenCodeExecutor extends BaseExecutor {
     const replayCredentials = usedCredentials.value || args.credentials;
     // 重试用 executeInner 包过的 logger：那条 warn 必须带同一个 req= 才能串起来。
     const replayArgs = { ...args, log: usedCredentials.log || args.log, body: replayBody, credentials: replayCredentials };
-    return (await this.retryOnceAfterStall(result, replayArgs)) ?? result;
+    const replayContext = {
+      requestStartedAt: usedCredentials.requestStartedAt || 0,
+      failedEgress: usedCredentials.requestEgress || null,
+      failedEgressSince: usedCredentials.requestEgressSince || null,
+    };
+    return (await this.retryOnceAfterStall(result, replayArgs, replayContext)) ?? result;
   }
 
   /**
-   * 无首字节超时：出口还活着，只是 sidecar 池里那条连接死了。
-   * 单池部署下没有第二条出口可换，唯一能做的是换一条新连接再试一次 ——
-   * 不换线是刻意的，换线归 429/403 那条路径管。
-   *
-   * 谁调用都行，但只能从这里出：executeInner 有四五条 return 路径（早退、429 换线后
-   * 重试、末尾重试），逐个补必漏。实测 10:33:18 换线成功 → 10:33:20 撞 429
-   * → 重试 → 10:33:38 header timeout → 直接 503 回客户端，就是漏在 429 那条路上。
-   *
-   * 为什么必须 bump：retire() 有 30s 节流，窗口内 sidecar 不会重启；不换 generation
-   * 的话重试骑着同一条死 socket，只是把 20s 再等一遍。
-   *
-   * 为什么只对「无首字节」这一类：出口限流（429）、指纹被拒（403 FreeTierError）、
-   * 结构性不支持（socks5）重试一万次也是同一个结果，白等 20s。
+   * 无首字节超时既可能是 sidecar 死连接，也可能是当前出口悬挂。
+   * 先让 asip 同步换线，再用新 generation 重放一次；asip 不可用或拒绝换线时，
+   * 仍保留原出口新连接重试。只重试一次，避免并发超时放大成换线/请求风暴。
    */
-  async retryOnceAfterStall(result, args) {
+  async retryOnceAfterStall(result, args, context = {}) {
     if (result?.response?.status !== 503) return null;
     if (result.response.headers.get("x-transport-error-type") !== "synthetic") return null;
     const failure = result.response.headers.get("x-transport-failure") || "";
-    if (!HEADER_STALL_FAILURES.has(failure)) return null;
+    if (!TRANSPORT_REPLAY_FAILURES.has(failure)) return null;
     if (!args?.body) return null;
+
+    let rotation = null;
+    if (asipRotationEnabled()) {
+      rotation = await rotateEgress("transport", {
+        signal: args?.signal,
+        requestStartedAt: context.requestStartedAt || 0,
+        failedEgress: context.failedEgress || null,
+        failedEgressSince: context.failedEgressSince || null,
+      });
+    }
+    clearProxyDispatchers();
     bumpTransportGeneration();
-    args.log?.warn?.("EGRESS", `transport stall (${failure}) -> retry once on a fresh connection`);
-    // 直接走 BaseExecutor：再回 executeInner 会把整段 429/asip 逻辑重跑一遍，
-    // 一次超时能放大成多次换线。
+    args.log?.warn?.(
+      "EGRESS",
+      `transport stall (${failure}) -> retry once on fresh connection`
+      + (rotation ? ` after asip rotation (${rotation.reason})` : " (asip unavailable)"),
+    );
+    // 直接走 BaseExecutor：再回 executeInner 会把 429/asip 逻辑重跑一遍。
     return await super.execute(args);
   }
 
@@ -819,6 +830,9 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (args.usedCredentials) {
       args.usedCredentials.value = prepared;
       args.usedCredentials.log = log;
+      args.usedCredentials.requestStartedAt = requestStartedAt;
+      args.usedCredentials.requestEgress = requestEgress;
+      args.usedCredentials.requestEgressSince = requestEgressSince;
     }
     // 克隆的触发条件是「这次请求有可能需要重放 body」：asip 换线后要重放一次请求。
     // transformRequest 会就地改 body（打指纹、改工具名），不先克隆就重放等于二次改指纹 → 403。

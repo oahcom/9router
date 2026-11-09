@@ -46,7 +46,7 @@ describe.skipIf(!HAS_BUN)("sidecar retirement", () => {
 
   beforeEach(async () => {
     resetTransport();
-    upstream = await startStreamingUpstream(20, 300); // ~6s 的流
+    upstream = await startStreamingUpstream(70, 500); // ~35s，覆盖旧的 30s 强杀点
   });
 
   afterEach(() => {
@@ -78,9 +78,9 @@ describe.skipIf(!HAS_BUN)("sidecar retirement", () => {
     );
     expect(failed === null || failed.status >= 500, `坏请求返回 ${failed?.status}`).toBe(true);
 
-    // 修复前 retire 会 SIGKILL 共享 sidecar：这条流的 body 被截断，
-    // 客户端看到半截响应。修复后它应当完整跑完。
+    // 修复前 retire 最迟在 30s 时 SIGKILL 共享 sidecar：这条 35s 流的 body
+    // 必然被截断。修复后旧进程必须等到在途归零才退出。
     const body = await bodyPromise;
-    expect(body, "在途流被截断（sidecar 被 SIGKILL）").toContain("data: done");
-  }, 40000);
+    expect(body, "在途长流被退役 sidecar 的 30s 强杀截断").toContain("data: done");
+  }, 45000);
 });

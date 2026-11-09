@@ -62,6 +62,20 @@ function rateLimited() {
   );
 }
 
+function stalled(failure = "header-timeout") {
+  return new Response(
+    JSON.stringify({ type: "error", error: { type: "UpstreamTransportError" } }),
+    {
+      status: 503,
+      headers: {
+        "content-type": "application/json",
+        "x-transport-error-type": "synthetic",
+        "x-transport-failure": failure,
+      },
+    },
+  );
+}
+
 function body(text) {
   return { messages: [{ role: "user", content: text }], tools: [] };
 }
@@ -182,5 +196,63 @@ describe("asip rotation without an alternate pool", () => {
     expect(rotateMock).toHaveBeenCalledTimes(0);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(result.response.status).toBe(429);
+  });
+
+  it("rotates on a transport stall and retries on the fresh egress", async () => {
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("stall-rotate");
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(rotateMock.mock.calls[0][0]).toBe("transport");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(200);
+    expect(bumpMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("also replays an upstream fetch failure before any response bytes", async () => {
+    fetchMock.mockResolvedValueOnce(stalled("upstream-fetch-failed")).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("fetch-failed");
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(rotateMock.mock.calls[0][0]).toBe("transport");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(200);
+  });
+
+  it("keeps the fresh-connection retry when asip declines a stall rotation", async () => {
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({ switched: false, switchedAt: 0, reason: "no_warm_standby" });
+
+    const result = await run("stall-declined");
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(200);
+    expect(bumpMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds a persistent transport stall to one replay", async () => {
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(stalled());
+    rotateMock.mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("stall-persistent");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(503);
+  });
+
+  it("retries a stall on a fresh connection when asip is disabled", async () => {
+    enabledMock.mockReturnValue(false);
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(ok());
+
+    const result = await run("stall-disabled");
+
+    expect(rotateMock).toHaveBeenCalledTimes(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.response.status).toBe(200);
   });
 });

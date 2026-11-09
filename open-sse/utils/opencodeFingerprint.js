@@ -359,17 +359,44 @@ const ENV_TMP_DIR = path.join(os.tmpdir(), "opencode");
 // path. process.cwd() put the gateway host's real directory into every upsteam
 // prompt, and the model repeated it to end users ("I'm in
 // /home/administrator/9router"), leaking the host layout. Keep it neutral.
-const ENV_WORKING_DIR = process.env.OPENCODE_ENV_WORKING_DIR || "/home/user/project";
-const ENV_FINGERPRINT_PROMPT = [
-  ENV_HEADING,
-  ENV_TAG,
-  `  Working directory: ${ENV_WORKING_DIR}`,
-  `  Workspace root folder: ${ENV_WORKING_DIR}`,
-  "  Is directory a git repo: no",
-  `  Platform: ${process.platform}`,
-  `  Prefer ${ENV_TMP_DIR} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.`,
-  "</env>",
-].join("\n");
+// 与 asip probe_warp.py 的 ENV_WORKDIR_POOL / 取模算法逐字一致：探测必须与
+// 生产发同一个值，否则测的不是同一条腿（2026-11-10 的教训：探测用家目录路径
+// 被判 429，生产用默认路径正常，asip 把整池线都判死）。
+// 按 epoch 小时取模轮换，不做每请求随机：真实 CLI 会话内工作目录固定，逐请求
+// 变化本身就是异常特征，且两端独立随机后探测永远追不上生产的取值。
+const ENV_WORKDIR_POOL = [
+  "/home/user/project",
+  "/home/user/workspace",
+  "/home/user/src",
+  "/workspace/app",
+  "/srv/app",
+  "/opt/9router",
+];
+const ENV_WORKDIR_SLOT_MS = 3600 * 1000;
+const ENV_WORKDIR_PIN = process.env.OPENCODE_ENV_WORKING_DIR || "";
+
+export function envWorkdir(now = Date.now()) {
+  if (ENV_WORKDIR_PIN) return ENV_WORKDIR_PIN;
+  const slot = Math.floor(now / ENV_WORKDIR_SLOT_MS);
+  return ENV_WORKDIR_POOL[slot % ENV_WORKDIR_POOL.length];
+}
+
+export function envFingerprintPrompt(now = Date.now()) {
+  const wd = envWorkdir(now);
+  return [
+    ENV_HEADING,
+    ENV_TAG,
+    `  Working directory: ${wd}`,
+    `  Workspace root folder: ${wd}`,
+    "  Is directory a git repo: no",
+    `  Platform: ${process.platform}`,
+    `  Prefer ${ENV_TMP_DIR} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.`,
+    "</env>",
+  ].join("\n");
+}
+
+const ENV_WORKING_DIR = envWorkdir();
+const ENV_FINGERPRINT_PROMPT = envFingerprintPrompt();
 
 /** True when the marker is already present; a genuine opencode client is passthrough. */
 function systemCarriesEnv(system) {
@@ -412,19 +439,20 @@ function appendSystemText(system, text) {
 export function applyEnvFingerprint(body, flat, { claude = false } = {}) {
   try {
     if (!body || typeof body !== "object") return false;
+    const prompt = envFingerprintPrompt();
 
     if (flat) {
       if (body.instructions !== undefined && typeof body.instructions !== "string") return false;
       if (systemCarriesEnv(body.instructions)) return false;
       body.instructions = (typeof body.instructions === "string" && body.instructions.trim())
-        ? `${body.instructions}\n\n${ENV_FINGERPRINT_PROMPT}`
-        : ENV_FINGERPRINT_PROMPT;
+        ? `${body.instructions}\n\n${prompt}`
+        : prompt;
       return true;
     }
 
     if (claude || body.system !== undefined) {
       if (systemCarriesEnv(body.system)) return false;
-      body.system = appendSystemText(body.system, ENV_FINGERPRINT_PROMPT);
+      body.system = appendSystemText(body.system, prompt);
       return true;
     }
 
@@ -433,11 +461,11 @@ export function applyEnvFingerprint(body, flat, { claude = false } = {}) {
     if (idx >= 0) {
       const target = body.messages[idx];
       if (systemCarriesEnv(target.content)) return false;
-      const content = appendSystemText(target.content, ENV_FINGERPRINT_PROMPT);
+      const content = appendSystemText(target.content, prompt);
       body.messages = body.messages.map((msg, i) => (i === idx ? { ...msg, content } : msg));
       return true;
     }
-    body.messages = [{ role: "system", content: ENV_FINGERPRINT_PROMPT }, ...body.messages];
+    body.messages = [{ role: "system", content: prompt }, ...body.messages];
     return true;
   } catch {
     return false;

@@ -320,7 +320,11 @@ export async function rotateEgress(
       " port=" + (proxyUrl || "-") +
       " reason=" + (res.reason || "?") +
       " switched=" + Boolean(res.switched) +
-      " restart=" + Boolean(res.restart_required)
+      " restart=" + Boolean(res.restart_required) +
+      " line=" + (res.offending_tag || res.active_tag || "-") +
+      " ip=" + (res.offending_egress || res.active_egress || "-") +
+      " verdict=" + (res.offending_verdict || "n/a") +
+      " to=" + (res.switch_to || "-")
     );
   }
   // 六条闸都在后台修、没有端口能立刻接管：主链路不再同步兜底，改由本进程

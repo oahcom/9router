@@ -2,7 +2,7 @@
 // 五种在调用方眼里含义完全不同（要不要 bump、要不要重试）。
 // opencode-asip-rotate 只 mock 了 rotateEgress，标签互换/挂死都抓不到 ——
 // 线上出现过「真超时记成 unavailable、垃圾响应记成 timeout」（2026-10-30 审查）。
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -402,6 +402,67 @@ describe("no healthy slot -> 9router restarts itself", () => {
         // ignore
       }
       resetAsipSelfRestartForTest();
+    }
+  });
+});
+
+
+describe("rotate trace log carries req / line / ip / verdict", () => {
+  const reply = (body) => (socket) => {
+    socket.on("data", () => {
+      const payload = JSON.stringify(body);
+      socket.end(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+          Buffer.byteLength(payload) + "\r\n\r\n" + payload
+      );
+    });
+  };
+
+  it("prints the offending egress and its probe verdict in one line", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await listen(reply({
+        ok: true,
+        switched: true,
+        reason: "ok",
+        offending_tag: "WARP-CF-H",
+        offending_egress: "2a09:bac5:1f05:28::4:36f",
+        offending_verdict: "quota",
+        switch_to: "slot-2",
+      }));
+      await rotateEgress("rate429", { reqId: "REQ-TRACE-9" });
+      const line = spy.mock.calls
+        .map((args) => args.join(" "))
+        .find((msg) => msg.includes("[ASIP] rotate req=REQ-TRACE-9"));
+      expect(line).toBeTruthy();
+      expect(line).toContain("line=WARP-CF-H");
+      expect(line).toContain("ip=2a09:bac5:1f05:28::4:36f");
+      expect(line).toContain("verdict=quota");
+      expect(line).toContain("to=slot-2");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("falls back to active_tag/active_egress on older asip replies", async () => {
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await listen(reply({
+        ok: true,
+        switched: false,
+        reason: "too_frequent",
+        active_tag: "WG-7",
+        active_egress: "1.1.1.1",
+      }));
+      await rotateEgress("rate429", { reqId: "REQ-TRACE-OLD" });
+      const line = spy.mock.calls
+        .map((args) => args.join(" "))
+        .find((msg) => msg.includes("[ASIP] rotate req=REQ-TRACE-OLD"));
+      expect(line).toContain("line=WG-7");
+      expect(line).toContain("ip=1.1.1.1");
+      expect(line).toContain("verdict=n/a");
+    } finally {
+      spy.mockRestore();
     }
   });
 });

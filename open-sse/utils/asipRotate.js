@@ -1,6 +1,9 @@
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { canonicalProxyKey } from "./proxyResolution.js";
+import { getWritableDataDir } from "./writableDataDir.js";
 
 /**
  * asip 同步轮换客户端。
@@ -44,10 +47,50 @@ function selfRestartIsDryRun() {
     || process.env.ASIP_SELF_RESTART_DISABLED === "1";
 }
 
+// 节流时间戳必须落盘：lastSelfRestartAt 是进程内内存态，process.exit(1)
+// 之后归零，新进程一启动就又能重启一次。线上 19:52:25 / 19:52:39 两次
+// 自重启正是这样连着发生的（9router 进程启动计数 3）。
+// 测试环境一律写 tmpdir，绝不碰生产数据目录。
+function selfRestartStateFile() {
+  if (process.env.ASIP_SELF_RESTART_STATE_FILE) {
+    return process.env.ASIP_SELF_RESTART_STATE_FILE;
+  }
+  const base = selfRestartIsDryRun()
+    ? path.join(os.tmpdir(), "9router-vitest")
+    : getWritableDataDir();
+  return path.join(base, "runtime", "asip-self-restart.json");
+}
+
+function readPersistedSelfRestartAt() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(selfRestartStateFile(), "utf8"));
+    const at = Number(raw && raw.at);
+    return Number.isFinite(at) && at > 0 ? at : 0;
+  } catch {
+    return 0; // 文件不存在 / 损坏：当作从未重启过，不阻塞必要的自重启。
+  }
+}
+
+function persistSelfRestartAt(at) {
+  try {
+    const file = selfRestartStateFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ at }), { mode: 0o600 });
+  } catch (err) {
+    // 写失败不能挡住自重启本身，但节流会退回进程内内存态，必须留下痕迹。
+    console.warn("[ASIP] self-restart throttle state not persisted: " +
+      (err && err.message ? err.message : err));
+  }
+}
+
 export function requestAsipSelfRestart(now = Date.now()) {
   // 429 风暴里同一批请求都会拿到"无健康备槽"，不节流会反复重启到服务不可用。
-  if (now - lastSelfRestartAt < SELF_RESTART_GAP_MS) return false;
+  // 内存态兜底同一进程内的连发，落盘态兜住「重启后内存归零」。
+  const last = Math.max(lastSelfRestartAt, readPersistedSelfRestartAt());
+  if (now - last < SELF_RESTART_GAP_MS) return false;
   lastSelfRestartAt = now;
+  // 必须在 setTimeout(exit) 之前同步写完，否则进程退出时状态可能还没落盘。
+  persistSelfRestartAt(now);
   console.warn(
     "[ASIP] no healthy slot -> self-restart in " + SELF_RESTART_DELAY_MS +
     "ms (gates are repaired in background)"
@@ -60,6 +103,16 @@ export function requestAsipSelfRestart(now = Date.now()) {
 }
 
 export function resetAsipSelfRestartForTest() {
+  lastSelfRestartAt = 0;
+  try {
+    fs.unlinkSync(selfRestartStateFile());
+  } catch {
+    // 文件本来就不存在。
+  }
+}
+
+// 只清内存、保留落盘 —— 让单测能模拟「process.exit(1) 之后的新进程」。
+export function resetAsipSelfRestartMemoryForTest() {
   lastSelfRestartAt = 0;
 }
 

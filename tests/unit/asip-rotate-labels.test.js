@@ -22,6 +22,7 @@ const {
   clearAsipProxyCooling,
   requestAsipSelfRestart,
   resetAsipSelfRestartForTest,
+  resetAsipSelfRestartMemoryForTest,
 } = await (async () => {
   process.env.ASIP_SOCKET = SOCK;
   process.env.ASIP_TOKEN_FILE = TOKEN_FILE;
@@ -376,5 +377,31 @@ describe("no healthy slot -> 9router restarts itself", () => {
     expect(requestAsipSelfRestart(1_000_000)).toBe(true);
     expect(requestAsipSelfRestart(1_001_000)).toBe(false);
     expect(requestAsipSelfRestart(1_061_000)).toBe(true);
+  });
+
+  it("keeps the throttle across a process restart", () => {
+    // 线上 19:52:25 重启后新进程内存归零，19:52:39 又能重启一次。
+    // 落盘时间戳必须跨进程生效。
+    const stateFile = path.join(DIR, "self-restart.json");
+    process.env.ASIP_SELF_RESTART_STATE_FILE = stateFile;
+    try {
+      expect(requestAsipSelfRestart(2_000_000)).toBe(true);
+      expect(fs.existsSync(stateFile)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(stateFile, "utf8")).at).toBe(2_000_000);
+
+      // 模拟 process.exit(1) 后的新进程：只剩落盘状态。
+      resetAsipSelfRestartMemoryForTest();
+      expect(requestAsipSelfRestart(2_001_000)).toBe(false);
+      // 满 60s 之后才允许下一次。
+      expect(requestAsipSelfRestart(2_061_000)).toBe(true);
+    } finally {
+      delete process.env.ASIP_SELF_RESTART_STATE_FILE;
+      try {
+        fs.unlinkSync(stateFile);
+      } catch {
+        // ignore
+      }
+      resetAsipSelfRestartForTest();
+    }
   });
 });

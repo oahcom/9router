@@ -25,6 +25,44 @@ const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 2000);
 // 线上出口换掉，而且结果取决于当时网络。测试里由 tests/setup.js 置 1。
 const DISABLED = process.env.ASIP_DISABLED === "1";
 
+// 无健康备槽时由本进程重启：asip 那边六条闸都在后台修，没有端口能立刻接管
+// 这条请求。主链路不再同步探线/换线兜底；这里重建连接池、清掉进程内冷却表，
+// 等闸修好重新来。必须用非 0 退出码：systemd 是 Restart=on-failure，
+// /api/shutdown 的 process.exit(0) 会让服务停住不拉起（且 production 下那个
+// 端点直接 403，本来就调不通）。
+const SELF_RESTART_GAP_MS = Number(
+  process.env.ASIP_SELF_RESTART_GAP_MS || 60_000);
+const SELF_RESTART_DELAY_MS = 1000;
+let lastSelfRestartAt = 0;
+
+function selfRestartIsDryRun() {
+  // 测试里绝不能真的把 worker 退掉；helper 仍返回"本会重启"供断言节流。
+  return process.env.VITEST === "true"
+    || Boolean(process.env.VITEST_WORKER_ID)
+    || Boolean(process.env.VITEST_POOL_ID)
+    || process.env.NODE_ENV === "test"
+    || process.env.ASIP_SELF_RESTART_DISABLED === "1";
+}
+
+export function requestAsipSelfRestart(now = Date.now()) {
+  // 429 风暴里同一批请求都会拿到"无健康备槽"，不节流会反复重启到服务不可用。
+  if (now - lastSelfRestartAt < SELF_RESTART_GAP_MS) return false;
+  lastSelfRestartAt = now;
+  console.warn(
+    "[ASIP] no healthy slot -> self-restart in " + SELF_RESTART_DELAY_MS +
+    "ms (gates are repaired in background)"
+  );
+  if (!selfRestartIsDryRun()) {
+    const timer = setTimeout(() => process.exit(1), SELF_RESTART_DELAY_MS);
+    timer.unref?.();
+  }
+  return true;
+}
+
+export function resetAsipSelfRestartForTest() {
+  lastSelfRestartAt = 0;
+}
+
 // 槽位端口健康冷却：asip 报某个端口 429/transport 后，新请求在短窗口内跳过
 // 它；当前请求的 switchToUrl 即时重试不受影响。按规范化代理 URL 而不是 poolId
 // 记录，同一端口即使被多个池/连接引用也一起避开。只存内存，重启即清。
@@ -220,7 +258,12 @@ export async function rotateEgress(
   if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error, lineChanged: false };
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable", lineChanged: false };
   applyProxyCooldownFromResponse(proxyUrl, res);
-  // asip 说「这次不知道出口是谁」（并发抢锁失败）：不要碰本地记录。
+  // 六条闸都在后台修、没有端口能立刻接管：主链路不再同步兜底，改由本进程
+  // 重启重建连接池，等闸回来。统一放在这里触发，429 / transport / 连接超时
+  // 三条调用路径都覆盖到，不必每个 executor 各写一遍。
+  const restartRequired = Boolean(res.restart_required) && !res.switch_to_url;
+  if (restartRequired) requestAsipSelfRestart();
+  // asip 说「这次不知道出口是谁」（无健康备槽 / 并发抢锁）：不要碰本地记录。
   // 那一瞬间 selector 正在被另一次切换改写，读到的任何身份都是旧的；写进去
   // 就是用旧线覆盖真相，下一条 429 会带着错误出口去回溯。
   if (res.line_unknown) {
@@ -233,6 +276,7 @@ export async function rotateEgress(
       reason: res.reason || "coalesced",
       lineChanged: false,
       lineUnknown: true,
+      restartRequired,
       avoidPortUntil: Number.isFinite(Number(res.avoid_port_until))
         ? Number(res.avoid_port_until) * 1000 : 0,
     };
@@ -256,6 +300,7 @@ export async function rotateEgress(
     switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
     reason: res.reason || (res.switched ? "ok" : "unknown"),
     lineChanged: noteActiveLine(res.active_tag, res.active_egress),
+    restartRequired,
     avoidPortUntil: Number.isFinite(Number(res.avoid_port_until))
       ? Number(res.avoid_port_until) * 1000 : 0,
   };

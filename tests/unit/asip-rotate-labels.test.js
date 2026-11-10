@@ -20,6 +20,8 @@ const {
   isAsipProxyCooling,
   markAsipProxyCooling,
   clearAsipProxyCooling,
+  requestAsipSelfRestart,
+  resetAsipSelfRestartForTest,
 } = await (async () => {
   process.env.ASIP_SOCKET = SOCK;
   process.env.ASIP_TOKEN_FILE = TOKEN_FILE;
@@ -311,5 +313,67 @@ describe("active line identity", () => {
     await rotateEgress("rate429");
     const result = await rotateEgress("rate429");
     expect(result.lineChanged).toBe(true);
+  });
+});
+
+
+describe("no healthy slot -> 9router restarts itself", () => {
+  const reply = (body) => (socket) => {
+    socket.on("data", () => {
+      const payload = JSON.stringify(body);
+      socket.end(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+          Buffer.byteLength(payload) + "\r\n\r\n" + payload
+      );
+    });
+  };
+
+  beforeEach(() => {
+    // 双保险：即便上面那组环境变量判断漏了，测试也绝不真退进程。
+    process.env.ASIP_SELF_RESTART_DISABLED = "1";
+    resetAsipSelfRestartForTest();
+  });
+
+  afterAll(() => {
+    delete process.env.ASIP_SELF_RESTART_DISABLED;
+    resetAsipSelfRestartForTest();
+  });
+
+  it("asks for a self-restart and does not retry on a dead gate", async () => {
+    await listen(reply({
+      ok: true, switched: false, reason: "ok", switched_at: 0,
+      line_unknown: true, restart_required: true,
+      switch_to: null, switch_to_url: null,
+      active_tag: "WARP-A", active_egress: "2606:a::1",
+      avoid_port_until: 0,
+    }));
+    const result = await rotateEgress("rate429", {
+      proxyUrl: "http://127.0.0.1:7890",
+    });
+    expect(result.restartRequired).toBe(true);
+    expect(result.lineUnknown).toBe(true);
+    expect(result.switchToUrl).toBe(null);
+    expect(result.lineChanged).toBe(false);
+    clearAsipProxyCooling("http://127.0.0.1:7890");
+  });
+
+  it("does not restart when asip actually offered a standby port", async () => {
+    // 矛盾回包（两个信号同时给）以可用端口为准：有落点就不必重启。
+    await listen(reply({
+      ok: true, switched: true, reason: "ok", switched_at: 0,
+      line_unknown: true, restart_required: true,
+      switch_to: "slot-4", switch_to_url: "http://127.0.0.1:7894",
+      active_tag: "WARP-A", active_egress: "2606:a::1",
+      avoid_port_until: 0,
+    }));
+    const result = await rotateEgress("rate429");
+    expect(result.restartRequired).toBe(false);
+    expect(result.switchToUrl).toBe("http://127.0.0.1:7894");
+  });
+
+  it("throttles repeated restart requests inside one 429 storm", () => {
+    expect(requestAsipSelfRestart(1_000_000)).toBe(true);
+    expect(requestAsipSelfRestart(1_001_000)).toBe(false);
+    expect(requestAsipSelfRestart(1_061_000)).toBe(true);
   });
 });

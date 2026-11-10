@@ -797,8 +797,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 「没换线也当换过了」。
       // already_retired 是同一件事的另一面：asip 没换线，但那条隧道**已经**在
       // 这条请求之后被换掉了，手里这条连接还挂在它上面，重连一次就够。
-      // line_ok：asip 用同一份指纹实测这条线仍然可用，明确没换线。429 不是出口
-      // 坏了，重连一次、在同一出口上重试，比换掉一条还能用的线划算。
+      // line_ok：asip 用同一份指纹实测这条线仍然可用，明确没换线。按 asip
+      // 结论重连一次、在同一出口上重试，比换掉一条还能用的线划算。
       const ROTATED_REASONS = ["ok", "coalesced", "too_frequent",
         "already_retired", "line_ok",];
       const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
@@ -917,7 +917,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。
       // line_ok 与 already_retired 同理：asip 明确说这条线还能用（实测 OK），
-      // 没换线。429 不是出口级封禁，重连一次在同一出口上重试即可。
+      // 没换线。按 asip 结论重连一次，在同一出口上重试即可。
       if (asip.switchedAt >= requestStartedAt
           || asip.reason === "already_retired"
           || asip.reason === "line_ok"

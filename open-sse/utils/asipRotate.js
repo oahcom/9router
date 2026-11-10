@@ -5,6 +5,7 @@ import path from "node:path";
 import { canonicalProxyKey } from "./proxyResolution.js";
 import { getWritableDataDir } from "./writableDataDir.js";
 import { currentReqId } from "./requestContext.js";
+import { bumpEgressGeneration } from "./egressGeneration.js";
 
 /**
  * asip 同步轮换客户端。
@@ -486,6 +487,14 @@ export async function refreshSlotEgress({ signal = null } = {}) {
     const fresh = cur?.at && now - cur.at < PORT_LINE_TTL_MS;
     const snapEgress = s.egress || null;
     if (!cur || !cur.egress || !fresh || cur.egress !== snapEgress) {
+      // 订阅式感知（拉取侧）：asip 主动换线 / 探针重启隧道之后，/slots 里该
+      // 端口挂的出口地址会变。这时立刻让该端口的池化连接失效，不必等下一条
+      // 请求先撞死 20s。只认「旧地址确实存在且变了」，首次灌表不触发。
+      // 注意这里只 bump generation，不动 PORT_LINES 之外的任何东西，也不会
+      // 像每次请求都刷 /slots 那样把 failedEgressSince 冲掉。
+      if (cur?.egress && cur.egress !== snapEgress) {
+        bumpEgressGeneration(`http://127.0.0.1:${port}`, { force: true });
+      }
       PORT_LINES.set(port, {
         tag: s.tag || null,
         egress: snapEgress,

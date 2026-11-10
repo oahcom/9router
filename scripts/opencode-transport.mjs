@@ -41,14 +41,25 @@ function responseHeaders(input) {
 // 10s 后未用的 socket 被丢弃，下一次请求重建，僵尸池最多影响 10s。
 const SESSION_IDLE_TIMEOUT_SEC = 10;
 const SESSION_MAX_IDLE_SOCKETS = 8;
-const sessions = new Map();
+// asip 会单方面重启隧道（实测同线重启 p50 22-24s），9router 未必收到换线通知，
+// generation 也就不一定变。对端没了、本地 socket 仍 ESTAB，持续流量下 idleTimeout
+// 永远不触发 → 僵尸连接被无限复用。给 session 一个硬寿命作为兜底：超龄换新池，
+// 已发出的请求仍持有旧 session 对象，不会被掐断。
+const SESSION_MAX_AGE_SEC = Math.max(5, Number(process.env.OPENCODE_SESSION_MAX_AGE_SEC || 20));
+const sessions = new Map();   // key -> { session, createdAt }
 
 function sessionFor(proxy, generation = 0) {
-  // generation 由父进程在换线后 bump：selector 变了，旧连接不再是同一条出口。
+  // generation 由父进程按端口 bump：出口身份变了，旧连接不再是同一条出口。
   const key = (proxy || "direct") + "|" + generation;
-  let session = sessions.get(key);
-  if (!session) {
-    session = new Bun.FetchSession({
+  const now = Date.now();
+  let entry = sessions.get(key);
+  if (entry && now - entry.createdAt > SESSION_MAX_AGE_SEC * 1000) {
+    // 只删表里的引用；在途请求持有的 session 不受影响，旧池靠 idleTimeout 回收。
+    sessions.delete(key);
+    entry = null;
+  }
+  if (!entry) {
+    const session = new Bun.FetchSession({
       ...(proxy ? { proxy } : {}),
       keepAlive: {
         idleTimeout: SESSION_IDLE_TIMEOUT_SEC,
@@ -57,9 +68,10 @@ function sessionFor(proxy, generation = 0) {
     });
     // 旧 generation 的 session 不会再用到，交给 idleTimeout 淘汰；表只留最近 64 个。
     if (sessions.size >= 64) sessions.delete(sessions.keys().next().value);
-    sessions.set(key, session);
+    entry = { session, createdAt: now };
+    sessions.set(key, entry);
   }
-  return session;
+  return entry.session;
 }
 
 // 响应头之后，fetch 已经成功，上游 socket 再被重置只会体现为 body 流

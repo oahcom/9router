@@ -5,6 +5,7 @@ import { Readable } from "node:stream";
 import path from "node:path";
 import { OPENCODE_TRANSPORT_CONFIG } from "../config/runtimeConfig.js";
 import { assertEgressTargetAllowed, normalizeString, resolveEffectiveProxyUrl } from "./proxyResolution.js";
+import { bumpEgressGeneration, generationFor } from "./egressGeneration.js";
 
 const TRANSPORT_PATH = "/forward";
 const SIDECAR = path.join("scripts", "opencode-transport.mjs");
@@ -29,12 +30,33 @@ function takeResetSlot() {
   return true;
 }
 
-// sidecar 按 (proxy, generation) 分桶复用 socket：换线后 bump 一次，
-// 下一次请求就会拿到新 session / 新连接，而不是骑在旧隧道上。
-let transportGeneration = 0;
-export function bumpTransportGeneration() {
-  transportGeneration += 1;
-  return transportGeneration;
+// sidecar 按 (proxy, generation) 分桶复用 socket。旧的模块级整数有两个问题：
+// ① 任意一条线出事就 bump，连累另外 5 个端口；② asip 单方面重启隧道时本进程
+// 不知情，整数不动，僵尸 socket 被一直复用（诊断第十三、十四节）。现在按端口
+// 分账；无参调用（opencode.js 换线分支）仍保留全局 bump 语义，行为不变。
+export function bumpTransportGeneration(proxyUrl = null) {
+  return bumpEgressGeneration(proxyUrl, { force: true });
+}
+
+function portLabel(proxyUrl) {
+  const m = /:(\d+)\/?$/.exec(String(proxyUrl || "").trim());
+  return m ? `port ${m[1]}` : "direct";
+}
+
+/**
+ * L0 socket 失败的统一入口：让这一条请求所用端口的池化连接立刻失效。
+ * 只改 key，不 close dispatcher、不杀进程 —— 同进程里其它在途请求仍持有旧
+ * session 引用，不受影响。header-timeout / upstream-timeout 也走这里，好让
+ * 上层 45s 重放拿到全新 session，而不是重演同一条半开连接。
+ */
+function invalidatePortConnections(proxyUrl, log, reason) {
+  const before = generationFor(proxyUrl);
+  bumpEgressGeneration(proxyUrl);
+  const after = generationFor(proxyUrl);
+  if (before !== after) {
+    transportWarn(log, `socket failure (${reason}); dropped pooled sessions on ${portLabel(proxyUrl)}`);
+  }
+  return after;
 }
 
 function available() {
@@ -310,7 +332,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
         body: options.body,
         reqId: log?.opencodeRequestId || undefined,
         proxy: proxyUrl || null,
-        sessionGeneration: transportGeneration,
+        sessionGeneration: generationFor(proxyUrl),
         // 0 = 不设上限（非流式：长生成可能在响应头返回前就超过 19s）
         timeoutMs: headerTimeoutMs,
       }, options.signal, headerTimeoutMs);
@@ -325,6 +347,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
           `upstream fetch failed (attempt ${attempt + 1}/2)${upstreamTimeout ? " [timeout]" : ""}: ${detail.slice(0, 300)}`
         );
         if (upstreamTimeout) {
+          invalidatePortConnections(proxyUrl, log, "upstream-timeout");
           // 同一出口（同一 proxyUrl）重试必然再等满一次超时：attempt 1 只是把
           // 20s 变成 40s。这里只负责清掉可能僵死的池化 socket，请求本身直接
           // 交回上层换出口；冷却避免同一批并发超时把 sidecar 反复杀穿。
@@ -336,8 +359,15 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
           }
           return noteFailure("upstream-timeout");
         }
-        // sidecar 报的是上游 fetch 失败（非超时）。非流式没有 cleanup 需求，
-        // 重试同一出口只会重复失败；只在冷却外重启一次以清池。
+        // sidecar 报的是上游 fetch 失败（非超时）：UND_ERR_SOCKET /
+        // ECONNRESET，即「对端已经把连接关了」。这不是整条线坏了，换线、
+        // 直连都治不了；丢掉本端口的池化 session 后用全新连接重打一次
+        // 成本极低（实测 p50 7s），且不会像 header-timeout 那样白等 20s。
+        invalidatePortConnections(proxyUrl, log, "upstream-fetch-failed");
+        if (attempt === 0) {
+          transportWarn(log, "retrying once on a fresh connection (same egress)");
+          continue;
+        }
         if (takeResetSlot()) {
           retire();
         }
@@ -352,6 +382,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
       // （实测一整段 2 分钟的同形态 503）。retire 掉，让下一条请求从干净进程开始。
       // 冷却复用下面 transportTimeout 的节流，避免每个超时都 spawn 一次。
       if (options.signal?.aborted || error.name === "AbortError") {
+        invalidatePortConnections(proxyUrl, log, "caller-aborted");
         if (takeResetSlot()) {
           transportWarn(log, "caller aborted before headers; retiring sidecar to drop stale socket");
           retire();
@@ -361,6 +392,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
       // 响应头超时 = 出口路径死了（sidecar 本身活着）。不重启 sidecar 再试一次
       // （同一代理必然再挂），直接交给上层换另一条出口，把 60s 白等压到 20s。
       if (error.transportTimeout) {
+        invalidatePortConnections(proxyUrl, log, "header-timeout");
         // 超时的常见成因是 Bun 的池化 socket 已死（隧道静默断开、本地仍 ESTAB），
         // 同一 sidecar 会一直复用它 → 后续每条请求都白等满超时。重启 sidecar 才
         // 能清池；冷却避免同一批并发超时把 sidecar 反复杀穿。
@@ -376,9 +408,11 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
       // socket hang up 多半是别的请求刚把共享 sidecar 退役了，不是本请求的
       // 上游有问题。此时重试会再开一个 sidecar，把一次失败放大成雪崩。
       if (error.code === "ECONNRESET" || error.code === "EPIPE") {
+        invalidatePortConnections(proxyUrl, log, `sidecar-socket-reset:${error.code}`);
         if (attempt === 0) continue;
         return noteFailure(`sidecar-socket-reset:${error.code}`);
       }
+      invalidatePortConnections(proxyUrl, log, "forward-failed");
       if (attempt === 0) {
         retire();
         continue;

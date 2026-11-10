@@ -282,8 +282,17 @@ async function getDispatcher(proxyUrl, insecure = false) {
  * 只改变选择器指向 —— 已有连接仍拴在旧隧道上。不丢缓存的话，切完再重试等于
  * 拿新选择器走旧连接，429 照旧。代价是下一次请求要重建连接（几毫秒）。
  */
-export function clearProxyDispatchers() {
-  proxyDispatchers.clear();
+export function clearProxyDispatchers(proxyUrl = null) {
+  if (!proxyUrl) {
+    proxyDispatchers.clear();
+    return;
+  }
+  // 传端口时只丢这一个出口的池化连接。不 close()：已发出的请求仍持有
+  // dispatcher 引用，close 会把同进程的在途流一起掐断。
+  const normalized = normalizeProxyUrl(proxyUrl);
+  if (!normalized) return;
+  proxyDispatchers.delete(`${normalized}::secure`);
+  proxyDispatchers.delete(`${normalized}::insecure`);
 }
 
 async function fetchWithTlsFallback(url, options, proxyUrl) {
@@ -587,9 +596,16 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       if (proxyOptions?.strictProxy === true) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
       }
+      // L0 连接失效（UND_ERR_SOCKET: other side closed / ECONNRESET）：先精确
+      // 丢掉这个端口池化的 ProxyAgent。僵尸 socket 不是「这条线坏了」，不丢的
+      // 话后面 3 次轮换会一直在同一个死池里重打，最后把请求发到本机地址。
+      // 只删 Map 引用、不 close()：同进程其它在途请求仍持有 dispatcher。
+      // 这里刻意不额外插一发「同出口重试」——换线后的第一发本来就是全新连接，
+      // 插一发会把既定的 3 发换线预算变成 4 发，也改变 rotate 次数契约。
+      clearProxyDispatchers(proxyUrl);
+      let lastError = proxyError;
       // 连接失败先换隧道再试：池子里还有别的线，没理由第一步就用本机地址。
       // 最多 PROXY_FAILURE_ROTATE_ATTEMPTS 发（首发之外再换 3 条线）。
-      let lastError = proxyError;
       let attemptProxyUrl = proxyUrl;
       if (isReplayableBody(options?.body)) {
         for (let attempt = 1; attempt <= PROXY_FAILURE_ROTATE_ATTEMPTS; attempt += 1) {
@@ -599,6 +615,8 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
             signal: options?.signal,
           });
           if (!rotatedProxyUrl) break;
+          // 轮换后的端口同样可能有旧池；不丢就还是骑在复活前的 socket 上。
+          clearProxyDispatchers(rotatedProxyUrl);
           try {
             const retried = await proxySend(rotatedProxyUrl)(url, options);
             console.warn(`[ProxyFetch] Proxy failed (${lastError.message}); rotated -> ${rotatedProxyUrl}, recovered on attempt ${attempt}/${PROXY_FAILURE_ROTATE_ATTEMPTS}`);

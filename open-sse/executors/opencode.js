@@ -102,6 +102,10 @@ const MAX_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.OPENCODE_ROTATE_ATTEM
 // 从首次收到 429 起算的总预算。超预算就不再打：宁可把 429 交回调用方，
 // 也不要把一条请求拖到几十秒——上游限流窗口本来就不是秒级。
 const ROTATE_ATTEMPT_BUDGET_MS = Number(process.env.OPENCODE_ROTATE_BUDGET_MS || 25000);
+// asip 的 switched_at 是「秒」，转成毫秒后精度只有 1s；拿它跟本进程的 ms 级
+// requestStartedAt 比大小，差 1ms 就会把「刚换过线」判成「没换」。判定窗口统一
+// 放宽 1s：这一秒内的换线仍然算数（线确实是新的），更早的照旧不算。
+const ROTATE_CLOCK_SLACK_MS = 1000;
 
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import { clearProxyDispatchers } from "../utils/proxyFetch.js";
@@ -613,6 +617,12 @@ export class OpenCodeExecutor extends BaseExecutor {
     super("opencode", PROVIDERS.opencode);
   }
 
+  // 429 的三发换线循环在本类 executeInner 里，基类不要再套一层（3×3 发），
+  // 也不能由基类抢先记账 —— 记账必须落在真正承载这次 429 的那台闸上。
+  handlesOwnEgress429() {
+    return true;
+  }
+
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool, egressId } = {}) {
     const sourceCredentials = credentials || {};
     const session = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool, egressId);
@@ -976,7 +986,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 没换线。按 asip 结论重连一次，在同一出口上重试即可。
       // restartRequired 一票否决：无可用闸口时不重试，由自重启接管。
       if (!asip.restartRequired
-          && (asip.switchedAt >= requestStartedAt
+          && (asip.switchedAt >= requestStartedAt - ROTATE_CLOCK_SLACK_MS
               || asip.reason === "already_retired"
               || asip.reason === "line_ok"
               // 多端口：asip 指定了另一台 sing-box，这次重试就走它。独立进程、
@@ -987,6 +997,13 @@ export class OpenCodeExecutor extends BaseExecutor {
         let attemptEgress = requestEgress;
         let attemptResult = null;
         let attemptNo = 0;
+        // 上一发是什么时候打出去的。asip 的 switchedAt 只有晚于它才算「这一发
+        // 途中换过线」，否则拿旧结论把同一出口再打一遍。
+        let lastAttemptStartedAt = requestStartedAt;
+        // 本条请求打过的出口地址。asip 选槽只看「哪台闸健康」，不看「这个地址
+        // 刚才是不是已经在本条请求上撞过」—— 六条线共用一个 /64 池，换一台闸
+        // 完全可能落回同一个 /128，那种重试是白打（实测 waxdk3ude 就是这样）。
+        const triedEgress = new Set();
         // 首发已经打过了，这里只补换线重试的那几发。
         while (attemptNo < MAX_ROTATE_ATTEMPTS - 1) {
           if (attemptNo > 0 && Date.now() - requestStartedAt > ROTATE_ATTEMPT_BUDGET_MS) {
@@ -995,6 +1012,28 @@ export class OpenCodeExecutor extends BaseExecutor {
           }
           attemptNo += 1;
           const targetProxyUrl = attempt.switchToUrl || null;
+          const targetEgress = attempt.switchToEgress || attempt.activeEgress || null;
+          const samePort = !targetProxyUrl || targetProxyUrl === attemptProxyUrl;
+          // asip 证明过「这条请求发出之后线被换过」：同端口重连拿到的就是新地址，
+          // 这时即便它没报地址也有意义（coalesced 走这条）。already_retired 本身
+          // 就是这个结论 —— 它只在 exit ledger 里这条地址的退役时刻晚于请求发出时
+          // 才回，switchedAt 反而是更早的时刻，不能拿来否决。
+          const lineMoved = attempt.reason === "already_retired"
+            || Number(attempt.switchedAt || 0) >= lastAttemptStartedAt - ROTATE_CLOCK_SLACK_MS;
+          // 原地打转：换回来的地址这一发已经打过（六条线共用一个 /64 池，换一台
+          // 闸完全可能落回同一个 /128），或者既没换端口、也没有新线可证明。
+          // 再打一发必然是同一个 429，只多烧一次配额和几秒。
+          const repeatsEgress = Boolean(targetEgress)
+            && (targetEgress === attemptEgress || triedEgress.has(targetEgress));
+          if (repeatsEgress || (samePort && !targetEgress && !lineMoved)) {
+            log?.warn?.(
+              "EGRESS",
+              `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} refused: no new egress `
+              + `(${targetProxyUrl || attemptProxyUrl} / ${targetEgress || attemptEgress || "unknown"}, reason ${attempt.reason})`,
+            );
+            break;
+          }
+          if (targetEgress) triedEgress.add(targetEgress);
           // 每一发都要清连接池并 bump：sidecar 的 session key 是 proxy|generation，
           // 只清 undici dispatcher 不影响 Bun 那边池化的 socket（上一发刚回 429，
           // socket 还在池里）。最后一发清完即便不重发也无副作用。
@@ -1005,6 +1044,7 @@ export class OpenCodeExecutor extends BaseExecutor {
             `asip rotated egress (${attempt.reason}) -> retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} on fresh connection`,
           );
           const attemptStartedAt = Date.now();
+          lastAttemptStartedAt = attemptStartedAt;
           const current = await super.execute({
             ...args,
             log,

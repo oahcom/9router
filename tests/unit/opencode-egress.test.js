@@ -18,6 +18,10 @@ vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   // 执行器每个请求读一次当前出口地址，429 时交给 asip 查换线表。
   currentAsipEgress: () => null,
   currentAsipEgressSince: () => null,
+  // 换到另一台闸时要给原端口打短冷却；以前用例的 asip 回包从不带 switchToUrl，
+  // 这个依赖没被触发过，缺了会在「第二跳落在已用地址」那条用例里炸。
+  markAsipProxyCooling: vi.fn(() => 0),
+  isAsipProxyCooling: () => false,
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";
@@ -393,5 +397,52 @@ describe("OpenCode free-lane egress switching", () => {
     await run(executor, { body: makeBody(), proxyOptions: null, providerSessionId: "conv-no-probe" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OpenCode 429 in-place guard", () => {
+  it("stops at one send when asip reports neither a new port nor a switched line", async () => {
+    const executor = getExecutor("opencode");
+    const proxyOptions = { ...pool("a", "http://proxy-a.example:8080") };
+    // coalesced / too_frequent：这次调用没换线，switchedAt 也是旧的 —— 再打一发
+    // 就是同一个端口上的同一条隧道，必然还是同一个 429。
+    rotateMock.mockImplementation(async () => ({
+      switched: false, switchedAt: 0, reason: "coalesced", switchToUrl: null,
+    }));
+    fetchMock.mockResolvedValue(rateLimitedResponse());
+
+    const result = await run(executor, {
+      body: makeBody("coalesced"), proxyOptions, providerSessionId: "conv-coalesced",
+    });
+
+    expect(result.response.status).toBe(429);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a second hop that lands on the address already used by the first", async () => {
+    const executor = getExecutor("opencode");
+    const proxyOptions = { ...pool("a", "http://proxy-a.example:8080") };
+    // 六条线共用一个 /64 池：第二跳换到了另一台闸，但出口还是第一跳那个 /128。
+    rotateMock
+      .mockResolvedValueOnce({
+        switched: true, switchedAt: Date.now(), reason: "ok",
+        switchToUrl: "http://proxy-b.example:8080", switchToEgress: "2a09:bac5:7777::1",
+      })
+      .mockResolvedValue({
+        switched: true, switchedAt: Date.now(), reason: "ok",
+        switchToUrl: "http://proxy-c.example:8080", switchToEgress: "2a09:bac5:7777::1",
+      });
+    fetchMock.mockResolvedValue(rateLimitedResponse({ type: "RateLimitError" }));
+
+    const result = await run(executor, {
+      body: makeBody("reuse-ip"), proxyOptions, providerSessionId: "conv-reuse-ip",
+    });
+
+    expect(result.response.status).toBe(429);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // 换闸改的是 proxyOptions.url（resolveConnectionProxyUrl 优先读它），
+    // connectionProxyUrl 仍是 provider 配的那条。
+    expect(fetchMock.mock.calls[1][2].url || fetchMock.mock.calls[1][2].connectionProxyUrl)
+      .toBe("http://proxy-b.example:8080");
   });
 });

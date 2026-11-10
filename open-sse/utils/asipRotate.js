@@ -373,6 +373,11 @@ export async function rotateEgress(
     switchToUrl: res.switch_to_url || null,
     switchToPool: res.switch_to || null,
     switchToEgress: res.switch_to_egress || null,
+    // asip 眼里「这台闸现在挂着哪个出口地址」。没有 switch_to 时（already_retired
+    // 的原地重连、line_ok）这是唯一能证明「地址确实换了」的字段：调用方拿它跟
+    // 上一发打过的地址比，相同就说明这一发还是同一个 /128，重试没有意义。
+    activeEgress: res.active_egress || null,
+    activeTag: res.active_tag || null,
     switched: Boolean(res.switched),
     switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
     reason: res.reason || (res.switched ? "ok" : "unknown"),

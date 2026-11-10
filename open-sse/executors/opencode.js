@@ -702,6 +702,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         failedEgress: context.failedEgress || null,
         failedEgressSince: context.failedEgressSince || null,
         proxyUrl: context.proxyUrl || null,
+        reqId: args?.reqId,
       });
     }
     clearProxyDispatchers();
@@ -784,6 +785,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         failedEgress: requestEgress,
         failedEgressSince: requestEgressSince,
         proxyUrl: egress?.proxyUrl || null,
+        reqId: args?.reqId,
       });
       // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
       //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
@@ -917,6 +919,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         failedEgress: requestEgress,
         failedEgressSince: requestEgressSince,
         proxyUrl: egress?.proxyUrl || null,
+        reqId: args?.reqId,
       });
       // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。

@@ -232,7 +232,7 @@ function callAsip(path, payload, signal = null) {
  */
 export async function rotateEgress(
   reason = "rate429",
-  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null } = {},
+  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null, reqId = null } = {},
 ) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted", lineChanged: false };
@@ -252,12 +252,24 @@ export async function rotateEgress(
     ...(failedEgress ? { egress_ip: failedEgress } : {}),
     ...(failedEgressSince > 0 ? { egress_since: failedEgressSince } : {}),
     ...(proxyUrl ? { egress_proxy_url: proxyUrl } : {}),
+    ...(reqId ? { req_id: String(reqId) } : {}),
   }, signal);
   // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
   // 调用方要据此提前重建连接（审查发现）。
   if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error, lineChanged: false };
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable", lineChanged: false };
   applyProxyCooldownFromResponse(proxyUrl, res);
+  // 排查通道：把请求 id、走的槽位端口、asip 结论写成一行。之前 /rotate 不带
+  // reqId，两边日志只能靠时间戳对，无法把一条失败请求钉到具体闸口/出口上。
+  if (reqId) {
+    console.warn(
+      "[ASIP] rotate req=" + reqId +
+      " port=" + (proxyUrl || "-") +
+      " reason=" + (res.reason || "?") +
+      " switched=" + Boolean(res.switched) +
+      " restart=" + Boolean(res.restart_required)
+    );
+  }
   // 六条闸都在后台修、没有端口能立刻接管：主链路不再同步兜底，改由本进程
   // 重启重建连接池，等闸回来。统一放在这里触发，429 / transport / 连接超时
   // 三条调用路径都覆盖到，不必每个 executor 各写一遍。

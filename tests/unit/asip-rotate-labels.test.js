@@ -352,6 +352,7 @@ describe("no healthy slot -> 9router restarts itself", () => {
     });
     expect(result.restartRequired).toBe(true);
     expect(result.lineUnknown).toBe(true);
+    expect(result.reason).toBe("no_healthy_slot");
     expect(result.switchToUrl).toBe(null);
     expect(result.lineChanged).toBe(false);
     clearAsipProxyCooling("http://127.0.0.1:7890");

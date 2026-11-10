@@ -166,6 +166,25 @@ describe("asip rotation without an alternate pool", () => {
     expect(result.response.status).toBe(429);
   });
 
+  it("does not retry when asip asks for a self-restart", async () => {
+    // 旧版 asip 无健康备槽时仍回 reason=ok，并且可能带上一个足以让主分支
+    // 判定「换过线」的 switchedAt。可这一刻没有任何可用闸口，1s 后本进程
+    // 还要自重启 —— 重试只会打在刚烧掉的原端口上、还撞上进程退出。
+    // restartRequired 必须对重试条件一票否决。
+    fetchMock.mockResolvedValueOnce(rateLimited());
+    rotateMock.mockResolvedValueOnce({
+      switched: false, switchedAt: Date.now() + 60_000,
+      reason: "ok", restartRequired: true,
+      lineUnknown: true, switchToUrl: null, lineChanged: false,
+    });
+
+    const result = await run("deadgate");
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.response.status).toBe(429);
+  });
+
   it("does not retry on a stale non-zero switchedAt", async () => {
     // coalesced / too_frequent 会回上一次换线的时间戳：非零，但远早于本次请求。
     // 只看「非零」会误判成换成功，所以 gate 必须比时间。

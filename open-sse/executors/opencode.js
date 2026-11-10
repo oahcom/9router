@@ -799,9 +799,13 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 这条请求之后被换掉了，手里这条连接还挂在它上面，重连一次就够。
       // line_ok：asip 用同一份指纹实测这条线仍然可用，明确没换线。按 asip
       // 结论重连一次、在同一出口上重试，比换掉一条还能用的线划算。
+      // （当前 asip 主链路已不再返回 line_ok，留着是兼容旧版回包。）
       const ROTATED_REASONS = ["ok", "coalesced", "too_frequent",
         "already_retired", "line_ok",];
-      const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
+      // restartRequired 一票否决：没有可用闸口时不要重连重试，本进程马上要
+      // 自重启，重试只会打在刚烧掉的原端口上、还撞上进程退出。
+      const rotateHappened = ROTATED_REASONS.includes(rotated.reason)
+        && !rotated.restartRequired;
       if (rotateHappened) {
         clearProxyDispatchers();
         // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
@@ -918,12 +922,14 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。
       // line_ok 与 already_retired 同理：asip 明确说这条线还能用（实测 OK），
       // 没换线。按 asip 结论重连一次，在同一出口上重试即可。
-      if (asip.switchedAt >= requestStartedAt
-          || asip.reason === "already_retired"
-          || asip.reason === "line_ok"
-          // 多端口：asip 指定了另一台 sing-box，这次重试就走它。独立进程、
-          // 独立连接池，等同于「已经换过出口」。
-          || Boolean(asip.switchToUrl)) {
+      // restartRequired 一票否决：无可用闸口时不重试，由自重启接管。
+      if (!asip.restartRequired
+          && (asip.switchedAt >= requestStartedAt
+              || asip.reason === "already_retired"
+              || asip.reason === "line_ok"
+              // 多端口：asip 指定了另一台 sing-box，这次重试就走它。独立进程、
+              // 独立连接池，等同于「已经换过出口」。
+              || Boolean(asip.switchToUrl))) {
         clearProxyDispatchers();
         // 主路径也必须 bump：sidecar 的 session key 是 proxy|generation，只清 undici
         // dispatcher 不影响 Bun 那边池化的 socket（原请求刚回 429，socket 还在池里）。

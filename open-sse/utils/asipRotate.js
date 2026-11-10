@@ -273,7 +273,11 @@ export async function rotateEgress(
       switchToEgress: res.switch_to_egress || null,
       switched: false,
       switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
-      reason: res.reason || "coalesced",
+      // 要自重启时统一改口成 no_healthy_slot。旧版 asip 在无健康备槽时仍回
+      // reason=ok/coalesced，opencode 的 429 早退分支会把它们当「换过线了，
+      // 重连再试一次」—— 明明没有可用闸口，还要在刚烧掉的原端口上多打一发，
+      // 而 1s 后本进程就退出了。在这里归一，三条 executor 调用路径一次覆盖。
+      reason: restartRequired ? "no_healthy_slot" : (res.reason || "coalesced"),
       lineChanged: false,
       lineUnknown: true,
       restartRequired,

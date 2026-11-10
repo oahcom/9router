@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import { canonicalProxyKey } from "./proxyResolution.js";
 
 /**
  * asip 同步轮换客户端。
@@ -23,6 +24,61 @@ const TIMEOUT_MS = Number(process.env.ASIP_TIMEOUT_MS || 2000);
 // 走到 429 分支，asip 的 /rotate 是真的切生产 sing-box 选择器 —— 一次测试就把
 // 线上出口换掉，而且结果取决于当时网络。测试里由 tests/setup.js 置 1。
 const DISABLED = process.env.ASIP_DISABLED === "1";
+
+// 槽位端口健康冷却：asip 报某个端口 429/transport 后，新请求在短窗口内跳过
+// 它；当前请求的 switchToUrl 即时重试不受影响。按规范化代理 URL 而不是 poolId
+// 记录，同一端口即使被多个池/连接引用也一起避开。只存内存，重启即清。
+const PROXY_COOLDOWN_DEFAULT_MS = Number(
+  process.env.ASIP_PROXY_COOLDOWN_MS || 15_000);
+const PROXY_COOLDOWN_MAX_MS = 60_000;
+const proxyCooldowns = new Map(); // canonical proxy url -> until epoch ms
+
+function proxyCooldownKey(proxyUrl) {
+  const raw = String(proxyUrl || "").trim();
+  if (!raw) return "";
+  return canonicalProxyKey(raw) || raw;
+}
+
+export function markAsipProxyCooling(proxyUrl, untilMs = 0, ttlMs = 0) {
+  const key = proxyCooldownKey(proxyUrl);
+  if (!key) return 0;
+  const now = Date.now();
+  const ttl = Number(ttlMs) > 0 ? Number(ttlMs) : PROXY_COOLDOWN_DEFAULT_MS;
+  const wanted = Number(untilMs) > now
+    ? Math.min(Number(untilMs), now + PROXY_COOLDOWN_MAX_MS)
+    : now + Math.max(1000, Math.min(ttl, PROXY_COOLDOWN_MAX_MS));
+  // 并发响应可能一个旧、一个新；只延长不缩短，避免迟到的旧回包提前放行坏端口。
+  const until = Math.max(proxyCooldowns.get(key) || 0, wanted);
+  proxyCooldowns.set(key, until);
+  return until;
+}
+
+export function isAsipProxyCooling(proxyUrl, now = Date.now()) {
+  const key = proxyCooldownKey(proxyUrl);
+  if (!key) return false;
+  const until = proxyCooldowns.get(key) || 0;
+  if (until <= now) {
+    proxyCooldowns.delete(key);
+    return false;
+  }
+  return true;
+}
+
+export function clearAsipProxyCooling(proxyUrl) {
+  const key = proxyCooldownKey(proxyUrl);
+  if (key) proxyCooldowns.delete(key);
+}
+
+function applyProxyCooldownFromResponse(proxyUrl, res) {
+  if (!proxyUrl || !res) return;
+  const untilSec = Number(res.avoid_port_until);
+  if (Number.isFinite(untilSec) && untilSec > 0) {
+    markAsipProxyCooling(proxyUrl, untilSec * 1000);
+  }
+  // line_ok 是 asip 实测同一出口仍可用的明确结论：把它从短冷却里提前放出，
+  // 否则一个本来健康的端口会被无谓跳过 15 秒。
+  if (res.reason === "line_ok") clearAsipProxyCooling(proxyUrl);
+}
 
 // 调用方据此决定「要不要为一次可能的重试先克隆 body」：asip 关着时克隆纯属浪费。
 export function asipRotationEnabled() {
@@ -138,10 +194,15 @@ function callAsip(path, payload, signal = null) {
  */
 export async function rotateEgress(
   reason = "rate429",
-  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null } = {},
+  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null } = {},
 ) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted", lineChanged: false };
+  // 先冷却坏端口，再等 asip 回话。asip 超时/不可达时本地也要能避开它；
+  // 当前调用随后会用 switchToUrl 显式改走健康端口，不受这个过滤影响。
+  if (proxyUrl && ["rate429", "abuse403", "transport"].includes(reason)) {
+    markAsipProxyCooling(proxyUrl);
+  }
   // requestStartedAt 让 asip 把坏账记到**发出这条请求时**的那条线。
   // 429 迟到几十秒，期间出口可能已经换过，此刻的活动线没承载过它。
   // failedEgress 让 asip 判断这条 429 追的地址是不是已经被换走了。
@@ -152,11 +213,30 @@ export async function rotateEgress(
     ...(requestStartedAt > 0 ? { request_started_at: requestStartedAt / 1000 } : {}),
     ...(failedEgress ? { egress_ip: failedEgress } : {}),
     ...(failedEgressSince > 0 ? { egress_since: failedEgressSince } : {}),
+    ...(proxyUrl ? { egress_proxy_url: proxyUrl } : {}),
   }, signal);
   // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
   // 调用方要据此提前重建连接（审查发现）。
   if (res && res.error) return { switched: false, switchedAt: 0, reason: res.error, lineChanged: false };
   if (!res) return { switched: false, switchedAt: 0, reason: "unavailable", lineChanged: false };
+  applyProxyCooldownFromResponse(proxyUrl, res);
+  // asip 说「这次不知道出口是谁」（并发抢锁失败）：不要碰本地记录。
+  // 那一瞬间 selector 正在被另一次切换改写，读到的任何身份都是旧的；写进去
+  // 就是用旧线覆盖真相，下一条 429 会带着错误出口去回溯。
+  if (res.line_unknown) {
+    return {
+      switchToUrl: res.switch_to_url || null,
+      switchToPool: res.switch_to || null,
+      switchToEgress: res.switch_to_egress || null,
+      switched: false,
+      switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
+      reason: res.reason || "coalesced",
+      lineChanged: false,
+      lineUnknown: true,
+      avoidPortUntil: Number.isFinite(Number(res.avoid_port_until))
+        ? Number(res.avoid_port_until) * 1000 : 0,
+    };
+  }
   // 接入时刻单独存：`noteActiveLine` 只在身份变化时才该改变 `lineChanged` 的
   // 判定，而 since 每次都要跟新 —— 同一个地址可能被 asip 重新确认过多次。
   if (typeof res.active_egress_since === "number" && res.active_egress_since > 0) {
@@ -167,10 +247,17 @@ export async function rotateEgress(
     lastEgressSince = null;
   }
   return {
+    // 多端口：asip 让这次重试改走另一台 sing-box 的端口。独立进程、独立连接
+    // 池，命中即可用，不需要等它换线。
+    switchToUrl: res.switch_to_url || null,
+    switchToPool: res.switch_to || null,
+    switchToEgress: res.switch_to_egress || null,
     switched: Boolean(res.switched),
     switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
     reason: res.reason || (res.switched ? "ok" : "unknown"),
     lineChanged: noteActiveLine(res.active_tag, res.active_egress),
+    avoidPortUntil: Number.isFinite(Number(res.avoid_port_until))
+      ? Number(res.avoid_port_until) * 1000 : 0,
   };
 }
 

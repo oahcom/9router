@@ -10,7 +10,9 @@ import { asipRotationEnabled, rotateEgress } from "../utils/asipRotate.js";
 // WARP 线的 selector。局域网里另一台机器的 7890（192.168.100.104:7890）是别人
 // 的 sing-box，直连的 provider 更是碰都不碰 sing-box；对这些流量 /rotate 只是
 // 白烧一条本地出口，还会把好线换走。
-const ASIP_PROXY_PORT = process.env.ASIP_LOCAL_PROXY_PORT || "7890";
+const ASIP_PROXY_PORTS = new Set(
+  String(process.env.ASIP_LOCAL_PROXY_PORT || "7890,7892,7893,7894,7895,7896")
+    .split(",").map(s => s.trim()).filter(Boolean));
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
 // 连接超时换线的冷却。一条真的坏掉的端点（域名写错、对端长期不可达）会持续
@@ -119,7 +121,7 @@ export class BaseExecutor {
       const parsed = new URL(String(rawUrl));
       if (!LOOPBACK_HOSTS.has(parsed.hostname)) return false;
       const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-      return port === ASIP_PROXY_PORT;
+      return ASIP_PROXY_PORTS.has(port);
     } catch {
       return false;
     }
@@ -139,7 +141,8 @@ export class BaseExecutor {
       return false;
     }
     lastConnectTimeoutRotateAt = now;
-    const res = await rotateEgress("transport", { signal });
+    const proxyUrl = proxyOptions?.url ?? proxyOptions?.connectionProxyUrl ?? null;
+    const res = await rotateEgress("transport", { signal, proxyUrl });
     // switched=false 可能只是并发合并（别人刚换过），switchedAt 才能证明「确实换过」。
     const rotated = Boolean(res?.switched) || Number(res?.switchedAt || 0) > 0;
     log?.warn?.(

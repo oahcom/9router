@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { fetchMock, rotateMock, enabledMock, bumpMock } = vi.hoisted(() => {
+const { fetchMock, rotateMock, enabledMock, bumpMock, cooldownMock } = vi.hoisted(() => {
   process.env.EGRESS_PROBE_MODE = "off";
   process.env.OPENCODE_TRANSPORT = "off";
   return {
@@ -8,6 +8,7 @@ const { fetchMock, rotateMock, enabledMock, bumpMock } = vi.hoisted(() => {
     rotateMock: vi.fn(),
     enabledMock: vi.fn(() => true),
     bumpMock: vi.fn(),
+    cooldownMock: vi.fn(),
   };
 });
 
@@ -26,6 +27,8 @@ vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: enabledMock,
+  // 目标端口失败后要把它打进短冷却，否则下一条新请求又选中它。
+  markAsipProxyCooling: cooldownMock,
   // 执行器每次请求都会读一次「当前出口地址」，429 时交给 asip 判断是否已被
   // 换走。白盒替换漏了它整个 executeInner 会抛 TypeError。
   currentAsipEgress: () => null,
@@ -98,6 +101,7 @@ async function run(text = "hi") {
 beforeEach(() => {
   fetchMock.mockReset();
   rotateMock.mockReset();
+  cooldownMock.mockReset();
   enabledMock.mockReset();
   enabledMock.mockReturnValue(true);
   bumpMock.mockReset();
@@ -257,6 +261,70 @@ describe("asip rotation without an alternate pool", () => {
     // 重放是「换线后的第二次机会」：asip 常回「出口正常不换线」，出口地址没变，
     // 再用 20s 判死就是把同一次失败重演一遍（实测 43s = 20+20 后 503）。
     expect(fetchMock.mock.calls[1][1].replayBudget).toBe(true);
+  });
+
+  it("retries the 429 on the healthy port asip pointed at", async () => {
+    // 多端口布局：asip 不再切 selector，而是让这次重试改走另一台 sing-box。
+    // 停在原端口重试等于在同一个坏进程上再撞一次。
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({
+      switched: true,
+      switchedAt: Date.now(),
+      reason: "rate429",
+      switchToUrl: "http://127.0.0.1:7893",
+      switchToEgress: "2606:slot3::1",
+      avoidPortUntil: 0,
+    });
+
+    const result = await run("switch-port");
+
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][2].url).toBe("http://127.0.0.1:7893");
+    expect(fetchMock.mock.calls[1][2].enabled).toBe(true);
+    // 目标端口没报错就不该冷却它。
+    expect(cooldownMock).not.toHaveBeenCalled();
+  });
+
+  it("retries when asip can only name a port (line_unknown)", async () => {
+    // 并发抢锁失败时 asip 不知道该说哪条线，但仍然知道哪台 sing-box 健康。
+    // 只看 switched 会白丢一个当场可用的出口。
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({
+      switched: false,
+      switchedAt: 0,
+      reason: "coalesced",
+      lineUnknown: true,
+      switchToUrl: "http://127.0.0.1:7894",
+      avoidPortUntil: 0,
+    });
+
+    const result = await run("line-unknown");
+
+    expect(result.response.status).toBe(200);
+    expect(fetchMock.mock.calls[1][2].url).toBe("http://127.0.0.1:7894");
+  });
+
+  it("cools the target port with the local default window", async () => {
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(rateLimited());
+    // 这个时刻属于**原端口**（asip 报的就是它）；目标端口是另一台进程，
+    // 不能被挪用，否则可能拿到一个早已过期的截止时间。
+    const sourcePortUntil = Date.now() + 12_000;
+    rotateMock.mockResolvedValueOnce({
+      switched: true,
+      switchedAt: Date.now(),
+      reason: "rate429",
+      switchToUrl: "http://127.0.0.1:7895",
+      switchToEgress: "2606:slot5::1",
+      avoidPortUntil: sourcePortUntil,
+    });
+
+    const result = await run("both-429");
+
+    expect(result.response.status).toBe(429);
+    expect(cooldownMock).toHaveBeenCalledWith("http://127.0.0.1:7895");
+    expect(cooldownMock).not.toHaveBeenCalledWith(
+      "http://127.0.0.1:7895", sourcePortUntil);
   });
 
   it("retries a stall on a fresh connection when asip is disabled", async () => {

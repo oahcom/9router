@@ -24,6 +24,13 @@ import { BaseExecutor, resetConnectTimeoutRotateState } from "../../open-sse/exe
 const LOCAL_PROXY = { url: "http://127.0.0.1:7890" };
 // 局域网里另一台机器的同名端口：换本机 asip 对它没有任何影响。
 const LAN_PROXY = { url: "http://192.168.100.104:7890" };
+// 多槽位布局：7892-7896 是另外几台本机 sing-box 进程，同样是「本机出口」。
+const SLOT_PROXY = { url: "http://127.0.0.1:7892" };
+// 只给 connectionProxyUrl（连接级代理）时，判定也必须认 —— 池解析出来的
+// proxyOptions 可能只有这个字段，漏读等于多槽位全都不换线。
+const CONNECTION_ONLY_PROXY = { connectionProxyUrl: "http://127.0.0.1:7892" };
+// 本机上但不是 sing-box 槽位端口（别的本地代理/桥）：换 asip 的选择器改不了它。
+const LOCAL_OTHER_PORT = { url: "http://127.0.0.1:1080" };
 
 function ok() {
   return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
@@ -95,6 +102,50 @@ describe("base executor: 连接超时换线", () => {
     expect(rotateMock.mock.calls[0][0]).toBe("transport");
     expect(executor.calls, "换线后应当只重试一次，没有第二次").toBe(2);
     expect(result.response.status).toBe(200);
+  });
+
+  it("经任一本机槽位端口（7892-7896）的连接超时都要换线", async () => {
+    // 7890 只是主出口那台进程；漏掉 7892-7896 等于多槽位布局下四分之五的
+    // 请求遇到连接超时都不自愈。
+    for (const port of ["7892", "7896"]) {
+      resetConnectTimeoutRotateState();
+      rotateMock.mockClear();
+      const executor = makeExecutor(["timeout", "ok"]);
+
+      const result = await run(executor, { url: `http://127.0.0.1:${port}` });
+
+      expect(rotateMock, `端口 ${port} 应当触发换线`).toHaveBeenCalledTimes(1);
+      // asip 要知道是哪台进程坏了：不带端口就只能盲换。
+      expect(rotateMock.mock.calls[0][1].proxyUrl).toBe(`http://127.0.0.1:${port}`);
+      expect(result.response.status).toBe(200);
+    }
+  });
+
+  it("只配了 connectionProxyUrl 时也要能换线", async () => {
+    const executor = makeExecutor(["timeout", "ok"]);
+
+    const result = await run(executor, CONNECTION_ONLY_PROXY);
+
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(rotateMock.mock.calls[0][1].proxyUrl).toBe("http://127.0.0.1:7892");
+    expect(result.response.status).toBe(200);
+  });
+
+  it("本机其它端口（非槽位）不换线", async () => {
+    // 换 asip 的选择器只影响 sing-box 自己的出站；别的本地代理不经过它。
+    const executor = makeExecutor(["timeout"]);
+
+    await expect(run(executor, LOCAL_OTHER_PORT)).rejects.toThrow(/aborted/i);
+
+    expect(rotateMock).toHaveBeenCalledTimes(0);
+  });
+
+  it("局域网上的槽位端口不换线", async () => {
+    const executor = makeExecutor(["timeout"]);
+
+    await expect(run(executor, { url: "http://192.168.100.104:7892" })).rejects.toThrow(/aborted/i);
+
+    expect(rotateMock).toHaveBeenCalledTimes(0);
   });
 
   it("局域网代理不换线：换本机 WARP 线对它没有任何作用", async () => {

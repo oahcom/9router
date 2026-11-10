@@ -14,7 +14,13 @@ const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "asip-labels-"));
 const SOCK = path.join(DIR, "rotate.sock");
 const TOKEN_FILE = path.join(DIR, "api-token");
 
-const { rotateEgress, forgetActiveLine } = await (async () => {
+const {
+  rotateEgress,
+  forgetActiveLine,
+  isAsipProxyCooling,
+  markAsipProxyCooling,
+  clearAsipProxyCooling,
+} = await (async () => {
   process.env.ASIP_SOCKET = SOCK;
   process.env.ASIP_TOKEN_FILE = TOKEN_FILE;
   process.env.ASIP_TIMEOUT_MS = "300";
@@ -144,6 +150,108 @@ describe("asip rotate error labels", () => {
     setTimeout(() => controller.abort(), 50);
     const result = await rotateEgress("rate429", { signal: controller.signal });
     expect(result.reason).toBe("aborted");
+  });
+});
+
+// 多端口：回包里的 switch_to_url / avoid_port_until 是 asip 给调用方的两个抓手。
+// 客户端这条链上（解析 -> 返回值 -> 冷却）任一处丢了字段，上层就只能盲重试。
+describe("multi-slot redirect fields", () => {
+  const SLOT_A = "http://127.0.0.1:7892";
+  const SLOT_B = "http://127.0.0.1:7893";
+
+  async function serveOnce(payload) {
+    return listen((socket) => {
+      socket.on("data", () => {
+        const body = JSON.stringify(payload);
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+            Buffer.byteLength(body) + "\r\n\r\n" + body
+        );
+      });
+    });
+  }
+
+  beforeEach(() => {
+    clearAsipProxyCooling(SLOT_A);
+    clearAsipProxyCooling(SLOT_B);
+  });
+
+  it("surfaces the healthy port asip points at", async () => {
+    await serveOnce({
+      ok: true,
+      switched: false,
+      reason: "coalesced",
+      switch_to: "slot-3",
+      switch_to_url: SLOT_B,
+      switch_to_egress: "2606:slot3::1",
+      avoid_port_until: 0,
+    });
+
+    const result = await rotateEgress("rate429", { proxyUrl: SLOT_A });
+
+    expect(result.switchToUrl).toBe(SLOT_B);
+    expect(result.switchToPool).toBe("slot-3");
+    expect(result.switchToEgress).toBe("2606:slot3::1");
+    // switched 仍然为 false：这一次调用什么都没换，只是指明了去处。
+    expect(result.switched).toBe(false);
+  });
+
+  it("converts avoid_port_until to epoch ms", async () => {
+    const untilSec = Math.floor(Date.now() / 1000) + 30;
+    await serveOnce({ ok: true, switched: false, reason: "coalesced", avoid_port_until: untilSec });
+
+    const result = await rotateEgress("rate429", { proxyUrl: SLOT_A });
+
+    expect(result.avoidPortUntil).toBe(untilSec * 1000);
+  });
+
+  it("keeps the port when asip cannot tell which line it is (line_unknown)", async () => {
+    // 并发抢锁失败：line 身份不可信，但那台健康进程的名字照样可给。
+    await serveOnce({
+      ok: true,
+      line_unknown: true,
+      reason: "coalesced",
+      switch_to_url: SLOT_B,
+      avoid_port_until: 0,
+    });
+
+    const result = await rotateEgress("rate429", { proxyUrl: SLOT_A });
+
+    expect(result.lineUnknown).toBe(true);
+    expect(result.switchToUrl).toBe(SLOT_B);
+    expect(result.lineChanged).toBe(false);
+  });
+
+  it("cools the failed port before waiting for asip", async () => {
+    // asip 没在跑（连不上）：本地也必须立刻避开这个端口，否则下一条新请求
+    // 还会选中它，把同一个 429 演一遍。
+    const result = await rotateEgress("rate429", { proxyUrl: SLOT_A });
+
+    expect(result.reason).toBe("socket");
+    expect(isAsipProxyCooling(SLOT_A)).toBe(true);
+    // 另一台进程不该被连坐。
+    expect(isAsipProxyCooling(SLOT_B)).toBe(false);
+  });
+
+  it("does not cool the port for reasons that are not egress faults", async () => {
+    // 只有 rate429 / abuse403 / transport 才说明「这个端口刚出错」。其余原因
+    // （手动换线等）把它关进冷却，等于凭空调走一条好出口。
+    await serveOnce({ ok: true, switched: true, reason: "ok", active_tag: "WG-7", active_egress: "1.1.1.1" });
+
+    await rotateEgress("manual", { proxyUrl: SLOT_A });
+
+    expect(isAsipProxyCooling(SLOT_A)).toBe(false);
+  });
+
+  it("releases the port when asip proves the line is fine", async () => {
+    markAsipProxyCooling(SLOT_A);
+    expect(isAsipProxyCooling(SLOT_A)).toBe(true);
+    await serveOnce({ ok: false, reason: "line_ok", active_tag: "WG-7", active_egress: "1.1.1.1" });
+
+    await rotateEgress("rate429", { proxyUrl: SLOT_A });
+
+    // asip 用同一份指纹实测这条线仍可用：提前放出来，别白等 15s。
+    expect(isAsipProxyCooling(SLOT_A)).toBe(false);
   });
 });
 

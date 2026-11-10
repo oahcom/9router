@@ -73,6 +73,32 @@ describe("OpenCode transport failure failover", () => {
     expect(result.response.status).toBe(503);
   });
 
+  // 多端口：asip 在 transport 这条路上同样会指定一台健康 sing-box。不跟着走
+  // 的话，重放仍然撞在原来那台已经卡死的进程上 —— 等于只换了个 generation。
+  it("moves the stall replay onto the port asip named", async () => {
+    failureRef.value = "header-timeout";
+    rotateMock.mockResolvedValueOnce({
+      switched: true,
+      switchedAt: Date.now(),
+      reason: "ok",
+      switchToUrl: "http://127.0.0.1:7893",
+      switchToEgress: "2606:slot3::1",
+      avoidPortUntil: 0,
+    });
+    const executor = getExecutor("opencode");
+    await executor.execute({
+      model: "deepseek-v4.1-flash-free",
+      body: { messages: [{ role: "user", content: "hello" }] },
+      stream: false,
+      credentials: { connectionId: "conn", rawHeaders: {} },
+    });
+
+    expect(transportMock).toHaveBeenCalledTimes(2);
+    // 3rd arg 就是传给 proxyAwareFetch/侧车的 proxyOptions。
+    expect(transportMock.mock.calls[1][2].url).toBe("http://127.0.0.1:7893");
+    expect(transportMock.mock.calls[1][2].enabled).toBe(true);
+  });
+
   // 实测 10:33:18 换线成功 → 10:33:20 撞 429 → 重试 → 10:33:38 header timeout
   // → 直接 503 返回客户端。429 末尾那次重试绕开了 503 处理段，那条路上
   // 曾经一次都不重试。

@@ -17,6 +17,7 @@ import {
   rotateEgress,
   currentAsipEgress,
   currentAsipEgressSince,
+  markAsipProxyCooling,
 } from "../utils/asipRotate.js";
 import { classifyRotateReason } from "../utils/egressClassify.js";
 
@@ -676,6 +677,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       requestStartedAt: usedCredentials.requestStartedAt || 0,
       failedEgress: usedCredentials.requestEgress || null,
       failedEgressSince: usedCredentials.requestEgressSince || null,
+      proxyUrl: usedCredentials.requestProxyUrl || null,
     };
     return (await this.retryOnceAfterStall(result, replayArgs, replayContext)) ?? result;
   }
@@ -699,6 +701,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         requestStartedAt: context.requestStartedAt || 0,
         failedEgress: context.failedEgress || null,
         failedEgressSince: context.failedEgressSince || null,
+        proxyUrl: context.proxyUrl || null,
       });
     }
     clearProxyDispatchers();
@@ -713,7 +716,14 @@ export class OpenCodeExecutor extends BaseExecutor {
     // replayBudget：这一趟是「换线后的第二次机会」，asip 经常判「出口正常」不换
     // 线（它的探针是小请求，小请求能过、大请求挂着），于是出口地址没变；再按
     // 首次的 20s 判死就是把同一次失败重演一遍（实测 43s = 20+20 后 503）。
-    return await super.execute({ ...args, replayBudget: true });
+    // 多端口：asip 给了健康备槽时必须真的改走它，否则 transport 重试仍撞旧端口。
+    return await super.execute({
+      ...args,
+      replayBudget: true,
+      proxyOptions: rotation?.switchToUrl
+        ? { ...(args.proxyOptions || {}), url: rotation.switchToUrl, enabled: true }
+        : args.proxyOptions,
+    });
   }
 
   async executeInner(args) {
@@ -773,6 +783,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         requestStartedAt,
         failedEgress: requestEgress,
         failedEgressSince: requestEgressSince,
+        proxyUrl: egress?.proxyUrl || null,
       });
       // 只有真换过线才清冷却 / 重建连接 / 重试。asip 的没换线理由要分开看：
       //   ok / coalesced / too_frequent —— 换线发生在 gap 内（coalesce_ms=800ms；
@@ -786,7 +797,10 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 「没换线也当换过了」。
       // already_retired 是同一件事的另一面：asip 没换线，但那条隧道**已经**在
       // 这条请求之后被换掉了，手里这条连接还挂在它上面，重连一次就够。
-      const ROTATED_REASONS = ["ok", "coalesced", "too_frequent", "already_retired"];
+      // line_ok：asip 用同一份指纹实测这条线仍然可用，明确没换线。429 不是出口
+      // 坏了，重连一次、在同一出口上重试，比换掉一条还能用的线划算。
+      const ROTATED_REASONS = ["ok", "coalesced", "too_frequent",
+        "already_retired", "line_ok",];
       const rotateHappened = ROTATED_REASONS.includes(rotated.reason);
       if (rotateHappened) {
         clearProxyDispatchers();
@@ -803,9 +817,21 @@ export class OpenCodeExecutor extends BaseExecutor {
           ...args,
           log,
           credentials: retryPrepared,
-          proxyOptions,
+          // asip 指定了另一台 sing-box：这次重试改走它，别在原端口上再撞一次。
+          proxyOptions: rotated.switchToUrl
+            ? { ...proxyOptions, url: rotated.switchToUrl, enabled: true }
+            : proxyOptions,
         });
+        if (rotated.switchToUrl && args.usedCredentials) {
+          // 后续若因 503 进入 execute() 的重放，必须知道刚发到的是目标端口。
+          args.usedCredentials.requestProxyUrl = rotated.switchToUrl;
+          args.usedCredentials.requestEgress = rotated.switchToEgress || null;
+        }
         if (retried?.response && retried.response.status !== 429) return retried;
+        // 目标端口也 429：按本地默认窗口冷却，避免下一条新请求又选中它。
+        // 不能套 rotated.avoidPortUntil —— 那是**原端口**的整修截止时刻，挪到
+        // 目标端口上很可能已经过去，等于给了一副空冷却。
+        if (rotated.switchToUrl) markAsipProxyCooling(rotated.switchToUrl);
       } else if (rotated.reason === "timeout") {
         // 超时 = asip 已经在换、只是没等到回话：这次不重试（结果不确定），
         // 但那条隧道确实在换，必须让 sidecar 重建 —— 否则下一条请求继续骑着它，
@@ -842,6 +868,9 @@ export class OpenCodeExecutor extends BaseExecutor {
       args.usedCredentials.value = prepared;
       args.usedCredentials.log = log;
       args.usedCredentials.requestStartedAt = requestStartedAt;
+      // 重放要知道刚才走的是哪台 sing-box：egress 只在本函数作用域里，
+      // 重放函数看不到它，必须把它带出来。
+      args.usedCredentials.requestProxyUrl = egress?.proxyUrl || null;
       args.usedCredentials.requestEgress = requestEgress;
       args.usedCredentials.requestEgressSince = requestEgressSince;
     }
@@ -883,10 +912,18 @@ export class OpenCodeExecutor extends BaseExecutor {
         requestStartedAt,
         failedEgress: requestEgress,
         failedEgressSince: requestEgressSince,
+        proxyUrl: egress?.proxyUrl || null,
       });
       // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。
-      if (asip.switchedAt >= requestStartedAt || asip.reason === "already_retired") {
+      // line_ok 与 already_retired 同理：asip 明确说这条线还能用（实测 OK），
+      // 没换线。429 不是出口级封禁，重连一次在同一出口上重试即可。
+      if (asip.switchedAt >= requestStartedAt
+          || asip.reason === "already_retired"
+          || asip.reason === "line_ok"
+          // 多端口：asip 指定了另一台 sing-box，这次重试就走它。独立进程、
+          // 独立连接池，等同于「已经换过出口」。
+          || Boolean(asip.switchToUrl)) {
         clearProxyDispatchers();
         // 主路径也必须 bump：sidecar 的 session key 是 proxy|generation，只清 undici
         // dispatcher 不影响 Bun 那边池化的 socket（原请求刚回 429，socket 还在池里）。
@@ -896,13 +933,25 @@ export class OpenCodeExecutor extends BaseExecutor {
           ...args,
           log,
           credentials: prepared,
-          proxyOptions,
+          proxyOptions: asip.switchToUrl
+            ? { ...proxyOptions, url: asip.switchToUrl, enabled: true }
+            : proxyOptions,
           ...(retryBody ? { body: retryBody } : {}),
         });
+        if (asip.switchToUrl && args.usedCredentials) {
+          // 目标端口失败后若触发外层 transport 重放，context 必须指向 B 而不是 A。
+          args.usedCredentials.requestProxyUrl = asip.switchToUrl;
+          args.usedCredentials.requestEgress = asip.switchToEgress || null;
+        }
         if (rotatedResult?.response
             && rotatedResult.response.status !== 429
             && !(upstreamStatus === 403 && rotatedResult.response.status === 403)) {
           return rotatedResult;
+        }
+        // 换到目标端口仍 429：目标端口本身也进入短冷却，下条新请求才会避开。
+        // avoidPortUntil 描述的是原端口的整修截止时刻，与目标端口无关，不套用。
+        if (asip.switchToUrl && rotatedResult?.response?.status === 429) {
+          markAsipProxyCooling(asip.switchToUrl);
         }
         result = rotatedResult ?? result;
       } else {

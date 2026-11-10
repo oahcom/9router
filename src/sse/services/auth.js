@@ -1,5 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
+import { isAsipProxyCooling } from "open-sse/utils/asipRotate.js";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
@@ -52,7 +53,13 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       let allPools = [];
       if (strategy !== "none") {
         allPools = await getProxyPools({ isActive: true });
-        const poolIds = allPools.filter(p => p.proxyUrl).map(p => p.id);
+        const usable = allPools.filter(p => p.proxyUrl);
+        // 槽位刚报过 429/transport 的端口在短 TTL 内不参与新请求轮询。只过滤
+        // “下一个新请求选哪个池”，当前请求的 switchToUrl 即时重试不经过这里。
+        const fresh = usable.filter(p => !isAsipProxyCooling(p.proxyUrl));
+        const poolIds = (fresh.length ? fresh : usable).map(p => p.id);
+        // 极端情况下全部池都在冷却：退回完整列表，绝不能传空数组 —— 空数组会
+        // 解析成无代理，非 strict 场景直接走直连 IP。
         pickedId = pickProxyPoolId(poolIds, strategy, providerId);
       }
       const resolvedProxy = await resolveConnectionProxyConfig({ proxyPoolId: pickedId || "" });

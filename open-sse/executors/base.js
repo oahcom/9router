@@ -4,7 +4,7 @@ import { proxyAwareFetch, clearProxyDispatchers } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
-import { asipRotationEnabled, rotateEgress, currentAsipEgress } from "../utils/asipRotate.js";
+import { asipRotationEnabled, rotateEgress, asipEgressForPort } from "../utils/asipRotate.js";
 
 // 只有经本机 sing-box 出去的流量才受 asip 换线影响 —— 换的是 sing-box 里那条
 // WARP 线的 selector。局域网里另一台机器的 7890（192.168.100.104:7890）是别人
@@ -194,8 +194,9 @@ export class BaseExecutor {
       return null;
     }
     const proxyUrl = proxyOptions?.url ?? proxyOptions?.connectionProxyUrl ?? null;
-    // 换线前的出口身份：asip 换完之后 lastSeenLine 会被改写，必须提前取。
-    const before = currentAsipEgress();
+    // 换线前的出口身份：按端口取。进程级快照（currentAsipEgress）在并发下会被
+    // 别的请求覆写，把无辜的地址报给 asip 当「刚撞墙的地址」。
+    const before = await asipEgressForPort(proxyUrl, { signal });
     let res = null;
     try {
       res = await rotateEgress("rate429", {
@@ -203,7 +204,8 @@ export class BaseExecutor {
         requestStartedAt,
         proxyUrl,
         reqId,
-        failedEgress: before,
+        failedEgress: before?.egress || null,
+        failedEgressSince: before?.since || null,
       });
     } catch (error) {
       log?.warn?.("EGRESS", `429 rotate failed on ${proxyUrl || "-"}: ${error?.message || error}`);

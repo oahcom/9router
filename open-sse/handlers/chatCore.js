@@ -7,6 +7,7 @@ import { createStreamController } from "../utils/streamHandler.js";
 import { newRequestId } from "@/sse/utils/logger.js";
 import { refreshWithRetry } from "../services/tokenRefresh.js";
 import { createRequestLogger } from "../utils/requestLogger.js";
+import { runWithReqId } from "../utils/requestContext.js";
 import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
@@ -396,7 +397,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // exception: it is decoded by the executor into OpenAI-compatible output.
   let providerResponseFormat = targetFormat;
   try {
-    const result = await executor.execute({
+    // 把 reqId 放进请求上下文：proxyFetch 的连接失败换线在 fetch 调用栈深处，
+    // 拿不到参数，之前它的 /rotate 在 asip 侧全是 req=-（实测 281 条），
+    // 失败请求无法按号对账。ALS 沿 await 链自动传播，一次覆盖整条路径。
+    const result = await runWithReqId(reqId, () => executor.execute({
       model,
       body: translatedBody,
       stream,
@@ -408,7 +412,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       reqId,
       proxyOptions,
       providerOverrides,
-    });
+    }));
     providerResponse = result.response;
     providerUrl = result.url;
     providerHeaders = result.headers;
@@ -466,7 +470,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
-          const retryResult = await executor.execute({
+          const retryResult = await runWithReqId(reqId, () => executor.execute({
             model,
             body: translatedBody,
             stream,
@@ -478,7 +482,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
             reqId,
             proxyOptions,
             providerOverrides,
-          });
+          }));
           if (retryResult.response.ok) {
             providerResponse = retryResult.response;
             providerUrl = retryResult.url;

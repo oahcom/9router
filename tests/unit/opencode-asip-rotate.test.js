@@ -27,6 +27,8 @@ vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: enabledMock,
+  // 执行器按端口取出口身份；mock 里一律「未知」，等价于改动前的 null。
+  asipEgressForPort: async () => ({ egress: null, since: null }),
   // 目标端口失败后要把它打进短冷却，否则下一条新请求又选中它。
   markAsipProxyCooling: cooldownMock,
   // 执行器每次请求都会读一次「当前出口地址」，429 时交给 asip 判断是否已被

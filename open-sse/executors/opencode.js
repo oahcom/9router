@@ -15,8 +15,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import {
   asipRotationEnabled,
   rotateEgress,
-  currentAsipEgress,
-  currentAsipEgressSince,
+  asipEgressForPort,
   markAsipProxyCooling,
 } from "../utils/asipRotate.js";
 import { classifyRotateReason } from "../utils/egressClassify.js";
@@ -789,11 +788,16 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 让 asip 对照自己的换线表判断「它是不是在本次请求之后被换走了」 ——
     // 是就不用再烧一条新线，重连即可。proxy 模式下客户端探不到这个地址
     // （identifyFixedEgress 对 proxy/relay 一律 ip:null），只能由 asip 给。
-    const requestEgress = currentAsipEgress();
+    // 按端口取，不用进程级快照：那个值会被并发请求覆写（实测 52% 的报障地址
+    // 与本槽出口不在同一个 /64），传给 asip 会误判 already_retired 并罚错线。
+    const requestProxyUrl = args.proxyOptions?.url
+      || args.proxyOptions?.connectionProxyUrl || null;
+    const requestLine = await asipEgressForPort(requestProxyUrl, { signal: args.signal });
+    const requestEgress = requestLine.egress;
     // 那个地址是什么时候接上的。单有地址分不清「已经切走」和「切走之前发出的
     // 429」—— 前者重连即可，后者必须真换线。带上接入时刻，asip 才能判断这个
     // 缓存值在请求发出时是否已经就位。
-    const requestEgressSince = currentAsipEgressSince();
+    const requestEgressSince = requestLine.since;
     // Every warn this request emits carries its short id, so the EGRESS lines
     // (rotate / cooling) and the final ERROR can be stitched together without
     // guessing from timestamps. Call sites stay untouched.

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { canonicalProxyKey } from "./proxyResolution.js";
 import { getWritableDataDir } from "./writableDataDir.js";
+import { currentReqId } from "./requestContext.js";
 
 /**
  * asip 同步轮换客户端。
@@ -287,6 +288,10 @@ export async function rotateEgress(
   reason = "rate429",
   { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null, reqId = null, retryAfterMs = 0 } = {},
 ) {
+  // 调用方没带 reqId 时退回请求上下文：proxyFetch 那一层拿不到请求标识，
+  // 它发起的 transport 换线在 asip 侧于是全是 req=-（实测 281 条），
+  // 无法按请求串日志。这里统一兜底，三条调用路径一次覆盖。
+  reqId = reqId || currentReqId();
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted", lineChanged: false };
   // 先冷却坏端口，再等 asip 回话。asip 超时/不可达时本地也要能避开它；
@@ -367,6 +372,10 @@ export async function rotateEgress(
     // 沿用上一个地址的时刻：那个时刻属于另一个地址，拿来判断只会得到错误结论。
     lastEgressSince = null;
   }
+  // 这台闸现在的出口身份记到端口名上（不是进程级全局）：下一次同端口的
+  // 请求带着 failedEgress 回去时，才是它自己那条线的地址。
+  notePortLine(proxyUrl, res.active_tag, res.active_egress,
+               res.active_egress_since);
   return {
     // 多端口：asip 让这次重试改走另一台 sing-box 的端口。独立进程、独立连接
     // 池，命中即可用，不需要等它换线。
@@ -406,7 +415,121 @@ let lastSeenLine = null;
 // 已经就位」。
 let lastEgressSince = null;
 
-/** 本进程最近一次从 asip 那里看到的出口地址。 */
+// ── 每端口一份出口身份 ──────────────────────────────────────────────────
+// 上面 lastSeenLine 是**进程级**全局：任意并发请求的 /rotate 都会覆写它。
+// 拿它当「这条请求骑的地址」是错的 —— 实测 277 条带报障地址的记录里，144 条
+// 与本槽出口不在同一个 /64，就是被别的请求覆写的残留值。asip 拿这个错地址去
+// 判 already_retired、去 avoid，惩罚的全是无辜的线。
+//
+// 端口是稳定键：9router 只知道 127.0.0.1:789N，而每台 sing-box 的 selector
+// 才是「这台闸现在挂哪条线」。所以身份按端口存，来源有两条：
+//   1. /rotate 的回包里 active_tag / active_egress（该端口权威值）；
+//   2. /slots 快照（带 port 字段），用来填还没有过 rotate 记录的端口。
+const PORT_LINES = new Map(); // "7896" -> { tag, egress, since, at }
+let slotSnapshot = null; // { at, byPort: Map }
+const SLOT_SNAPSHOT_TTL_MS = 5000;
+// asip 会主动换线（proactive），端口上挂的地址随时可能变，而 /rotate 回包只在
+// 出事时才来。缓存不放过期时间的话，一条几小时前记下的地址会被一直当成
+// failedEgress 报回去 —— 这就又变回「全局旧值」了，只是按端口分了份。
+const PORT_LINE_TTL_MS = Number(process.env.ASIP_PORT_LINE_TTL_MS || 30000);
+
+function portOfProxyUrl(proxyUrl) {
+  const m = /:(\d+)\/?$/.exec(String(proxyUrl || "").trim());
+  return m ? m[1] : null;
+}
+
+/** 记下某个端口当前的出口身份（/rotate 回包里拿到的权威值）。 */
+export function notePortLine(proxyUrl, tag, egress, since) {
+  const port = portOfProxyUrl(proxyUrl);
+  if (!port) return;
+  const sinceNum = Number(since);
+  PORT_LINES.set(port, {
+    tag: tag || null,
+    egress: egress || null,
+    since: Number.isFinite(sinceNum) && sinceNum > 0 ? sinceNum : null,
+    at: Date.now(),
+  });
+}
+
+/** 只知道端口的同步查询；查不到就返回 null，调用方自行决定要不要问 asip。 */
+export function egressForPort(proxyUrl) {
+  const port = portOfProxyUrl(proxyUrl);
+  if (!port) return { egress: null, since: null };
+  const st = PORT_LINES.get(port);
+  return { egress: st?.egress || null, since: st?.since ?? null };
+}
+
+/**
+ * 问 asip 每台闸当前挂着哪个出口，灌进 PORT_LINES。
+ *
+ * 5 秒一次：/slots 要逐槽问 sing-box 的 clash API（6 次本地 HTTP），按请求
+ * 打会把换线决策的成本摊到每一条流量上。慢 5 秒的代价只是「这一发自带地址
+ * 可能旧一点」，asip 那边还有 requestStartedAt 兜底。
+ */
+export async function refreshSlotEgress({ signal = null } = {}) {
+  const now = Date.now();
+  if (slotSnapshot && now - slotSnapshot.at < SLOT_SNAPSHOT_TTL_MS) {
+    return slotSnapshot.byPort;
+  }
+  const res = await callAsip("/slots", null, signal);
+  if (!res || res.error || !Array.isArray(res.slots)) {
+    return slotSnapshot?.byPort || null;
+  }
+  const byPort = new Map();
+  for (const s of res.slots) {
+    if (!s || s.port == null) continue;
+    const port = String(s.port);
+    byPort.set(port, { tag: s.tag || null, egress: s.egress || null, since: null });
+    const cur = PORT_LINES.get(port);
+    // rotate 回包带 since 且还新鲜时比快照权威，不覆盖；过期或地址对不上就
+    // 必须以 /slots 为准，否则主动换线之后我们还在拿旧地址回溯。
+    const fresh = cur?.at && now - cur.at < PORT_LINE_TTL_MS;
+    const snapEgress = s.egress || null;
+    if (!cur || !cur.egress || !fresh || cur.egress !== snapEgress) {
+      PORT_LINES.set(port, {
+        tag: s.tag || null,
+        egress: snapEgress,
+        // 地址变了，旧 since 属于另一条线，不能沿用。
+        since: cur && cur.egress === snapEgress ? (cur.since ?? null) : null,
+        at: now,
+      });
+    }
+  }
+  slotSnapshot = { at: now, byPort };
+  return byPort;
+}
+
+/** 这条请求走的端口现在挂着哪个出口。查不到时问一次 /slots。 */
+export async function asipEgressForPort(proxyUrl, { signal = null } = {}) {
+  const port = portOfProxyUrl(proxyUrl);
+  if (!port) return { egress: null, since: null };
+  const cached = PORT_LINES.get(port);
+  const now = Date.now();
+  if (cached?.egress && now - (cached.at || 0) < PORT_LINE_TTL_MS) {
+    return { egress: cached.egress, since: cached.since ?? null };
+  }
+  await refreshSlotEgress({ signal });
+  const after = PORT_LINES.get(port);
+  // /slots 不可达时宁可报「未知」，也不要拿一份过期身份去判 already_retired。
+  const refreshed = after?.at && Date.now() - after.at < PORT_LINE_TTL_MS;
+  return {
+    egress: refreshed ? (after.egress || null) : null,
+    since: refreshed ? (after.since ?? null) : null,
+  };
+}
+
+/** 仅测试用：清空端口身份表与 /slots 快照缓存，让用例之间互不污染。 */
+export function resetPortLinesForTest() {
+  PORT_LINES.clear();
+  slotSnapshot = null;
+}
+
+/**
+ * 本进程最近一次从 asip 那里看到的出口地址。
+ *
+ * @deprecated 这是**进程级**值，不是「这条请求骑的地址」，并发下必错。诊断
+ * 用途尚可，绝不能当 failedEgress 传给 asip —— 用 asipEgressForPort(proxyUrl)。
+ */
 export function currentAsipEgress() {
   return lastSeenLine ? lastSeenLine.split("|")[1] || null : null;
 }

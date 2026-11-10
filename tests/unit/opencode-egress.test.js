@@ -15,6 +15,8 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: () => true,
+  // 执行器按端口取出口身份；mock 里一律「未知」，等价于改动前的 null。
+  asipEgressForPort: async () => ({ egress: null, since: null }),
   // 执行器每个请求读一次当前出口地址，429 时交给 asip 查换线表。
   currentAsipEgress: () => null,
   currentAsipEgressSince: () => null,

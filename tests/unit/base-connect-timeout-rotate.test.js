@@ -8,6 +8,8 @@ const { rotateMock, enabledMock } = vi.hoisted(() => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: enabledMock,
+  // 执行器按端口取出口身份；mock 里一律「未知」，等价于改动前的 null。
+  asipEgressForPort: async () => ({ egress: null, since: null }),
   currentAsipEgress: () => null,
   currentAsipEgressSince: () => null,
 }));

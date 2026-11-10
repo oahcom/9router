@@ -285,7 +285,7 @@ function callAsip(path, payload, signal = null) {
  */
 export async function rotateEgress(
   reason = "rate429",
-  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null, reqId = null } = {},
+  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null, reqId = null, retryAfterMs = 0 } = {},
 ) {
   // 客户端已经断开时不必再换线：换了服务的是别人，白烧一次出口。
   if (signal?.aborted) return { switched: false, switchedAt: 0, reason: "aborted", lineChanged: false };
@@ -301,6 +301,7 @@ export async function rotateEgress(
   // 请求发出时是否已经就位 —— 只有就位过的地址，「已换走」才是可下的结论。
   const res = await callAsip("/rotate", {
     reason,
+    ...(retryAfterMs > 0 ? { retry_after_ms: Math.round(retryAfterMs) } : {}),
     ...(requestStartedAt > 0 ? { request_started_at: requestStartedAt / 1000 } : {}),
     ...(failedEgress ? { egress_ip: failedEgress } : {}),
     ...(failedEgressSince > 0 ? { egress_since: failedEgressSince } : {}),

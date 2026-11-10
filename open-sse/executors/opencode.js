@@ -718,13 +718,46 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 线（它的探针是小请求，小请求能过、大请求挂着），于是出口地址没变；再按
     // 首次的 20s 判死就是把同一次失败重演一遍（实测 43s = 20+20 后 503）。
     // 多端口：asip 给了健康备槽时必须真的改走它，否则 transport 重试仍撞旧端口。
-    return await super.execute({
+    const replayStartedAt = Date.now();
+    const replayResult = await super.execute({
       ...args,
       replayBudget: true,
       proxyOptions: rotation?.switchToUrl
         ? { ...(args.proxyOptions || {}), url: rotation.switchToUrl, enabled: true }
         : args.proxyOptions,
     });
+    // 重放走的是 BaseExecutor，绕开了 executeInner 里的 429 处置链。若不在这里
+    // 补一次记账，「transport 卡住 → 秒切 → 重放撞 429」这条路径上的失败对系统
+    // 零影响：目标出口既不标脏、目标端口也不冷却，随后几分钟会被反复复用
+    // （2026-11-10 21:22 实测：同一 /128 被复用 ≥4 次、6分47秒后才被别的请求拉黑）。
+    // 只报障记账、绝不再重放，所以不会形成「重放 → 换线 → 重放」循环。
+    // proxyUrl 取重放真正走的那台闸：换了端口就是 switchToUrl，没换就是原端口。
+    // rotateEgress("rate429") 内部已自带 markAsipProxyCooling(proxyUrl)，
+    // asip 侧 finally 也会按既定口径起后台修，这里不重复实现。
+    const accountingProxyUrl = rotation?.switchToUrl || context?.proxyUrl || null;
+    if (replayResult?.response?.status === 429 && rotation && accountingProxyUrl) {
+      try {
+        const replayRetryAfterMs = parseRetryAfterMs(
+          replayResult.response.headers,
+          await readResponseText(replayResult.response),
+        );
+        const accounted = await rotateEgress("rate429", {
+          signal: args?.signal,
+          requestStartedAt: replayStartedAt,
+          failedEgress: rotation.switchToEgress || context?.failedEgress || null,
+          proxyUrl: accountingProxyUrl,
+          reqId: args?.reqId,
+          retryAfterMs: replayRetryAfterMs || 0,
+        });
+        args.log?.warn?.(
+          "EGRESS",
+          `replay 429 -> accounting on ${accountingProxyUrl} (${accounted?.reason ?? "no-reply"}); no second replay`,
+        );
+      } catch (error) {
+        args.log?.warn?.("EGRESS", `replay 429 accounting failed: ${error?.message ?? String(error)}`);
+      }
+    }
+    return replayResult;
   }
 
   async executeInner(args) {
@@ -913,6 +946,12 @@ export class OpenCodeExecutor extends BaseExecutor {
       );
     }
     if (retryBody || typeof args.body === "string") {
+      // 上游 429 的 Retry-After 必须透传给 asip 写 ban_until：默认 60s 回池
+      // 与实测 11~13h 的额度封禁严重错配，标脏当天就会被重新选中。
+      // readResponseText 用 response.clone()，不影响后面再读一次正文。
+      const rotateRetryAfterMs = upstreamStatus === 429
+        ? parseRetryAfterMs(result.response.headers, await readResponseText(result.response))
+        : null;
       const asip = await rotateEgress(rotateReason, {
         signal: args?.signal,
         requestStartedAt,
@@ -920,6 +959,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         failedEgressSince: requestEgressSince,
         proxyUrl: egress?.proxyUrl || null,
         reqId: args?.reqId,
+        retryAfterMs: rotateRetryAfterMs || 0,
       });
       // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。

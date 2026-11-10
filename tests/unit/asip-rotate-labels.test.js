@@ -199,6 +199,31 @@ describe("multi-slot redirect fields", () => {
     expect(result.switched).toBe(false);
   });
 
+  it("forwards retry_after_ms so asip can write a long ban_until", async () => {
+    let seen = null;
+    await listen((socket) => {
+      socket.on("data", (chunk) => {
+        const text = chunk.toString("utf8");
+        const marker = "\r\n\r\n";
+        const at = text.indexOf(marker);
+        const body = JSON.stringify({ ok: true, switched: false, reason: "coalesced", avoid_port_until: 0 });
+        if (at >= 0) {
+          try { seen = JSON.parse(text.slice(at + marker.length)); } catch {}
+        }
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+            Buffer.byteLength(body) + "\r\n\r\n" + body
+        );
+      });
+    });
+
+    await rotateEgress("rate429", { proxyUrl: SLOT_A, retryAfterMs: 43200 * 1000 });
+
+    expect(seen).not.toBeNull();
+    expect(seen.retry_after_ms).toBe(43200 * 1000);
+    expect(seen.reason).toBe("rate429");
+  });
+
   it("converts avoid_port_until to epoch ms", async () => {
     const untilSec = Math.floor(Date.now() / 1000) + 30;
     await serveOnce({ ok: true, switched: false, reason: "coalesced", avoid_port_until: untilSec });

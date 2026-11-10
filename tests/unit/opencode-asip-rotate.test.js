@@ -65,6 +65,22 @@ function rateLimited() {
   );
 }
 
+function rateLimitedWithRetry(seconds = 43200) {
+  return new Response(
+    JSON.stringify({
+      type: "error",
+      error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
+    }),
+    {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": String(seconds),
+      },
+    },
+  );
+}
+
 function stalled(failure = "header-timeout") {
   return new Response(
     JSON.stringify({ type: "error", error: { type: "UpstreamTransportError" } }),
@@ -266,6 +282,76 @@ describe("asip rotation without an alternate pool", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(result.response.status).toBe(503);
+  });
+
+  // 回归：把重放改成走 BaseExecutor 之后，429 的标脏/冷却整段不可达，目标出口
+  // 在随后几分钟被反复复用。修复后重放 429 必须补一次记账，且只记一次。
+  it("accounts the replay 429 on the port that actually carried it", async () => {
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(rateLimitedWithRetry(43200));
+    rotateMock
+      .mockResolvedValueOnce({
+        switched: true,
+        switchedAt: Date.now(),
+        reason: "ok",
+        switchToUrl: "http://127.0.0.1:7896",
+        switchToEgress: "2606:slot6::1",
+        avoidPortUntil: 0,
+      })
+      .mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("stall-replay-429");
+
+    expect(result.response.status, "记账不能改变失败结果").toBe(429);
+    expect(fetchMock, "只记账、绝不再重放，防止循环").toHaveBeenCalledTimes(2);
+    expect(rotateMock).toHaveBeenCalledTimes(2);
+    expect(rotateMock.mock.calls[0][0]).toBe("transport");
+    expect(rotateMock.mock.calls[1][0]).toBe("rate429");
+    const opts = rotateMock.mock.calls[1][1];
+    expect(opts.proxyUrl, "必须归因到真正承载这次 429 的目标闸，不是事发闸").toBe("http://127.0.0.1:7896");
+    expect(opts.failedEgress).toBe("2606:slot6::1");
+    expect(opts.reqId).toBe("solo12345");
+    expect(opts.requestStartedAt, "用重放发出时刻，不是原请求时刻").toBeGreaterThan(0);
+    expect(opts.retryAfterMs, "上游 Retry-After 必须透传给 asip 写 ban_until").toBe(43200 * 1000);
+  });
+
+  it("passes the upstream Retry-After on the normal 429 path too", async () => {
+    fetchMock.mockResolvedValueOnce(rateLimitedWithRetry(45000)).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("first-429-retry-after");
+
+    expect(result.response.status).toBe(200);
+    expect(rotateMock).toHaveBeenCalledTimes(1);
+    expect(rotateMock.mock.calls[0][1].retryAfterMs).toBe(45000 * 1000);
+  });
+
+  it("does not add an accounting rotation when the replay succeeds", async () => {
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({
+      switched: true,
+      switchedAt: Date.now(),
+      reason: "ok",
+      switchToUrl: "http://127.0.0.1:7896",
+      switchToEgress: "2606:slot6::1",
+      avoidPortUntil: 0,
+    });
+
+    const result = await run("stall-replay-ok");
+
+    expect(result.response.status).toBe(200);
+    expect(rotateMock, "200 不触发记账，保持原有一次 transport 换线").toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips accounting when asip rotation is disabled", async () => {
+    enabledMock.mockReturnValue(false);
+    fetchMock.mockResolvedValueOnce(stalled()).mockResolvedValueOnce(rateLimited());
+
+    const result = await run("stall-replay-429-disabled");
+
+    expect(result.response.status).toBe(429);
+    expect(rotateMock, "功能关闭时不额外发 /rotate").toHaveBeenCalledTimes(0);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("gives the rotated replay a longer header budget", async () => {

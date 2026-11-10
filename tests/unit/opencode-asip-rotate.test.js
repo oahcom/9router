@@ -314,6 +314,36 @@ describe("asip rotation without an alternate pool", () => {
     expect(opts.retryAfterMs, "上游 Retry-After 必须透传给 asip 写 ban_until").toBe(43200 * 1000);
   });
 
+  it("accounts a retry 429 after asip already rotated instead of only cooling the port", async () => {
+    // 2026-11-10 23:11:41 req=watvq3hbz 实测：asip 回 coalesced + switchToUrl，
+    // 重试仍 429，但只看到 markAsipProxyCooling，没有 rate429 回流 —— 目标出口
+    // 既不标脏也不写 ban_until，60s 后又被选回来。这条用例锁住回流记账。
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(rateLimited());
+    rotateMock
+      .mockResolvedValueOnce({
+        switched: true,
+        switchedAt: Date.now(),
+        reason: "coalesced",
+        switchToUrl: "http://127.0.0.1:7895",
+        switchToEgress: "2606:slot5::1",
+        avoidPortUntil: 0,
+      })
+      .mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+
+    const result = await run("retry-429");
+
+    expect(result.response.status, "记账不能改变失败结果").toBe(429);
+    expect(fetchMock, "只记账、绝不再重放").toHaveBeenCalledTimes(2);
+    expect(rotateMock).toHaveBeenCalledTimes(2);
+    expect(rotateMock.mock.calls[0][0]).toBe("rate429");
+    expect(rotateMock.mock.calls[1][0], "重试仍 429 必须补一次 rate429 记账").toBe("rate429");
+    const opts = rotateMock.mock.calls[1][1];
+    expect(opts.proxyUrl, "归因到重试真正走的闸，不是事发闸").toBe("http://127.0.0.1:7895");
+    expect(opts.failedEgress).toBe("2606:slot5::1");
+    expect(opts.requestStartedAt, "用重试发出时刻").toBeGreaterThan(0);
+    expect(cooldownMock, "端口冷却仍然保留").toHaveBeenCalledWith("http://127.0.0.1:7895");
+  });
+
   it("passes the upstream Retry-After on the normal 429 path too", async () => {
     fetchMock.mockResolvedValueOnce(rateLimitedWithRetry(45000)).mockResolvedValueOnce(ok());
     rotateMock.mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });

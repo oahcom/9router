@@ -978,6 +978,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         // dispatcher 不影响 Bun 那边池化的 socket（原请求刚回 429，socket 还在池里）。
         bumpTransportGeneration();
         log?.warn?.("EGRESS", "asip rotated egress (" + asip.reason + ") -> retry once on fresh connection");
+        const rotatedStartedAt = Date.now();
         const rotatedResult = await super.execute({
           ...args,
           log,
@@ -999,8 +1000,38 @@ export class OpenCodeExecutor extends BaseExecutor {
         }
         // 换到目标端口仍 429：目标端口本身也进入短冷却，下条新请求才会避开。
         // avoidPortUntil 描述的是原端口的整修截止时刻，与目标端口无关，不套用。
-        if (asip.switchToUrl && rotatedResult?.response?.status === 429) {
-          markAsipProxyCooling(asip.switchToUrl);
+        if (rotatedResult?.response?.status === 429) {
+          if (asip.switchToUrl) {
+            markAsipProxyCooling(asip.switchToUrl);
+          }
+          // 这条重试同样走 super.execute，绕开了 executeInner 的 429 处置链。
+          // 只冷却端口不够：出口地址既不标脏、也不写 ban_until，60s 后照旧回池
+          // 被复用（2026-11-10 23:11:41 req=watvq3hbz 实测：asip 回 coalesced 并
+          // 给了新闸，重试仍 429，日志里只有端口冷却、没有任何回流记账）。
+          // 只记账、绝不再重放，所以不会形成「重试 → 换线 → 重试」循环。
+          const accountingProxyUrl = asip.switchToUrl || egress?.proxyUrl || null;
+          if (accountingProxyUrl) {
+            try {
+              const replayRetryAfterMs = parseRetryAfterMs(
+                rotatedResult.response.headers,
+                await readResponseText(rotatedResult.response),
+              );
+              const accounted = await rotateEgress("rate429", {
+                signal: args?.signal,
+                requestStartedAt: rotatedStartedAt,
+                failedEgress: asip.switchToEgress || requestEgress || null,
+                proxyUrl: accountingProxyUrl,
+                reqId: args?.reqId,
+                retryAfterMs: replayRetryAfterMs || 0,
+              });
+              log?.warn?.(
+                "EGRESS",
+                `retry 429 -> accounting on ${accountingProxyUrl} (${accounted?.reason ?? "no-reply"}); no second replay`,
+              );
+            } catch (error) {
+              log?.warn?.("EGRESS", `retry 429 accounting failed: ${error?.message ?? String(error)}`);
+            }
+          }
         }
         result = rotatedResult ?? result;
       } else {

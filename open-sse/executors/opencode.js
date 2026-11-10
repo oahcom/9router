@@ -94,6 +94,15 @@ import {
 } from "../utils/egress.js";
 
 const MAX_LOCAL_COOLDOWN_MS = 60_000;
+
+// 一条请求最多打几发（含首发）。单发打不中不是换线失效：换上去的地址本身常在
+// 几秒内也被封（2026-11-10 23:31 req=waukibt63：新地址服役 139s 即 429，第二发
+// 仍 429）。失败率按单发拦截率做乘法下降；三发（首发 + 两次换线）是效果与耗时的折中。
+const MAX_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.OPENCODE_ROTATE_ATTEMPTS || 3));
+// 从首次收到 429 起算的总预算。超预算就不再打：宁可把 429 交回调用方，
+// 也不要把一条请求拖到几十秒——上游限流窗口本来就不是秒级。
+const ROTATE_ATTEMPT_BUDGET_MS = Number(process.env.OPENCODE_ROTATE_BUDGET_MS || 25000);
+
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import { clearProxyDispatchers } from "../utils/proxyFetch.js";
 import {
@@ -973,67 +982,94 @@ export class OpenCodeExecutor extends BaseExecutor {
               // 多端口：asip 指定了另一台 sing-box，这次重试就走它。独立进程、
               // 独立连接池，等同于「已经换过出口」。
               || Boolean(asip.switchToUrl))) {
-        clearProxyDispatchers();
-        // 主路径也必须 bump：sidecar 的 session key 是 proxy|generation，只清 undici
-        // dispatcher 不影响 Bun 那边池化的 socket（原请求刚回 429，socket 还在池里）。
-        bumpTransportGeneration();
-        log?.warn?.("EGRESS", "asip rotated egress (" + asip.reason + ") -> retry once on fresh connection");
-        const rotatedStartedAt = Date.now();
-        const rotatedResult = await super.execute({
-          ...args,
-          log,
-          credentials: prepared,
-          proxyOptions: asip.switchToUrl
-            ? { ...proxyOptions, url: asip.switchToUrl, enabled: true }
-            : proxyOptions,
-          ...(retryBody ? { body: retryBody } : {}),
-        });
-        if (asip.switchToUrl && args.usedCredentials) {
-          // 目标端口失败后若触发外层 transport 重放，context 必须指向 B 而不是 A。
-          args.usedCredentials.requestProxyUrl = asip.switchToUrl;
-          args.usedCredentials.requestEgress = asip.switchToEgress || null;
-        }
-        if (rotatedResult?.response
-            && rotatedResult.response.status !== 429
-            && !(upstreamStatus === 403 && rotatedResult.response.status === 403)) {
-          return rotatedResult;
-        }
-        // 换到目标端口仍 429：目标端口本身也进入短冷却，下条新请求才会避开。
-        // avoidPortUntil 描述的是原端口的整修截止时刻，与目标端口无关，不套用。
-        if (rotatedResult?.response?.status === 429) {
-          if (asip.switchToUrl) {
-            markAsipProxyCooling(asip.switchToUrl);
+        let attempt = asip;
+        let attemptProxyUrl = egress?.proxyUrl || null;
+        let attemptEgress = requestEgress;
+        let attemptResult = null;
+        let attemptNo = 0;
+        // 首发已经打过了，这里只补换线重试的那几发。
+        while (attemptNo < MAX_ROTATE_ATTEMPTS - 1) {
+          if (attemptNo > 0 && Date.now() - requestStartedAt > ROTATE_ATTEMPT_BUDGET_MS) {
+            log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); giving up`);
+            break;
           }
-          // 这条重试同样走 super.execute，绕开了 executeInner 的 429 处置链。
-          // 只冷却端口不够：出口地址既不标脏、也不写 ban_until，60s 后照旧回池
-          // 被复用（2026-11-10 23:11:41 req=watvq3hbz 实测：asip 回 coalesced 并
-          // 给了新闸，重试仍 429，日志里只有端口冷却、没有任何回流记账）。
-          // 只记账、绝不再重放，所以不会形成「重试 → 换线 → 重试」循环。
-          const accountingProxyUrl = asip.switchToUrl || egress?.proxyUrl || null;
+          attemptNo += 1;
+          const targetProxyUrl = attempt.switchToUrl || null;
+          // 每一发都要清连接池并 bump：sidecar 的 session key 是 proxy|generation，
+          // 只清 undici dispatcher 不影响 Bun 那边池化的 socket（上一发刚回 429，
+          // socket 还在池里）。最后一发清完即便不重发也无副作用。
+          clearProxyDispatchers();
+          bumpTransportGeneration();
+          log?.warn?.(
+            "EGRESS",
+            `asip rotated egress (${attempt.reason}) -> retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} on fresh connection`,
+          );
+          const attemptStartedAt = Date.now();
+          const current = await super.execute({
+            ...args,
+            log,
+            credentials: prepared,
+            proxyOptions: targetProxyUrl
+              ? { ...proxyOptions, url: targetProxyUrl, enabled: true }
+              : proxyOptions,
+            // 每一发都要从快照重新克隆：transformRequest 会就地改 body（打指纹、
+            // 改工具名），把同一个对象交给第二发等于二次打指纹 → 403。
+            ...(retryBody ? { body: cloneRequestBody(retryBody) || retryBody } : {}),
+          });
+          if (current) attemptResult = current;
+          if (targetProxyUrl && args.usedCredentials) {
+            // 目标端口失败后若触发外层 transport 重放，context 必须指向 B 而不是 A。
+            args.usedCredentials.requestProxyUrl = targetProxyUrl;
+            args.usedCredentials.requestEgress = attempt.switchToEgress || null;
+          }
+          if (current?.response
+              && current.response.status !== 429
+              && !(upstreamStatus === 403 && current.response.status === 403)) {
+            return current;
+          }
+          if (current?.response?.status !== 429) break;
+          // 这一发仍 429：先让这个端口进短冷却，再把地址标脏、顺手要下一条线。
+          // 记账与换线是同一次 /rotate：asip 收到 rate429 会 mark blocked 并挑新槽，
+          // 旧实现把返回值丢掉，于是「记了账但不再打」，第二发永远不存在。
+          const accountingProxyUrl = targetProxyUrl || attemptProxyUrl;
+          if (targetProxyUrl) markAsipProxyCooling(targetProxyUrl);
+          let next = null;
           if (accountingProxyUrl) {
             try {
-              const replayRetryAfterMs = parseRetryAfterMs(
-                rotatedResult.response.headers,
-                await readResponseText(rotatedResult.response),
+              const attemptRetryAfterMs = parseRetryAfterMs(
+                current.response.headers,
+                await readResponseText(current.response),
               );
-              const accounted = await rotateEgress("rate429", {
+              next = await rotateEgress("rate429", {
                 signal: args?.signal,
-                requestStartedAt: rotatedStartedAt,
-                failedEgress: asip.switchToEgress || requestEgress || null,
+                requestStartedAt: attemptStartedAt,
+                failedEgress: attempt.switchToEgress || attemptEgress || null,
                 proxyUrl: accountingProxyUrl,
                 reqId: args?.reqId,
-                retryAfterMs: replayRetryAfterMs || 0,
+                retryAfterMs: attemptRetryAfterMs || 0,
               });
               log?.warn?.(
                 "EGRESS",
-                `retry 429 -> accounting on ${accountingProxyUrl} (${accounted?.reason ?? "no-reply"}); no second replay`,
+                `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} 429 -> accounted on ${accountingProxyUrl} (${next?.reason ?? "no-reply"})`,
               );
             } catch (error) {
-              log?.warn?.("EGRESS", `retry 429 accounting failed: ${error?.message ?? String(error)}`);
+              log?.warn?.("EGRESS", `attempt ${attemptNo} 429 accounting failed: ${error?.message ?? String(error)}`);
             }
           }
+          attemptProxyUrl = accountingProxyUrl;
+          attemptEgress = attempt.switchToEgress || attemptEgress || null;
+          if (!next || next.restartRequired) break;
+          const canContinue = Boolean(next.switchToUrl)
+            || next.switchedAt >= attemptStartedAt
+            || next.reason === "already_retired"
+            || next.reason === "line_ok";
+          if (!canContinue) {
+            log?.warn?.("EGRESS", `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} 429 -> no further line (${next.reason}); giving up`);
+            break;
+          }
+          attempt = next;
         }
-        result = rotatedResult ?? result;
+        result = attemptResult ?? result;
       } else {
         // 换线被拒（合并 / 节流 / 超时 / 不可用）时不重试：重试会打到同一条被烧的隧道上。
         // 但「为什么没换」必须留在生产日志里 —— 之前写 debug，而服务 LEVEL=INFO，

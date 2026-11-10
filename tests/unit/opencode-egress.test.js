@@ -72,6 +72,27 @@ function makeBody(text = "hello") {
   };
 }
 
+// 系统提示里的工作目录是每次 execute 现生成的随机临时路径，不属于「body 被改写」
+// 的范畴。比对前抹成占位符，其余结构仍逐字段严格比对。
+function normalizedBody(raw) {
+  const scrub = (value) => {
+    if (typeof value === "string") {
+      return value.replace(
+        /(Working directory: |Workspace root folder: )\S+/g,
+        "$1<runtime-tmp>",
+      );
+    }
+    if (Array.isArray(value)) return value.map(scrub);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [key, inner] of Object.entries(value)) out[key] = scrub(inner);
+      return out;
+    }
+    return value;
+  };
+  return scrub(JSON.parse(raw));
+}
+
 function run(executor, { body, proxyOptions, providerSessionId, credentials = { rawHeaders: {} } }) {
   return executor.execute({
     model: MODEL,
@@ -128,7 +149,7 @@ describe("OpenCode free-lane egress switching", () => {
     // 出口没变化时换会话只会让上游看到一个凭空出现的新身份。
     expect(secondSession).toBe(firstSession);
 
-    expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
+    expect(normalizedBody(second[1].body)).toEqual(normalizedBody(first[1].body));
 
     // Fixed proxy egresses are not cooled here: sing-box owns the exit IP and
     // rotates it underneath the same proxy URL.
@@ -155,7 +176,7 @@ describe("OpenCode free-lane egress switching", () => {
     // The IP is quota-limited; asip swaps it underneath the same proxy URL.
     expect(first[2].connectionProxyUrl).toBe("http://proxy-a.example:8080");
     expect(second[2].connectionProxyUrl).toBe("http://proxy-a.example:8080");
-    expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
+    expect(normalizedBody(second[1].body)).toEqual(normalizedBody(first[1].body));
   });
 
 
@@ -185,7 +206,7 @@ describe("OpenCode free-lane egress switching", () => {
     const second = fetchMock.mock.calls[1];
     expect(first[2].connectionProxyUrl || "").toBe("");
     expect(second[2].connectionProxyUrl || "").toBe("");
-    expect(JSON.parse(second[1].body)).toEqual(JSON.parse(first[1].body));
+    expect(normalizedBody(second[1].body)).toEqual(normalizedBody(first[1].body));
     // The retry carries a well-formed session; it differs from attempt 1 only
     // because sessions are scoped to the egress (sessionScopeKey = identity +
     // egressId), not because a quota 429 forces an epoch rotation. Measured
@@ -279,20 +300,19 @@ describe("OpenCode free-lane egress switching", () => {
     expect(messages.length).toBeGreaterThan(0);
     expect(messages.every((message) => !message.includes("req="))).toBe(true);
   });
-  it("retries only once when asip rotation does not fix the 429", async () => {
+  it("stops after the configured attempt budget when asip rotation never fixes the 429", async () => {
     const executor = getExecutor("opencode");
     const primary = pool("a", "http://proxy-a.example:8080");
     const proxyOptions = { ...primary };
     asipRotated();
 
-    fetchMock
-      .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", headers: { "retry-after": "60" } }))
-      .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", headers: { "retry-after": "30" } }));
+    // 首发 + OPENCODE_ROTATE_ATTEMPTS(默认 3) 发，每发都换线、每发都 429。
+    fetchMock.mockResolvedValue(rateLimitedResponse({ type: "RateLimitError", headers: { "retry-after": "30" } }));
 
     const result = await run(executor, { body: makeBody(), proxyOptions, providerSessionId: "conv-once" });
 
     expect(result.response.status).toBe(429);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(getEgressCooldown(identifyFixedEgress(TARGET, primary))).toBeNull();
   });
 
@@ -317,9 +337,7 @@ describe("OpenCode free-lane egress switching", () => {
     const proxyOptions = { ...primary };
     asipRotated();
 
-    fetchMock
-      .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", body: { retry_after: 90 } }))
-      .mockResolvedValueOnce(rateLimitedResponse({ type: "RateLimitError", body: { retry_after: 90 } }));
+    fetchMock.mockResolvedValue(rateLimitedResponse({ type: "RateLimitError", body: { retry_after: 90 } }));
 
     const result = await run(executor, { body: makeBody(), proxyOptions, providerSessionId: "conv-body-retry" });
 

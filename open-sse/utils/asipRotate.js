@@ -324,7 +324,10 @@ export async function rotateEgress(
       " line=" + (res.offending_tag || res.active_tag || "-") +
       " ip=" + (res.offending_egress || res.active_egress || "-") +
       " verdict=" + (res.offending_verdict || "n/a") +
-      " to=" + (res.switch_to || "-")
+      " to=" + (res.switch_to || "-") +
+      " to_line=" + (res.switch_to_tag || "-") +
+      " to_ip=" + (res.switch_to_egress || "-") +
+      " to_url=" + (res.switch_to_url || "-")
     );
   }
   // 六条闸都在后台修、没有端口能立刻接管：主链路不再同步兜底，改由本进程

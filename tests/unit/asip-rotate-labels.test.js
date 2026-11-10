@@ -429,6 +429,9 @@ describe("rotate trace log carries req / line / ip / verdict", () => {
         offending_egress: "2a09:bac5:1f05:28::4:36f",
         offending_verdict: "quota",
         switch_to: "slot-2",
+        switch_to_tag: "WARP-H2-FRA-76",
+        switch_to_egress: "2a09:bac5:2a93:18f0::27c:7c",
+        switch_to_url: "http://127.0.0.1:7893",
       }));
       await rotateEgress("rate429", { reqId: "REQ-TRACE-9" });
       const line = spy.mock.calls
@@ -439,6 +442,9 @@ describe("rotate trace log carries req / line / ip / verdict", () => {
       expect(line).toContain("ip=2a09:bac5:1f05:28::4:36f");
       expect(line).toContain("verdict=quota");
       expect(line).toContain("to=slot-2");
+      expect(line).toContain("to_line=WARP-H2-FRA-76");
+      expect(line).toContain("to_ip=2a09:bac5:2a93:18f0::27c:7c");
+      expect(line).toContain("to_url=http://127.0.0.1:7893");
     } finally {
       spy.mockRestore();
     }

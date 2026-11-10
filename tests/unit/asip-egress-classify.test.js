@@ -20,8 +20,14 @@ describe("classifyRotateReason", () => {
     expect(classifyRotateReason(403, undefined)).toBe(null);
   });
 
+  it("5xx 换线，但按 transport 处理（不标脏地址）", () => {
+    for (const s of [500, 502, 503, 504, 599]) {
+      expect(classifyRotateReason(s, "")).toBe("transport");
+    }
+  });
+
   it("其余状态码与出口无关", () => {
-    for (const s of [200, 400, 402, 500, 502, 503, 504]) {
+    for (const s of [200, 400, 401, 402, 404]) {
       expect(classifyRotateReason(s, "abusive traffic")).toBe(null);
     }
   });

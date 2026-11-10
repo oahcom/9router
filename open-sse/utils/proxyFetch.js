@@ -17,9 +17,85 @@ import {
 // 凭据剥离的判据只此一份（ssrfGuard）：这里曾有一份同名副本，search 侧
 // 的 baseUrl 覆盖路径就没有，于是同一条缺陷要修两遍。
 import { assertPublicUrlResolved, stripCredentialsForCrossOrigin } from "../../src/shared/utils/ssrfGuard.js";
+import { asipRotationEnabled, rotateEgress } from "./asipRotate.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
+
+// 代理连不上时，先在同一批隧道里换一条再试，而不是立刻掉直连。
+// 6 个 sing-box 各自独立进程：一条断了换另一条就有救；直连用本机地址去打一个
+// 按地址限流的上游，必然 429，而且不会被 asip 记账（2026-11-10 22:57–23:17 实测 282 次）。
+// 换不到仍按原行为直连——直连是兜底，不是主路；换几次见下方 ATTEMPTS。
+const ASIP_PROXY_PORTS = new Set(
+  String(process.env.ASIP_LOCAL_PROXY_PORT || "7890,7892,7893,7894,7895,7896")
+    .split(",").map((s) => s.trim()).filter(Boolean));
+const ASIP_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+// 换几发：首发之外最多再换 3 条线。只换一发时，asip 重启风暴很容易抽到另一条
+// 同样在重建的线——2026-11-10 23:0x 的重试目标普遍 served_sec < 600s。
+const PROXY_FAILURE_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.ASIP_PROXY_FAILURE_ATTEMPTS || 3));
+// 跨请求节流：别让一波并发失败各自把 /rotate 打成风暴。同一次请求内部的后续
+// 尝试用 force 绕过它（一次请求最多 3 次，总量有界）。
+const PROXY_FAILURE_ROTATE_GAP_MS = Math.max(0, Number(process.env.ASIP_PROXY_FAILURE_GAP_MS || 1000));
+// 窗口硬上限：10 秒内换线超过这么多次就停手、直接直连。防止 asip 全挂时每个
+// 请求都连换 3 次，把 asip 的控制面一起拖死。
+const PROXY_FAILURE_ROTATE_WINDOW_MS = 10000;
+const PROXY_FAILURE_ROTATE_WINDOW_MAX = Math.max(1, Number(process.env.ASIP_PROXY_FAILURE_WINDOW_MAX || 60));
+
+let lastProxyFailureRotateAt = 0;
+let rotateWindowStart = 0;
+let rotateWindowCount = 0;
+
+/** 测试隔离用：生产进程不需要。 */
+export function resetProxyFailureRotateState() {
+  lastProxyFailureRotateAt = 0;
+  rotateWindowStart = 0;
+  rotateWindowCount = 0;
+}
+
+/**
+ * 代理连接失败后换一条隧道。
+ *
+ * 返回可用的代理地址（同端口换线时返回原地址，因为 asip 换的是该端口底下的
+ * selector），返回 null 表示「这次不换」——非本机 sing-box、asip 关着、节流中、
+ * 窗口超限、asip 明确说没有可用闸口。
+ *
+ * force：同一次请求内部的第 2、3 次尝试，跳过跨请求节流（窗口上限仍然生效）。
+ */
+async function rotateAfterProxyFailure(proxyUrl, proxyOptions, { force = false, signal } = {}) {
+  if (proxyOptions?.asipRotateOnFailure === false) return null;
+  if (!asipRotationEnabled()) return null;
+  const now = Date.now();
+  if (!force && now - lastProxyFailureRotateAt < PROXY_FAILURE_ROTATE_GAP_MS) return null;
+  if (now - rotateWindowStart >= PROXY_FAILURE_ROTATE_WINDOW_MS) {
+    rotateWindowStart = now;
+    rotateWindowCount = 0;
+  }
+  if (rotateWindowCount >= PROXY_FAILURE_ROTATE_WINDOW_MAX) return null;
+  let parsed;
+  try {
+    parsed = new URL(String(proxyUrl));
+  } catch {
+    return null;
+  }
+  if (!ASIP_LOOPBACK_HOSTS.has(parsed.hostname)) return null;
+  const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  if (!ASIP_PROXY_PORTS.has(port)) return null;
+  rotateWindowCount += 1;
+  lastProxyFailureRotateAt = now;
+  try {
+    const res = await rotateEgress("transport", { proxyUrl, signal });
+    if (!res || res.restartRequired) return null;
+    if (res.switchToUrl) return res.switchToUrl;
+    if (res.switched || Number(res.switchedAt || 0) > 0
+        || res.reason === "line_ok" || res.reason === "already_retired") {
+      return proxyUrl;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
 // Disabled: not in use. Kept commented for future re-enable.
@@ -373,6 +449,16 @@ function isReplayableBody(body) {
 }
 
 /**
+ * 出站策略拒绝（SSRF 闸门 / 内网地址）是确定性结论：换线、直连都会得到同一个
+ * 答案，重试只是把同一个非法目标再发几次。这类错误必须直接向上抛，不能进
+ * 「换隧道再试」的循环——它跟链路断没断没有关系。
+ */
+function isEgressPolicyError(err) {
+  const msg = String(err?.message || "");
+  return msg.startsWith("[EgressGuard]") || msg.startsWith("Blocked URL:");
+}
+
+/**
  * 逐跳复核的 fetch：每一跳的目标先过 assertEgressTargetAllowed 再发出去。
  *
  * 301/302/303 按 fetch 语义改 GET 丢 body；307/308 保留 method+body（body 不可
@@ -494,11 +580,38 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       return await replayFreeTierRejectionDirect(url, options, proxied, directSend);
     } catch (proxyError) {
       if (proxyError?.code === "ERR_PROXY_DNS_MODE") throw proxyError;
+      if (isEgressPolicyError(proxyError)) throw proxyError;
+      // 调用方主动取消不是链路问题，换线改变不了任何东西。
+      if (proxyError?.name === "AbortError" && options?.signal?.aborted) throw proxyError;
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
       }
-      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
+      // 连接失败先换隧道再试：池子里还有别的线，没理由第一步就用本机地址。
+      // 最多 PROXY_FAILURE_ROTATE_ATTEMPTS 发（首发之外再换 3 条线）。
+      let lastError = proxyError;
+      let attemptProxyUrl = proxyUrl;
+      if (isReplayableBody(options?.body)) {
+        for (let attempt = 1; attempt <= PROXY_FAILURE_ROTATE_ATTEMPTS; attempt += 1) {
+          if (options?.signal?.aborted) break;
+          const rotatedProxyUrl = await rotateAfterProxyFailure(attemptProxyUrl, proxyOptions, {
+            force: attempt > 1,
+            signal: options?.signal,
+          });
+          if (!rotatedProxyUrl) break;
+          try {
+            const retried = await proxySend(rotatedProxyUrl)(url, options);
+            console.warn(`[ProxyFetch] Proxy failed (${lastError.message}); rotated -> ${rotatedProxyUrl}, recovered on attempt ${attempt}/${PROXY_FAILURE_ROTATE_ATTEMPTS}`);
+            return await replayFreeTierRejectionDirect(url, options, retried, directSend);
+          } catch (retryError) {
+            if (retryError?.name === "AbortError" && options?.signal?.aborted) throw retryError;
+            console.warn(`[ProxyFetch] Rotated tunnel attempt ${attempt}/${PROXY_FAILURE_ROTATE_ATTEMPTS} failed: ${retryError.message}`);
+            lastError = retryError;
+            attemptProxyUrl = rotatedProxyUrl;
+          }
+        }
+      }
+      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${lastError.message}`);
       return directSend(url, options);
     }
   }

@@ -11,6 +11,10 @@
 
 export function classifyRotateReason(status, bodyText) {
   if (status === 429) return "rate429";
+  // 5xx 是上游/边缘节点的故障：换一条隧道常能绕过（不同出口落到不同边缘）。
+  // reason 必须是 transport —— asip 对 transport 不标脏、不写 ban_until，
+  // 因为地址本身没问题，把一条好线拉进 12 小时黑名单反而更糟。
+  if (status >= 500 && status <= 599) return "transport";
   if (status !== 403) return null;
   return /abusive traffic/i.test(bodyText || "") ? "abuse403" : null;
 }

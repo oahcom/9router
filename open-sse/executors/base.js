@@ -5,6 +5,7 @@ import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
 import { asipRotationEnabled, rotateEgress, asipEgressForPort } from "../utils/asipRotate.js";
+import { takeRenamedToolNames } from "../utils/opencodeFingerprint.js";
 
 // 只有经本机 sing-box 出去的流量才受 asip 换线影响 —— 换的是 sing-box 里那条
 // WARP 线的 selector。局域网里另一台机器的 7890（192.168.100.104:7890）是别人
@@ -393,7 +394,8 @@ export class BaseExecutor {
           continue;
         }
 
-        return { response, url, headers, transformedBody };
+        const renamedToolMap = takeRenamedToolNames(replayBody || body);
+        return { response, url, headers, transformedBody, renamedToolMap };
       } catch (error) {
         clearTimeout(connectTimer);
         lastError = error;

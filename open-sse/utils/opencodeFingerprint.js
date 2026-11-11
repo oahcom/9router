@@ -64,6 +64,50 @@ const FINGERPRINT_TOOL_DEFINITIONS = {
 // mapping request-local without putting transport metadata on the wire.
 const renamedToolNames = new WeakMap();
 
+// 真名 -> 别名，**跨 body 共享**。
+//
+// WHY 需要它：WeakMap 按对象引用记账，而请求体在若干处会被克隆
+// （base.js 的 structuredClone、executor 的 asip 轮换重试、429 后的重放）。
+// 克隆换了引用 → WeakMap 取不到 → 幂等保护失效 → 别名套别名
+// （Bash → fn_18vix4v → fn_1ciz1x0）。上游回的是第二层别名，单跳还原只回得到
+// 第一层的 fn_18vix4v，客户端从未声明过这个名字 → "No such tool available"。
+//
+// 实测 2026-11-11：本机 asip 轮换重试路径上稳定复现，第二层别名 fn_1ciz1x0
+// 就是客户端报「不存在」的那个名字。
+//
+// **方向必须是「真名 -> 别名」**：判定「这个名字是不是我们生成的别名」时，
+// 要问的是「有没有哪个真名映射到了它」。反过来记（别名 -> 真名）会误判：
+// caller 声明的工具名恰好叫 `shell_client`（与指纹别名同名）时，会被当成
+// 「已别名化」而放行 —— 实测既有测试 `neutralizes plugin tool names instead
+// of reusing client alias names` 就是钉这个的。
+//
+// 别名按名字哈希生成（同一真名恒得同一别名），所以这张表跨请求一致，
+// 不会把两个不同的真名映到同一别名。
+const aliasRegistry = new Map();
+// 反向表：别名 -> 真名。与 aliasRegistry 同增同删，只为 O(1) 反查。
+const aliasReverse = new Map();
+
+/**
+ * 反向查表：这个**名字**是不是我们为某个真名生成过的别名？是则返回那个真名。
+ *
+ * WHY 要反向查（而不是直接 aliasRegistry.get(name)）：登记表是「真名 -> 别名」，
+ * 正向查问的是「这个真名有没有被改过名」，而判定克隆体需要问的是
+ * 「这个**名字**是不是别名」。caller 声明的工具名恰好叫 `shell_client` 时，
+ * 正向查会误判成「已别名化」而放行 —— 实测既有测试
+ * `neutralizes plugin tool names instead of reusing client alias names`
+ * 钉的就是这个。
+ */
+function aliasFor(name) {
+  if (!name) return null;
+  return aliasReverse.get(name) || null;
+}
+
+/** 登记一次改名：真名 -> 别名，同时补反向表。 */
+function registerAlias(original, alias) {
+  aliasRegistry.set(original, alias);
+  aliasReverse.set(alias, original);
+}
+
 /** The fingerprint name when `name` is exactly one; "" otherwise. */
 export function fingerprintToolKey(name) {
   const trimmed = String(name ?? "").trim();
@@ -159,6 +203,11 @@ export function concealFingerprintToolNames(tools) {
 
     const key = fingerprintToolKey(toolNameOf(tool));
     if (!key) {
+      // 指纹别名（<key>_client）不进登记表，所以这里不做「已别名化」复用：
+      // 它要么是 caller 的真名（照常处理），要么是中性别名（由
+      // neutralizeCallerToolNames 复用）。指纹别名自身在克隆体上由
+      // concealFingerprintToolNames 重新生成 —— 名字稳定（`<key>_client`
+      // / `<key>_client2`），不会套出第三层。
       out.push(tool);
       continue;
     }
@@ -184,6 +233,9 @@ export function concealFingerprintToolNames(tools) {
     for (let i = 2; taken.has(alias); i++) alias = `${key}_client${i}`;
     taken.add(alias);
     map.set(alias, key);
+    // **不进别名登记表**：指纹别名对应的是指纹工具（shell/read），不是 caller
+    // 的真名。登记它会让 caller 恰好声明了 `shell_client` 的工具被误判成
+    // 「已别名化」而原样放行 —— 那正是 caller 的真名，必须照常中性化。
     out.push(withToolName(tool, alias));
   }
   return { tools: out, map };
@@ -240,8 +292,22 @@ export function neutralizeCallerToolNames(tools, map, skip = new Set()) {
     if (!tool || typeof tool !== "object" || Array.isArray(tool)) return tool;
     const name = toolNameOf(tool);
     if (!name || fingerprintToolKey(name) || skip.has(name)) return tool;
+    // **这个名字是我们为某个真名生成过的别名**（克隆体的情形）。克隆换了
+    // 引用，WeakMap 的幂等保护失效，但内容还记得：直接复用别名，绝不套
+    // 第二层。套第二层的后果是上游回 fn_1ciz1x0，单跳还原只回得到
+    // fn_18vix4v —— 客户端从没声明过这个名字，于是 "No such tool available"。
+    //
+    // 判据是「这个**名字**是不是某个真名的别名」，不是「这个真名有没有被
+    // 改过名」：caller 声明的工具名恰好叫 `shell_client` 时，它虽然长得
+    // 像别名，但那是 caller 自己的真名，必须照常中性化。
+    const known = aliasFor(name);
+    if (known) {
+      map.set(name, known);
+      return tool;
+    }
     const alias = neutralToolAlias(name, taken);
     taken.add(alias);
+    registerAlias(name, alias);
     map.set(alias, name);
     return withToolName(tool, alias);
   });
@@ -497,6 +563,12 @@ export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   const alreadyRenamed = renamedToolNames.get(body);
   if (alreadyRenamed?.size) return alreadyRenamed;
 
+  // **克隆体的情形**：WeakMap 按引用记账，换了引用就取不到上一轮的 map。
+  // 这时不能从头再改一遍名 —— 会把别名套成别名。判据是「这一层的工具名
+  // 全部已是登记表里的别名」：那就说明名已经改过了，只把映射重建出来。
+  const rebound = rebuildRenamedMap(body);
+  if (rebound) return rebound;
+
   const { tools, map } = concealFingerprintToolNames(body.tools);
   const normalized = neutralizeCallerToolNames(Array.isArray(tools) ? tools : [], map, new Set(map.keys()));
   body.tools = Array.isArray(normalized) ? normalized : [];
@@ -526,6 +598,47 @@ export function recordRenamedToolNames(body, map) {
 export function takeRenamedToolNames(body) {
   if (!body || typeof body !== "object") return null;
   return renamedToolNames.get(body) || null;
+}
+
+/**
+ * 克隆体的 map 重建：这一层的工具名已经全是登记表里的别名时，把映射捡回来。
+ *
+ * WHY 需要：请求体在 base.js（structuredClone）、executor 的 asip 轮换重试、
+ * 429 重放处都会被克隆。克隆换了对象引用 → WeakMap 取不到上一轮记下的 map →
+ * 幂等保护失效 → 别名套别名（fn_18vix4v → fn_1ciz1x0）。上游回的是第二层，
+ * 单跳还原只回得到第一层 fn_18vix4v，客户端从没声明过它 → "No such tool
+ * available"。实测 2026-11-11，本机 asip 轮换路径上稳定复现。
+ *
+ * 判据：**至少有一个工具名在登记表里，且该名字本身就是别名形态**。
+ * 只有真名（客户端原样声明的）不算 —— 那是首轮，还没改过名。
+ *
+ * @returns {Map<string,string>|null} 重建出的 map；不是克隆体时返回 null
+ */
+function rebuildRenamedMap(body) {
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  if (tools.length === 0) return null;
+  const map = new Map();
+  let aliased = 0;
+  let plain = 0;
+  for (const tool of tools) {
+    const name = toolNameOf(tool);
+    if (!name) continue;
+    // 指纹工具（read/shell）本来就以真名留在报文里，不参与别名判定。
+    if (fingerprintToolKey(name)) continue;
+    const known = aliasFor(name);
+    if (!known) {
+      plain++;
+      continue;
+    }
+    map.set(name, known);
+    aliased++;
+  }
+  // 一个别名都没命中 → 不是「已改过名的克隆体」，按首轮处理。
+  if (aliased === 0) return null;
+  // 命中了但也混着未改名的真名 → 这是首轮（真名会被改），不能跳过改名。
+  if (plain > 0) return null;
+  recordRenamedToolNames(body, map);
+  return map;
 }
 
 // Response side -------------------------------------------------------------

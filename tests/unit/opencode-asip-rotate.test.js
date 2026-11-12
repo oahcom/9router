@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { fetchMock, rotateMock, enabledMock, bumpMock, cooldownMock } = vi.hoisted(() => {
+const { fetchMock, rotateMock, enabledMock, bumpMock, cooldownMock, egressMock } = vi.hoisted(() => {
   process.env.EGRESS_PROBE_MODE = "off";
   process.env.OPENCODE_TRANSPORT = "off";
   return {
@@ -9,6 +9,8 @@ const { fetchMock, rotateMock, enabledMock, bumpMock, cooldownMock } = vi.hoiste
     enabledMock: vi.fn(() => true),
     bumpMock: vi.fn(),
     cooldownMock: vi.fn(),
+    // 按端口取到的首发出口身份；默认未知，池闸回归用例里塞 WARP /128。
+    egressMock: vi.fn(async () => ({ egress: null, since: null })),
   };
 });
 
@@ -28,7 +30,7 @@ vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: enabledMock,
   // 执行器按端口取出口身份；mock 里一律「未知」，等价于改动前的 null。
-  asipEgressForPort: async () => ({ egress: null, since: null }),
+  asipEgressForPort: egressMock,
   // 目标端口失败后要把它打进短冷却，否则下一条新请求又选中它。
   markAsipProxyCooling: cooldownMock,
   // 执行器每次请求都会读一次「当前出口地址」，429 时交给 asip 判断是否已被
@@ -123,6 +125,8 @@ beforeEach(() => {
   enabledMock.mockReset();
   enabledMock.mockReturnValue(true);
   bumpMock.mockReset();
+  egressMock.mockReset();
+  egressMock.mockResolvedValue({ egress: null, since: null });
   resetEgressState();
 });
 
@@ -501,6 +505,31 @@ describe("asip rotation onto the proxy-pool gate (slot-7)", () => {
     const result = await run("gate-node-rotate", gatePool());
 
     expect(fetchMock).toHaveBeenCalledTimes(2);  // 首发 + 重放，守卫没拒绝
+    expect(result.response.status).toBe(200);
+  });
+
+  it("replays across ports even when active_egress names the old WARP line", async () => {
+    // 线上原样：首发打在 WARP /128 上，asip 让重试改走 7897，但回包的
+    // active_egress 仍是那条旧 WARP 地址（switch_to_egress 为空）。
+    // 旧实现把它当目标出口，判 repeatsEgress → refused（30min 83 次）。
+    const warpIp = "2a09:bac1:19a0:10::c:371";
+    egressMock.mockResolvedValue({ egress: warpIp, since: null });
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({
+      switched: true,
+      switchedAt: 0,
+      reason: "ok",
+      switchToUrl: "http://127.0.0.1:7897",
+      switchToPool: "slot-7",
+      switchToNode: "cn.bing.com:443~22-any",
+      switchToEgress: null,
+      activeEgress: warpIp,
+      lineChanged: true,
+    });
+
+    const result = await run("gate-cross-port");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);  // 旧 IP 不再冒充目标出口
     expect(result.response.status).toBe(200);
   });
 

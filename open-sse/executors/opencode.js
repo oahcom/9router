@@ -1008,11 +1008,18 @@ export class OpenCodeExecutor extends BaseExecutor {
           }
           attemptNo += 1;
           const targetProxyUrl = attempt.switchToUrl || null;
-          const targetEgress = attempt.switchToEgress || attempt.activeEgress || null;
           // 池闸原地换节点：端口不变、没有 IP 地址，但 asip 给了新节点名
           // 和换节点时刻（switched_at）。节点名本身就是「出口已变」的证据，
           // 也用来挡住同一节点被反复重放。
           const targetNode = attempt.switchToNode || null;
+          // 切到池闸时回包的 active_egress 是**原端口**那条 WARP 线的 /128，
+          // 不是目标端口的出口。旧实现在 switch_to_egress 为空时回退到它，
+          // 于是「targetEgress === attemptEgress」成立 → repeatsEgress →
+          // refused（线上实测 30min 内 83 次）。池闸的出口身份只有节点名，
+          // 绝不能让旧 IP 顶替；常规闸口的 switch_to_egress 仍是真地址。
+          const targetEgress = targetNode
+            ? null
+            : (attempt.switchToEgress || attempt.activeEgress || null);
           const repeatsPoolNode = Boolean(targetNode)
             && (targetNode === attemptNode || triedPoolNodes.has(targetNode));
           const nodeMoved = Boolean(targetNode) && !repeatsPoolNode;

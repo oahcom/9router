@@ -147,3 +147,12 @@ machine-id
 # headroom 运行时目录（proxy.log/install.log/proxy.pid）：进程自己追加写，不入库。
 # 历史里曾跟踪过 proxy.log，HEAD 只有 2.3KB 而工作区涨到 59MB。
 /headroom/
+
+# Next 构建快照 / 损坏构建目录：单个数百 MB，历史累计 6GB+，永不入库。
+# /.next/ 已在上方单独忽略；这里覆盖 .next.prev-* / .next.broken.* / .next.prev.* 等。
+/.next.*/
+# 数据库手工备份：settings 备份含真实凭据，只能留在本地磁盘。
+/db/*.backup-*.json
+/db/*.partial-*
+# 点号式源码备份（*.bak-* / *.bak 已在上方覆盖），如 asipRotate.js.bak.20261111_222301
+*.bak.*

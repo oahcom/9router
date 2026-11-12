@@ -122,7 +122,8 @@ export async function handleImageGenerationCore({
   }
 
   // Handle 401/403 — try token refresh (skipped for noAuth providers)
-  const executor = getExecutor(provider);
+  // 图片 provider 的传输由 adapter 负责，这里只借用 noAuth / refreshCredentials。
+  const executor = getExecutor(provider, { allowUnknown: true });
   if (
     !executor?.noAuth &&
     !adapter.noAuth &&

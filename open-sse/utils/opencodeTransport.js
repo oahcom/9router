@@ -272,18 +272,37 @@ function forward(transport, payload, signal, headerTimeoutMs = 0) {
 /**
  * 等响应头的预算。非流式给 0（不设限）：长生成可能在响应头返回前就超过该值。
  *
- * 流式分两档：
- *   - 首次 = headerTimeoutMs(20s)：这是「当前出口还行不行」的快速判据。
- *   - 换线后的重放 = headerTimeoutReplayMs(45s)：出口可能压根没变（asip 判
- *     「出口正常」就不换），再按 20s 判一次等于把同一次失败重演一遍。
- *     实测 43s = 20+20 两次同出口超时后 503，而同一出口的首字节随体量增长
- *     （1000KB≈7.1s、2000KB≈10s），重放多给一点预算就能把请求救回来。
+ * 流式按实际请求体字节数缩放 —— 等首字节等的是上游 prefill，而 prefill 时间
+ * 随 prompt 体量增长（同一出口实测 1000KB≈7.1s、2000KB≈10s；p90 444KB 桶
+ * TTFT 27.9s）。固定 20s 只够判小请求，300–600KB 的正常请求会被判成假超时，
+ * 进而换线 → 重放 → 还是同一出口 → 503。所以：
+ *   - 首次 = headerTimeoutMs(20s) + 每 500KB 加 headerTimeoutPer500kbMs(15s)，
+ *     封顶 headerTimeoutMaxMs(55s)。0/小 body 仍取 20s，快判语义不变。
+ *   - 换线重放取 max(首次预算, headerTimeoutReplayMs=45s)：出口可能压根没变
+ *     （asip 判「出口正常」就不换，它的探针是小请求），再按首次预算判一次
+ *     等于把同一次失败重演一遍（实测 43s = 20+20 两次同出口超时后 503）。
+ *
+ * 上限留在 base 的 60s 连接超时以内：超过它 base 的 connectCtrl 先 abort，
+ * 这个预算形同虚设，失败时客户端还要白等满 60s。
+ *
+ * @param {boolean} streamBody - 流式才设限（非流式 0）
+ * @param {boolean} replayBudget - 换线后的重放
+ * @param {number} [bodyBytes=0] - 实际请求体字节数；未知按 0（行为与旧版一致）
  */
-export function resolveHeaderTimeoutMs(streamBody, replayBudget) {
+export function resolveHeaderTimeoutMs(streamBody, replayBudget, bodyBytes = 0) {
   if (!streamBody) return 0;
   const base = OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs;
-  if (!replayBudget) return base;
-  return Math.max(base, OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs);
+  // 拿不到体量（NaN/负数）就不缩放：不能因为缺一个数就编出一个假预算。
+  const bytes = Number.isFinite(bodyBytes) && bodyBytes > 0 ? bodyBytes : 0;
+  // 按字节线性比例：每 500KB 加 headerTimeoutPer500kbMs。0/小 body 四舍五入后
+  // 仍是 base，快判语义不变。
+  const scaled = base + (bytes / (500 * 1024)) * OPENCODE_TRANSPORT_CONFIG.headerTimeoutPer500kbMs;
+  const firstTry = Math.min(scaled, OPENCODE_TRANSPORT_CONFIG.headerTimeoutMaxMs);
+  if (!replayBudget) return firstTry;
+  return Math.min(
+    Math.max(firstTry, OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs),
+    OPENCODE_TRANSPORT_CONFIG.headerTimeoutMaxMs,
+  );
 }
 
 // log 由执行器递进来（可为空）：传输层失败也要能按会话/tag/req= 归档，
@@ -315,7 +334,13 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
   // 结果，而不是让它进 attempt 循环把 19s 超时重放两遍。
   if (proxyUrl && !/^https?:\/\//i.test(proxyUrl)) return noteFailure(`unsupported-proxy:${proxyUrl.split(":")[0]}`);
   const streamBody = typeof options.body === "string" && /"stream"\s*:\s*true/.test(options.body);
-  const headerTimeoutMs = resolveHeaderTimeoutMs(streamBody, options.replayBudget === true);
+  // 首字节预算按真实发出字节数缩放：这里已经在发 body 了，量一次成本远小于
+  // 一次假超时（换线 + 重放 + 503）。
+  const headerTimeoutMs = resolveHeaderTimeoutMs(
+    streamBody,
+    options.replayBudget === true,
+    Buffer.byteLength(options.body, "utf8"),
+  );
 
   // A sidecar whose upstream fetch failed may hold a stale pooled socket or a
   // proxy that just reset. Restarting Bun is cheap and clears both; retry the

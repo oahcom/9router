@@ -1,4 +1,9 @@
-import { ERROR_RULES, BACKOFF_CONFIG, TRANSIENT_COOLDOWN_MS } from "../config/errorConfig.js";
+import {
+  ERROR_RULES,
+  BACKOFF_CONFIG,
+  TRANSIENT_COOLDOWN_MS,
+  isContextOverflowError,
+} from "../config/errorConfig.js";
 
 /**
  * Calculate exponential backoff cooldown for rate limits (429)
@@ -30,6 +35,13 @@ export function checkFallbackError(status, errorText, backoffLevel = 0, provider
   const lowerError = errorText
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";
+
+  // 上下文溢出先判：它的正文里可能同时出现「rate limit」这类词（上游模板千奇百怪），
+  // 一旦被文本规则先命中就会把这个健康账号锁掉几十秒，而真正的原因是 prompt 太长。
+  // 换账号、换成员都是把同一份超长 body 再传一遍，一次尝试就够。
+  if (isContextOverflowError(status, errorText)) {
+    return { shouldFallback: false, cooldownMs: 0, requestScoped: true };
+  }
 
   for (const rule of ERROR_RULES) {
     if (rule.provider && rule.provider !== provider) continue;
@@ -126,7 +138,7 @@ export function formatRetryAfter(rateLimitedUntil) {
 /** Prefix for model lock flat fields on connection record */
 export const MODEL_LOCK_PREFIX = "modelLock_";
 
-/** Special key used when no model is known (account-level lock) */
+/** Special key used when no model is known (provider-wide lock) */
 export const MODEL_LOCK_ALL = `${MODEL_LOCK_PREFIX}__all`;
 
 /** Build the flat field key for a model lock */

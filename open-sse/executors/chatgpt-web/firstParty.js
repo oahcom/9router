@@ -697,7 +697,7 @@ async function storeConversationDraft(page, input, requestId, registered) {
         source: "local",
         is_big_paste: false,
       }));
-      // Account-level MCP connectors join the turn via "plugin:<app_id>" hints
+      // Provider-scoped MCP connectors join the turn via "plugin:<app_id>" hints
       // (the same field the web composer sets when a plugin chip is toggled).
       const systemHints = [
         ...(mode.reason ? ["reason"] : []),

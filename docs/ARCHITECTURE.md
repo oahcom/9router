@@ -12,7 +12,7 @@ Core capabilities:
 - OpenAI-compatible API surface for CLI/tools
 - Request/response translation across provider formats
 - Model combo fallback (multi-model sequence)
-- Account-level fallback (multi-account per provider)
+- Provider-wide fallback (multi-account per provider)
 - OAuth + API-key provider connection management
 - Local persistence for providers, keys, aliases, combos, settings, pricing
 - Usage/cost tracking and request logging

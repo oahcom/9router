@@ -377,7 +377,7 @@ export async function getQoderUsage(accessToken, proxyOptions = null, providerId
         // The add-on block carries no expiry of its own in this API. Qoder's
         // web console lists every redeemed resource package with its own
         // deadline (check-in bonuses do expire, typically ~30 days), but
-        // openapi only exposes the account-level `expiresAt` sentinel above,
+        // openapi only exposes the provider-level `expiresAt` sentinel above,
         // which describes the plan, not the grants — reusing it here would
         // advertise "never expires" for credits that actually expire. So
         // leave the reset date unset and let the row link to Qoder's own

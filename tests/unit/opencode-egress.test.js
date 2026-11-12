@@ -351,9 +351,9 @@ describe("OpenCode free-lane egress switching", () => {
     expect(getEgressCooldown(identifyFixedEgress(TARGET, primary))).toBeNull();
   });
 
-  it("preserves a native x-opencode-session across an egress switch", async () => {
+  it("ignores a downstream native x-opencode-session and sends a daily one", async () => {
     const executor = getExecutor("opencode");
-    const native = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
+    const native = `ses_0123456789ab${"A".repeat(14)}`;
     const primary = pool("a", "http://proxy-a.example:8080");
     const proxyOptions = { ...primary };
 
@@ -367,10 +367,11 @@ describe("OpenCode free-lane egress switching", () => {
     });
 
     const sent = fetchMock.mock.calls[0][1].headers["x-opencode-session"];
-    expect(sent).toBe(native);
+    expect(sent).not.toBe(native);
+    expect(sent).toMatch(OPENCODE_SESSION_RE);
   });
 
-  it("mints one session per (conversation, egress) and reuses it while the egress is stable", () => {
+  it("picks from the same daily 15 regardless of egress", () => {
     const executor = getExecutor("opencode");
     const credentials = { rawHeaders: {} };
     const body = makeBody();
@@ -382,14 +383,11 @@ describe("OpenCode free-lane egress switching", () => {
       egressId,
     })._opencodeSession;
 
-    const onA = prepare("proxy:a");
-    const onA2 = prepare("proxy:a");
-    const onB = prepare("proxy:b");
+    const seen = new Set();
+    for (let i = 0; i < 300; i++) seen.add(prepare(`proxy:${i % 3}`));
 
-    expect(onA).toBe(onA2);
-    expect(onB).not.toBe(onA);
-    expect(onA).toMatch(OPENCODE_SESSION_RE);
-    expect(onB).toMatch(OPENCODE_SESSION_RE);
+    expect(seen.size).toBe(15);
+    for (const id of seen) expect(id).toMatch(OPENCODE_SESSION_RE);
   });
 
   it("does not probe direct egress on the normal path", async () => {

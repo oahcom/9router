@@ -55,7 +55,7 @@
 用户请求 → cc/claude-opus-4-5
            ↓ 配额耗尽(达到 5 小时限制)
            自动切换 → glm/glm-4.7
-           ↓ 每日配额耗尽
+           ↓ 配额用尽
            自动切换 → minimax/MiniMax-M2.1
            ↓ 5 小时配额耗尽
            自动切换 → if/kimi-k2-thinking (免费)

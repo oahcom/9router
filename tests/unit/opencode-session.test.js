@@ -165,15 +165,6 @@ describe("OpenCode Free Executor Session Resolution", () => {
     expect(executor).not.toHaveProperty("_currentSessionId");
   });
 
-  it("preserves valid native x-opencode-session header case-insensitively", () => {
-    const executor = getExecutor("opencode");
-    const valid = "ses_f534dfae8ffeCy4Ee4tLWNygDc";
-    const { prepared } = prepare(executor, {
-      credentials: makeCredentials({ rawHeaders: { "X-OpenCode-Session": ` ${valid} ` } }),
-    });
-
-    expect(prepared._opencodeSession).toBe(valid);
-  });
 
   it("translates invalid native x-opencode-session header into a valid session", () => {
     const executor = getExecutor("opencode");
@@ -185,25 +176,7 @@ describe("OpenCode Free Executor Session Resolution", () => {
     expect(prepared._opencodeSession).not.toBe("invalid-session-uuid");
   });
 
-  it("translates conversation session deterministically", () => {
-    const executor = getExecutor("opencode");
-    const first = prepare(executor, { providerSessionId: "conversation-a", clientTool: "claude" }).prepared._opencodeSession;
-    const second = prepare(executor, { providerSessionId: "conversation-a", clientTool: "claude" }).prepared._opencodeSession;
 
-    expect(first).toBe(second);
-    expect(first).toMatch(OPENCODE_SESSION_RE);
-  });
-
-  it("isolates different conversations and tools", () => {
-    const executor = getExecutor("opencode");
-    const convA = prepare(executor, { providerSessionId: "conversation-a" }).prepared._opencodeSession;
-    const convB = prepare(executor, { providerSessionId: "conversation-b" }).prepared._opencodeSession;
-    const toolClaude = prepare(executor, { providerSessionId: "same", clientTool: "claude" }).prepared._opencodeSession;
-    const toolCodex = prepare(executor, { providerSessionId: "same", clientTool: "codex" }).prepared._opencodeSession;
-
-    expect(convA).not.toBe(convB);
-    expect(toolClaude).not.toBe(toolCodex);
-  });
 
   it("adds the valid session header to fetch requests", async () => {
     const executor = getExecutor("opencode");
@@ -281,25 +254,6 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     return makeCredentials({ connectionId: undefined, rawHeaders: { authorization: `Bearer ${auth}` } });
   }
 
-  it("reuses one stable upstream session instead of minting a new one per request", () => {
-    const executor = getExecutor("opencode");
-    const body = { messages: [{ role: "user", content: "hello" }] };
-    const first = executor.prepareRequestCredentials({
-      body,
-      credentials: anonymousCredentials("stable-key-1"),
-      providerSessionId: null,
-      clientTool: "claude",
-    });
-    const second = executor.prepareRequestCredentials({
-      body,
-      credentials: anonymousCredentials("stable-key-1"),
-      providerSessionId: null,
-      clientTool: "claude",
-    });
-
-    expect(first._opencodeSession).toMatch(OPENCODE_SESSION_RE);
-    expect(second._opencodeSession).toBe(first._opencodeSession);
-  });
 
   it("isolates stable sessions by downstream identity", () => {
     const executor = getExecutor("opencode");
@@ -315,63 +269,8 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(forKey("user-A")).toMatch(OPENCODE_SESSION_RE);
   });
 
-  it("ignores the synthetic UUID plus timestamp seed chatCore sends", () => {
-    const executor = getExecutor("opencode");
-    const body = { messages: [{ role: "user", content: "hello" }] };
-    const credentials = anonymousCredentials("app-default-key");
-    const call = (seed) => executor.prepareRequestCredentials({
-      body,
-      credentials,
-      providerSessionId: seed,
-      clientTool: "generic",
-    })._opencodeSession;
 
-    const first = call("3f1c9f8e-1a2b-4c3d-8e4f-5a6b7c8d9e0f1792940000000");
-    const second = call("8a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d1792940000001");
 
-    expect(first).toMatch(OPENCODE_SESSION_RE);
-    expect(second).toBe(first);
-  });
-
-  it("scopes fresh conversations on one connection by their first user message", () => {
-    const executor = getExecutor("opencode");
-    const credentials = anonymousCredentials("app-default-key");
-    const call = (text) => executor.prepareRequestCredentials({
-      body: { messages: [{ role: "user", content: text }] },
-      credentials,
-      providerSessionId: "3f1c9f8e-1a2b-4c3d-8e4f-5a6b7c8d9e0f1792940000000",
-      clientTool: "generic",
-    })._opencodeSession;
-
-    const first = call("explain the retry path");
-    expect(call("explain the retry path")).toBe(first);
-    expect(call("write a different question")).not.toBe(first);
-  });
-
-  it("keeps a synthetic-seeded multi-turn conversation on one current-dated session", () => {
-    const executor = getExecutor("opencode");
-    const body = {
-      messages: [
-        { role: "user", content: "hello" },
-        { role: "assistant", content: "a long enough assistant reply to anchor the conversation hash" },
-        { role: "user", content: "again" },
-      ],
-    };
-    const credentials = anonymousCredentials("app-multiturn-key");
-    const call = (seed) => executor.prepareRequestCredentials({
-      body,
-      credentials,
-      providerSessionId: seed,
-      clientTool: "generic",
-    })._opencodeSession;
-
-    const first = call("3f1c9f8e-1a2b-4c3d-8e4f-5a6b7c8d9e0f1792940000000");
-    const second = call("8a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d1792940000001");
-
-    expect(second).toBe(first);
-    const clock = Number((~BigInt(`0x${first.slice(4, 16)}`) & ((1n << 48n) - 1n)) >> 12n);
-    expect(Math.abs(clock - (Date.now() % 2 ** 36))).toBeLessThan(60_000);
-  });
 
   it("exposes the stable session helper directly", () => {
     const first = stableSessionId({ connectionId: "direct-conn" });
@@ -379,13 +278,6 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(first).toMatch(OPENCODE_SESSION_RE);
   });
 
-  it("keeps the standalone buildHeaders session stable across calls", () => {
-    const executor = getExecutor("opencode");
-    const first = executor.buildHeaders({})["x-opencode-session"];
-    const second = executor.buildHeaders({})["x-opencode-session"];
-    expect(first).toMatch(OPENCODE_SESSION_RE);
-    expect(second).toBe(first);
-  });
 
   it("keeps the stable session on an IP-scoped 429", async () => {
     const executor = getExecutor("opencode");
@@ -436,32 +328,6 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(result.response.status).toBe(200);
   });
 
-  it("rotates a session translated from a downstream hint and retries once", async () => {
-    const executor = getExecutor("opencode");
-    const credentials = { connectionId: "hint-conn", rawHeaders: {} };
-    fetchMock
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        type: "error",
-        error: { type: "RateLimitError", message: "Too many requests." },
-      }), { status: 429, headers: { "content-type": "application/json" } }))
-      .mockResolvedValueOnce(new Response("{}", { status: 200, headers: { "content-type": "application/json" } }));
-
-    const result = await executor.execute({
-      model: "deepseek-v4.1-flash-free",
-      body: { messages: [{ role: "user", content: "hello" }] },
-      stream: false,
-      credentials,
-      providerSessionId: "conversation-hint",
-      clientTool: "claude",
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const firstSession = fetchMock.mock.calls[0][1].headers["x-opencode-session"];
-    const secondSession = fetchMock.mock.calls[1][1].headers["x-opencode-session"];
-    expect(firstSession).toBe(translateSessionId("conversation-hint", "claude", "direct"));
-    expect(secondSession).not.toBe(firstSession);
-    expect(result.response.status).toBe(200);
-  });
 
 
   it("applies the read/shell free-tier fingerprint on Chat Completions", () => {
@@ -539,5 +405,44 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
   it("declares forceStream on the opencode transport so chatCore serves SSE upstream", async () => {
     const { PROVIDERS } = await import("../../open-sse/config/providers.js");
     expect(PROVIDERS.opencode?.forceStream).toBe(true);
+  });
+});
+
+describe("OpenCode Daily Session Set (15/day, random pick)", () => {
+  it("只从当天 15 个里取，不为每个对话造新 id", () => {
+    const executor = getExecutor("opencode");
+    const seen = new Set();
+    for (let i = 0; i < 400; i++) {
+      const { prepared } = prepare(executor, { providerSessionId: `conv-${i}`, clientTool: `tool-${i % 3}` });
+      seen.add(prepared._opencodeSession);
+    }
+    expect(seen.size).toBe(15);
+    for (const id of seen) expect(id).toMatch(OPENCODE_SESSION_RE);
+  });
+
+  it("忽略下游自带 x-opencode-session，不复用客户端传的 id", () => {
+    const executor = getExecutor("opencode");
+    const native = `ses_0123456789ab${"A".repeat(14)}`;
+    const { prepared } = prepare(executor, {
+      credentials: makeCredentials({ rawHeaders: { "x-opencode-session": native } }),
+    });
+    expect(prepared._opencodeSession).not.toBe(native);
+    expect(prepared._opencodeSession).toMatch(OPENCODE_SESSION_RE);
+  });
+
+  it("出口 egress 不参与派生：换 egress 仍是同一批 15 个", () => {
+    const executor = getExecutor("opencode");
+    const seen = new Set();
+    for (let i = 0; i < 300; i++) {
+      const prepared = executor.prepareRequestCredentials({
+        body: { messages: [{ role: "user", content: "hi" }] },
+        credentials: makeCredentials(),
+        providerSessionId: "same-conv",
+        clientTool: "cli",
+        egressId: `egress-${i % 5}`,
+      });
+      seen.add(prepared._opencodeSession);
+    }
+    expect(seen.size).toBe(15);
   });
 });

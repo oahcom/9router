@@ -19,6 +19,43 @@ const MAX_TOOL_NAME_LEN = 128;
 const OPENCODE_UA = "opencode/1.18.31";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+// 每天固定 15 个上游会话，按 YYYYMMDD 派生；每次请求等概率随机取一个。
+// 前缀 12 hex 编码「当天 00:00 + 序号」，counter ∈ 1..15（上游只接受 0..16，>=100 直接 403）。
+const DAILY_SESSION_COUNT = 15;
+let dailySessionCache = { day: "", list: [] };
+
+function sessionDayKey(now = new Date()) {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+
+function dailySessions(day = sessionDayKey()) {
+  if (dailySessionCache.day === day && dailySessionCache.list.length) return dailySessionCache.list;
+  const dayMs = new Date(
+    Number(day.slice(0, 4)),
+    Number(day.slice(4, 6)) - 1,
+    Number(day.slice(6, 8)),
+    0, 0, 0
+  ).getTime();
+  const list = [];
+  for (let i = 0; i < DAILY_SESSION_COUNT; i++) {
+    const prefix = descendingTimeHex(dayMs, i + 1);
+    const digest = crypto.createHash("sha256").update(`opencode-daily-session|${day}|${i}`).digest();
+    let suffix = "";
+    for (let k = 0; k < 14; k++) suffix += BASE62_CHARS[digest[k] % 62];
+    list.push(`ses_${prefix}${suffix}`);
+  }
+  dailySessionCache = { day, list };
+  return list;
+}
+
+function pickDailySession() {
+  const list = dailySessions();
+  return list[crypto.randomInt(0, list.length)];
+}
 // Free-tier fingerprint (mirrors opencode executor, PR #4132): upstream 403s
 // requests without the file-search quartet and without stream:true.
 const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
@@ -246,18 +283,12 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
   }
 
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
+    // 会话 id 只用来吃上游的「每出口 40 个不同 session」闸，派生与下游身份无关：
+    // 每天固定 15 个、每次请求等概率随机取 1 个。
     const sourceCredentials = credentials || {};
-    const native = nativeSession(sourceCredentials.rawHeaders);
-    const resolved = normalizeSession(providerSessionId) || resolveSessionId({
-      headers: sourceCredentials.rawHeaders,
-      body,
-      connectionId: sourceCredentials.connectionId,
-      scope: "opencode-zen",
-    });
-
     return {
       ...sourceCredentials,
-      [SESSION_FIELD]: native || translatedSession(resolved, clientTool),
+      [SESSION_FIELD]: pickDailySession(),
     };
   }
 

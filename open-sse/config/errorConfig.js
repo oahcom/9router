@@ -89,6 +89,40 @@ export const ERROR_RULES = [
   { status: 504, backoff: true },
 ];
 
+/**
+ * 请求体自身超限（上下文溢出）的判别模式 —— 与「凭证是否有问题」无关，
+ * 也与「换个成员能不能服务」无关：prompt 已经超出上限，换任何成员都是同一份
+ * 超长 body 再传一遍。实测某会话 42 分钟 517 条 400 context_length_exceeded，
+ * 全部由「组合层换成员 + 客户端循环重发」放大而来，一次上游尝试就够。
+ *
+ * 只匹配明确点名「上下文/输入太长」的措辞，不碰通用 400（那类换成员仍可能成功）。
+ */
+export const CONTEXT_OVERFLOW_PATTERNS = [
+  "context_length_exceeded",
+  "context length exceeded",
+  "maximum context length",
+  "exceeds the maximum context length",
+  "prompt is too long",
+  "input is too long",
+  "reduce the length of the messages",
+  "exceeds the maximum number of tokens",
+];
+
+/** 上下文溢出以这些状态码出现（OpenAI 400、部分网关 413/422）。 */
+export const CONTEXT_OVERFLOW_STATUSES = [400, 413, 422];
+
+/**
+ * 这条错误是不是「请求体自己超出上下文」。
+ * @param {number} status - HTTP 状态码
+ * @param {string|object} errorText - 上游错误正文/消息
+ * @returns {boolean}
+ */
+export function isContextOverflowError(status, errorText) {
+  if (!CONTEXT_OVERFLOW_STATUSES.includes(status)) return false;
+  const text = (typeof errorText === "string" ? errorText : JSON.stringify(errorText ?? "")).toLowerCase();
+  return CONTEXT_OVERFLOW_PATTERNS.some((p) => text.includes(p));
+}
+
 // Backward compat: COOLDOWN_MS object (used by index.js re-export)
 export const COOLDOWN_MS = {
   unauthorized: COOLDOWN.long,

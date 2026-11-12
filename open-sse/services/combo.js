@@ -3,6 +3,7 @@
  */
 
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
+import { isContextOverflowError } from "../config/errorConfig.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { parseModel } from "./model.js";
@@ -573,6 +574,15 @@ export async function handleComboChat({
       // Normalize error text to string (Worker-safe)
       if (typeof errorText !== "string") {
         try { errorText = JSON.stringify(errorText); } catch { errorText = String(errorText); }
+      }
+
+      // 上下文溢出：prompt 本身超了上限，换成员只是把同一份超长 body 再传一遍。
+      // 实测一条会话 42 分钟产生 517 条 400 context_length_exceeded，放大来源正是
+      // 「组合层换成员 + 客户端循环重发」。这里直接返回该成员自己的 400 响应
+      // （status/body 原样），客户端能看出真实原因；不再尝试其它成员。
+      if (isContextOverflowError(result.status, errorText)) {
+        log.warn("COMBO", `Model ${modelStr} hit context limit (${result.status}); not retrying other members`, { status: result.status });
+        return result;
       }
 
       // Check if should fallback to next model

@@ -33,6 +33,7 @@ import TraeExecutor from "./trae.js";
 import ZedExecutor from "./zed.js";
 import WindsurfExecutor from "./windsurf.js";
 import { DefaultExecutor } from "./default.js";
+import { PROVIDERS } from "../config/providers.js";
 import { MinimaxCodeExecutor } from "./minimax-code.js";
 import { DevinCliExecutor } from "./devin-cli.js";
 
@@ -91,14 +92,56 @@ const executors = {
 
 const defaultCache = new Map();
 
-export function getExecutor(provider) {
-  if (executors[provider]) return executors[provider];
-  if (!defaultCache.has(provider)) defaultCache.set(provider, new DefaultExecutor(provider));
-  return defaultCache.get(provider);
+// ── 未知 provider 的兜底策略 ──────────────────────────────────
+// WHY：getExecutor 过去对任意字符串都兜底到 DefaultExecutor，而 DefaultExecutor
+// 在 id 没有配置时会借用 PROVIDERS.openai（default.js:95 的 `|| PROVIDERS.openai`）。
+// 于是一个拼写变体（opencode_zen / "opencode-zen " / OpenCode-Zen）不报错、不告警，
+// 带着 opencode 的凭据直接打到 api.openai.com，同时绕过了 OpenCodeExecutor 的客户端
+// 指纹加固。失败形态完全静默，只能靠比对出网流量发现。
+//
+// 三种 id 形态**合法地**没有专用执行器，必须放行：
+//   1. 自带 transport 配置的 provider（openai / anthropic / gemini）
+//   2. compat 家族（openai-compatible-* / anthropic-compatible-*）：真实 baseUrl
+//      来自 credentials（base.js buildUrl），借来的 openai 配置只是模板
+//   3. 注册表别名（cu / gcli / gb / mmf / br / brx …）—— 它们本来就在 executors 里
+// 其余一律拒绝。EXECUTOR_UNKNOWN_PROVIDER=warn 可退回旧的静默兜底（应急开关）。
+const COMPAT_PREFIXES = ["openai-compatible-", "anthropic-compatible-"];
+
+function _unknownPolicy() {
+  return String(process.env.EXECUTOR_UNKNOWN_PROVIDER || "error").toLowerCase();
+}
+
+export function getExecutor(provider, options = {}) {
+  const raw = typeof provider === "string" ? provider : String(provider ?? "");
+  const key = raw.trim();
+  const lowered = key.toLowerCase();
+
+  if (executors[key]) return executors[key];
+  if (executors[lowered]) return executors[lowered]; // 容忍大小写/首尾空格
+
+  // options.allowUnknown：调用方自己负责传输、只借用 DefaultExecutor 的
+  // noAuth / refreshCredentials（图片生成就是这种：真正的 URL/headers 由
+  // imageProviders/* 的 adapter 构建，provider id 从不在 PROVIDERS 里）。
+  // 这条路径不算拼写错误，不该按未知 provider 处理。
+  if (options.allowUnknown !== true) {
+    const compat = COMPAT_PREFIXES.some((p) => lowered.startsWith(p));
+    if (!compat && !PROVIDERS[key] && !PROVIDERS[lowered]) {
+      const msg = `[executor] unknown provider ${JSON.stringify(raw)}: `
+        + `no specialized executor and no transport config; refusing to fall back `
+        + `to the openai template (EXECUTOR_UNKNOWN_PROVIDER=warn restores the old `
+        + `silent fallback)`;
+      if (_unknownPolicy() !== "warn") throw new Error(msg);
+      console.warn(msg);
+    }
+  }
+
+  if (!defaultCache.has(raw)) defaultCache.set(raw, new DefaultExecutor(raw));
+  return defaultCache.get(raw);
 }
 
 export function hasSpecializedExecutor(provider) {
-  return !!executors[provider];
+  const key = typeof provider === "string" ? provider.trim() : provider;
+  return !!(executors[key] || executors[String(key).toLowerCase()]);
 }
 
 export { BaseExecutor } from "./base.js";

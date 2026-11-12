@@ -26,9 +26,21 @@ const proxyDispatchers = new Map();
 // 6 个 sing-box 各自独立进程：一条断了换另一条就有救；直连用本机地址去打一个
 // 按地址限流的上游，必然 429，而且不会被 asip 记账（2026-11-10 22:57–23:17 实测 282 次）。
 // 换不到仍按原行为直连——直连是兜底，不是主路；换几次见下方 ATTEMPTS。
-const ASIP_PROXY_PORTS = new Set(
+export const ASIP_PROXY_PORTS = new Set(
   String(process.env.ASIP_LOCAL_PROXY_PORT || "7890,7892,7893,7894,7895,7896")
     .split(",").map((s) => s.trim()).filter(Boolean));
+// 第七闸口（代理池兜底）不进常规轮询池：它只由 asip 的 switch_to_url 引流。
+// 但只要 9router 已经把请求切到 7897，这台 sing-box 上的 429/transport
+// 也必须能触发 asip 换节点，否则在兜底闸上失败就再没有切线机会了。
+// 只扩「可换线端口」，不动 ASIP_PROXY_PORTS —— 那个集合代表常规槽位，
+// 扩进去等于把兜底闸放进常规轮询，破坏严格兜底。
+const ASIP_GATE_PORTS = new Set(
+  String(process.env.ASIP_PROXY_GATE_PORT || "7897")
+    .split(",").map((s) => s.trim()).filter(Boolean));
+const ASIP_ROTATABLE_PORTS = new Set([...ASIP_PROXY_PORTS, ...ASIP_GATE_PORTS]);
+export function isAsipRotatablePort(port) {
+  return ASIP_ROTATABLE_PORTS.has(String(port));
+}
 const ASIP_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
 // 换几发：首发之外最多再换 3 条线。只换一发时，asip 重启风暴很容易抽到另一条
@@ -80,7 +92,7 @@ async function rotateAfterProxyFailure(proxyUrl, proxyOptions, { force = false, 
   }
   if (!ASIP_LOOPBACK_HOSTS.has(parsed.hostname)) return null;
   const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-  if (!ASIP_PROXY_PORTS.has(port)) return null;
+  if (!isAsipRotatablePort(port)) return null;
   rotateWindowCount += 1;
   lastProxyFailureRotateAt = now;
   try {

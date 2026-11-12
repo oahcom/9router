@@ -101,7 +101,7 @@ function body(text) {
   return { messages: [{ role: "user", content: text }], tools: [] };
 }
 
-async function run(text = "hi") {
+async function run(text = "hi", pool = soloPool()) {
   const executor = getExecutor("opencode");
   return executor.execute({
     model: MODEL,
@@ -109,7 +109,7 @@ async function run(text = "hi") {
     stream: false,
     credentials: { rawHeaders: {} },
     clientTool: "claude",
-    proxyOptions: soloPool(),
+    proxyOptions: pool,
     providerSessionId: "conv-solo-" + text,
     log: { warn: vi.fn(), debug: vi.fn(), info: vi.fn() },
     reqId: "solo12345",
@@ -473,5 +473,55 @@ describe("asip rotation without an alternate pool", () => {
     expect(rotateMock).toHaveBeenCalledTimes(0);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(result.response.status).toBe(200);
+  });
+});
+
+// 第七闸口（代理池兜底）：池节点没有 /128 出口地址，旧守卫会因为
+// 「samePort && 没有 targetEgress && 没换过线」把这一发重放全拒掉
+// （线上 30min 内 83 次 refused）。nodeMoved / switchedAt 任一成立即放行。
+describe("asip rotation onto the proxy-pool gate (slot-7)", () => {
+  function gatePool() {
+    return { ...soloPool(), connectionProxyUrl: "http://127.0.0.1:7897" };
+  }
+
+  it("replays when asip rotated a pool node on the same port", async () => {
+    fetchMock.mockResolvedValueOnce(rateLimited()).mockResolvedValueOnce(ok());
+    rotateMock.mockResolvedValueOnce({
+      switched: true,
+      switchedAt: Date.now(),
+      reason: "ok",
+      switchToUrl: "http://127.0.0.1:7897",
+      switchToPool: "slot-7",
+      switchToNode: "pool-node-2",
+      switchToEgress: null,
+      activeEgress: null,
+      lineChanged: true,
+    });
+
+    const result = await run("gate-node-rotate", gatePool());
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);  // 首发 + 重放，守卫没拒绝
+    expect(result.response.status).toBe(200);
+  });
+
+  it("still refuses when asip gives no evidence of a node change", async () => {
+    // 旧版回包：同端口、没有 IP、没有节点名、没有换线时刻 ——
+    // 保持原有防打转语义，不给 9router 白烧一发配额。
+    fetchMock.mockResolvedValueOnce(rateLimited());
+    rotateMock.mockResolvedValueOnce({
+      switched: false,
+      switchedAt: 0,
+      reason: "ok",
+      lineUnknown: false,
+      switchToUrl: "http://127.0.0.1:7897",
+      switchToNode: null,
+      switchToEgress: null,
+      activeEgress: null,
+    });
+
+    const result = await run("gate-no-evidence", gatePool());
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.response.status).toBe(429);
   });
 });

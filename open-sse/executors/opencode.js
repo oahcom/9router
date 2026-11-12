@@ -123,6 +123,43 @@ const MAX_SESSION_LENGTH = 256;
 const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
+
+// 每天固定 15 个上游会话，按 YYYYMMDD 派生；每次请求等概率随机取一个。
+// 前缀 12 hex 编码「当天 00:00 + 序号」，counter ∈ 1..15（上游只接受 0..16，>=100 直接 403）。
+const DAILY_SESSION_COUNT = 15;
+let dailySessionCache = { day: "", list: [] };
+
+function sessionDayKey(now = new Date()) {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}${m}${d}`;
+}
+
+function dailySessions(day = sessionDayKey()) {
+  if (dailySessionCache.day === day && dailySessionCache.list.length) return dailySessionCache.list;
+  const dayMs = new Date(
+    Number(day.slice(0, 4)),
+    Number(day.slice(4, 6)) - 1,
+    Number(day.slice(6, 8)),
+    0, 0, 0
+  ).getTime();
+  const list = [];
+  for (let i = 0; i < DAILY_SESSION_COUNT; i++) {
+    const prefix = descendingTimeHex(dayMs, i + 1);
+    const digest = crypto.createHash("sha256").update(`opencode-daily-session|${day}|${i}`).digest();
+    let suffix = "";
+    for (let k = 0; k < 14; k++) suffix += BASE62_CHARS[digest[k] % 62];
+    list.push(`ses_${prefix}${suffix}`);
+  }
+  dailySessionCache = { day, list };
+  return list;
+}
+
+function pickDailySession() {
+  const list = dailySessions();
+  return list[crypto.randomInt(0, list.length)];
+}
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 // chatCore falls back to `crypto.randomUUID() + Date.now()` for providerSessionId
@@ -414,59 +451,10 @@ function conversationSessionId(credentials, fingerprint) {
 }
 
 function resolveOpencodeSession(body, credentials, providerSessionId, clientTool, egressId = "") {
-  const headers = credentials?.rawHeaders || {};
-  const native = nativeSession(headers);
-  if (native) return native;
-
-  let incoming = null;
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === SESSION_HEADER) {
-      incoming = normalizeSession(value);
-      break;
-    }
-  }
-
-  const seed = typeof providerSessionId === "string" && SYNTHETIC_SESSION_SEED_RE.test(providerSessionId.trim())
-    ? null
-    : providerSessionId;
-  const hinted = incoming || normalizeSession(seed);
-  if (hinted) return translateSessionId(hinted, clientTool, egressId, sessionEpoch(credentials, egressId));
-
-  const fingerprint = conversationFingerprint(body, clientTool);
-
-  if (credentials?.connectionId || bodyHasSessionHints(body)) {
-    let viaManager = null;
-    try {
-      viaManager = resolveSessionId({
-        headers,
-        body,
-        connectionId: credentials?.connectionId,
-        scope: "opencode",
-      });
-    } catch {
-      viaManager = null;
-    }
-    if (viaManager) {
-      // The manager's last resort is a per-connection synthetic id, so every
-      // fresh conversation on a connection would collapse onto one session.
-      const connectionScoped = SYNTHETIC_SESSION_SEED_RE.test(String(viaManager).trim());
-      const hint = connectionScoped && fingerprint
-        ? conversationSessionId(credentials, fingerprint)
-        : viaManager;
-      return translateSessionId(hint, clientTool, egressId, sessionEpoch(credentials, egressId));
-    }
-  }
-
-  if (fingerprint) {
-    return translateSessionId(
-      conversationSessionId(credentials, fingerprint),
-      clientTool,
-      egressId,
-      sessionEpoch(credentials, egressId)
-    );
-  }
-
-  return stableSessionId(credentials, egressId);
+  // 会话 id 只用来吃上游的「每出口 40 个不同 session」闸，派生与下游身份无关：
+  // 每天固定 15 个、每次请求等概率随机取 1 个。其余（透传/翻译/TTL/LRU/对话指纹/
+  // egress 作用域/epoch 轮换）一律不参与。
+  return pickDailySession();
 }
 
 function normalizeResponsesTools(body) {
@@ -729,7 +717,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       "EGRESS",
       `transport stall (${failure}) -> retry once on fresh connection`
       + (rotation ? ` after asip rotation (${rotation.reason})` : " (asip unavailable)")
-      + ` with ${Math.round(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs / 1000)}s header budget`,
+      + ` with >=${Math.round(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs / 1000)}s header budget (scaled by body size)`,
     );
     // 直接走 BaseExecutor：再回 executeInner 会把 429/asip 逻辑重跑一遍。
     // replayBudget：这一趟是「换线后的第二次机会」，asip 经常判「出口正常」不换
@@ -1008,6 +996,10 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 刚才是不是已经在本条请求上撞过」—— 六条线共用一个 /64 池，换一台闸
         // 完全可能落回同一个 /128，那种重试是白打（实测 waxdk3ude 就是这样）。
         const triedEgress = new Set();
+        // 第七闸口的「出口」是池节点 tag，没有 /128 地址。单独记一份，
+        // 作用等价于 triedEgress：同一节点反复重放必然还是同一个 429。
+        const triedPoolNodes = new Set();
+        let attemptNode = null;
         // 首发已经打过了，这里只补换线重试的那几发。
         while (attemptNo < MAX_ROTATE_ATTEMPTS - 1) {
           if (attemptNo > 0 && Date.now() - requestStartedAt > ROTATE_ATTEMPT_BUDGET_MS) {
@@ -1017,6 +1009,13 @@ export class OpenCodeExecutor extends BaseExecutor {
           attemptNo += 1;
           const targetProxyUrl = attempt.switchToUrl || null;
           const targetEgress = attempt.switchToEgress || attempt.activeEgress || null;
+          // 池闸原地换节点：端口不变、没有 IP 地址，但 asip 给了新节点名
+          // 和换节点时刻（switched_at）。节点名本身就是「出口已变」的证据，
+          // 也用来挡住同一节点被反复重放。
+          const targetNode = attempt.switchToNode || null;
+          const repeatsPoolNode = Boolean(targetNode)
+            && (targetNode === attemptNode || triedPoolNodes.has(targetNode));
+          const nodeMoved = Boolean(targetNode) && !repeatsPoolNode;
           const samePort = !targetProxyUrl || targetProxyUrl === attemptProxyUrl;
           // asip 证明过「这条请求发出之后线被换过」：同端口重连拿到的就是新地址，
           // 这时即便它没报地址也有意义（coalesced 走这条）。already_retired 本身
@@ -1029,15 +1028,19 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 再打一发必然是同一个 429，只多烧一次配额和几秒。
           const repeatsEgress = Boolean(targetEgress)
             && (targetEgress === attemptEgress || triedEgress.has(targetEgress));
-          if (repeatsEgress || (samePort && !targetEgress && !lineMoved)) {
+          if (repeatsEgress || repeatsPoolNode
+              || (samePort && !targetEgress && !nodeMoved && !lineMoved)) {
             log?.warn?.(
               "EGRESS",
               `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} refused: no new egress `
-              + `(${targetProxyUrl || attemptProxyUrl} / ${targetEgress || attemptEgress || "unknown"}, reason ${attempt.reason})`,
+              + `(${targetProxyUrl || attemptProxyUrl} / ${targetEgress || attemptEgress || "unknown"}`
+              + ` node=${targetNode || "-"}, reason ${attempt.reason})`,
             );
             break;
           }
           if (targetEgress) triedEgress.add(targetEgress);
+          if (targetNode) triedPoolNodes.add(targetNode);
+          attemptNode = targetNode || attemptNode;
           // 每一发都要清连接池并 bump：sidecar 的 session key 是 proxy|generation，
           // 只清 undici dispatcher 不影响 Bun 那边池化的 socket（上一发刚回 429，
           // socket 还在池里）。最后一发清完即便不重发也无副作用。
@@ -1104,6 +1107,7 @@ export class OpenCodeExecutor extends BaseExecutor {
           attemptEgress = attempt.switchToEgress || attemptEgress || null;
           if (!next || next.restartRequired) break;
           const canContinue = Boolean(next.switchToUrl)
+            || Boolean(next.switchToNode && next.switchToNode !== attemptNode)
             || next.switchedAt >= attemptStartedAt
             || next.reason === "already_retired"
             || next.reason === "line_ok";

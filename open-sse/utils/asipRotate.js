@@ -334,14 +334,21 @@ export async function rotateEgress(
       " to=" + (res.switch_to || "-") +
       " to_line=" + (res.switch_to_tag || "-") +
       " to_ip=" + (res.switch_to_egress || "-") +
+      " to_node=" + (res.switch_to_node || "-") +
       " to_url=" + (res.switch_to_url || "-")
     );
   }
-  // 六条闸都在后台修、没有端口能立刻接管：主链路不再同步兜底，改由本进程
-  // 重启重建连接池，等闸回来。统一放在这里触发，429 / transport / 连接超时
-  // 三条调用路径都覆盖到，不必每个 executor 各写一遍。
+  // 六条闸都在后台修、没有端口能立刻接管。这里只重建「连接」，不动进程：
+  // 作废该端口的 egress generation，后续请求用新 key 建新连接；同时清掉进程内
+  // 冷却表，免得刚被 429 的端口在闸修好后仍被跳过。
+  // 不重启进程的理由：槽位不健康是出口侧（WARP 线）的问题，重启进程不会让闸
+  // 变健康，却要付 Next.js 冷启动数秒、切断全部在途请求、把压缩层一起拖下水
+  // 的代价；而且 asip 后台修闸要时间，进程重启只会变成 60s 一次的自杀循环。
   const restartRequired = Boolean(res.restart_required) && !res.switch_to_url;
-  if (restartRequired) requestAsipSelfRestart();
+  if (restartRequired) {
+    bumpEgressGeneration(proxyUrl, { force: true });
+    proxyCooldowns.clear();
+  }
   // asip 说「这次不知道出口是谁」（无健康备槽 / 并发抢锁）：不要碰本地记录。
   // 那一瞬间 selector 正在被另一次切换改写，读到的任何身份都是旧的；写进去
   // 就是用旧线覆盖真相，下一条 429 会带着错误出口去回溯。
@@ -350,6 +357,9 @@ export async function rotateEgress(
       switchToUrl: res.switch_to_url || null,
       switchToPool: res.switch_to || null,
       switchToEgress: res.switch_to_egress || null,
+      // 第七闸口换的是池节点，没有 /128 出口地址；节点名单独透传，
+      // 让调用方能证明「这台闸确实换了出口」而不必伪造一个 IP。
+      switchToNode: res.switch_to_node || null,
       switched: false,
       switchedAt: Math.round(Number(res.switched_at || 0) * 1000),
       // 要自重启时统一改口成 no_healthy_slot。旧版 asip 在无健康备槽时仍回
@@ -383,6 +393,8 @@ export async function rotateEgress(
     switchToUrl: res.switch_to_url || null,
     switchToPool: res.switch_to || null,
     switchToEgress: res.switch_to_egress || null,
+    // 第七闸口（代理池兜底）的池内换节点：节点 tag 是它唯一的出口身份。
+    switchToNode: res.switch_to_node || null,
     // asip 眼里「这台闸现在挂着哪个出口地址」。没有 switch_to 时（already_retired
     // 的原地重连、line_ok）这是唯一能证明「地址确实换了」的字段：调用方拿它跟
     // 上一发打过的地址比，相同就说明这一发还是同一个 /128，重试没有意义。

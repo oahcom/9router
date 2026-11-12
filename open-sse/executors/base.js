@@ -14,6 +14,14 @@ import { takeRenamedToolNames } from "../utils/opencodeFingerprint.js";
 const ASIP_PROXY_PORTS = new Set(
   String(process.env.ASIP_LOCAL_PROXY_PORT || "7890,7892,7893,7894,7895,7896")
     .split(",").map(s => s.trim()).filter(Boolean));
+// 与 utils/proxyFetch.js 的 ASIP_GATE_PORTS 同步：第七闸口（7897）只在
+// asip 指它为重试目标时才承载流量，但它上面的连接超时同样该触发换线。
+// 这里保持独立定义：base.js 常被带 mock 的单测加载，跨文件 import 新导出
+// 会让那些 mock 漏项，反而把连接超时判据搞坏。
+const ASIP_GATE_PORTS = new Set(
+  String(process.env.ASIP_PROXY_GATE_PORT || "7897")
+    .split(",").map(s => s.trim()).filter(Boolean));
+const ASIP_ROTATABLE_PORTS = new Set([...ASIP_PROXY_PORTS, ...ASIP_GATE_PORTS]);
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
 // 连接超时换线的冷却。一条真的坏掉的端点（域名写错、对端长期不可达）会持续
@@ -144,7 +152,7 @@ export class BaseExecutor {
       const parsed = new URL(String(rawUrl));
       if (!LOOPBACK_HOSTS.has(parsed.hostname)) return false;
       const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-      return ASIP_PROXY_PORTS.has(port);
+      return ASIP_ROTATABLE_PORTS.has(port);
     } catch {
       return false;
     }

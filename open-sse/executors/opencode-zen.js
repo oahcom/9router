@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { asipEgressForPort } from "../utils/asipRotate.js";
 import { isMuseSparkModel, isOpencodeFreeTierModel } from "../providers/models/helpers.js";
 import { applyOpencodeTransportHeaders } from "./opencodeTransportHeaders.js";
 import {
@@ -20,41 +21,57 @@ const OPENCODE_UA = "opencode/1.18.31";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-// 每天固定 15 个上游会话，按 YYYYMMDD 派生；每次请求等概率随机取一个。
-// 前缀 12 hex 编码「当天 00:00 + 序号」，counter ∈ 1..15（上游只接受 0..16，>=100 直接 403）。
-const DAILY_SESSION_COUNT = 15;
-let dailySessionCache = { day: "", list: [] };
+// 每个出口 IP 固定 15 个上游会话；IP 变即重建，IP 内每 10 次轮换一个。
+// 旧方案「每天固定 15 个、全天所有出口复用」会被上游按 session 全局烧穿。
+const SESSION_POOL_SIZE = 15;
+const SESSION_POOL_SWITCH_EVERY = 10;
+const SESSION_POOL_MAX_KEYS = 8192;
+const sessionPools = new Map();
 
-function sessionDayKey(now = new Date()) {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}${m}${d}`;
+function sessionPoolKey(egressIp, egressId) {
+  const ip = String(egressIp || "").trim();
+  if (ip) return `ip:${ip}`;
+  const id = String(egressId || "").trim();
+  return id ? `eg:${id}` : "eg:default";
 }
 
-function dailySessions(day = sessionDayKey()) {
-  if (dailySessionCache.day === day && dailySessionCache.list.length) return dailySessionCache.list;
-  const dayMs = new Date(
-    Number(day.slice(0, 4)),
-    Number(day.slice(4, 6)) - 1,
-    Number(day.slice(6, 8)),
-    0, 0, 0
-  ).getTime();
+function mintSessionPool() {
   const list = [];
-  for (let i = 0; i < DAILY_SESSION_COUNT; i++) {
-    const prefix = descendingTimeHex(dayMs, i + 1);
-    const digest = crypto.createHash("sha256").update(`opencode-daily-session|${day}|${i}`).digest();
-    let suffix = "";
-    for (let k = 0; k < 14; k++) suffix += BASE62_CHARS[digest[k] % 62];
-    list.push(`ses_${prefix}${suffix}`);
+  for (let i = 0; i < SESSION_POOL_SIZE; i++) list.push(generateSessionId());
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(0, i + 1);
+    [list[i], list[j]] = [list[j], list[i]];
   }
-  dailySessionCache = { day, list };
   return list;
 }
 
-function pickDailySession() {
-  const list = dailySessions();
-  return list[crypto.randomInt(0, list.length)];
+function nextSessionInPool(key, { rotate = false } = {}) {
+  let pool = sessionPools.get(key);
+  if (!pool) {
+    if (sessionPools.size >= SESSION_POOL_MAX_KEYS) {
+      sessionPools.delete(sessionPools.keys().next().value);
+    }
+    pool = { list: mintSessionPool(), idx: 0, used: 0, lastUsed: Date.now() };
+    sessionPools.set(key, pool);
+  }
+  pool.lastUsed = Date.now();
+  // LRU：把刚用过的池移到 Map 末尾，淘汰的才是真正的冷池。
+  sessionPools.delete(key);
+  sessionPools.set(key, pool);
+  if (rotate || pool.used >= SESSION_POOL_SWITCH_EVERY) {
+    pool.idx = (pool.idx + 1) % pool.list.length;
+    pool.used = 0;
+  }
+  const id = pool.list[pool.idx];
+  pool.used += 1;
+  if (process.env.OPENCODE_SESSION_TRACE === "1") {
+    console.warn(`[SESSION-ZEN] key=${key} idx=${pool.idx} used=${pool.used} sid=${id}`);
+  }
+  return id;
+}
+
+function pickSessionForEgress(egressIp = "", egressId = "", opts = {}) {
+  return nextSessionInPool(sessionPoolKey(egressIp, egressId), opts);
 }
 // Free-tier fingerprint (mirrors opencode executor, PR #4132): upstream 403s
 // requests without the file-search quartet and without stream:true.
@@ -282,18 +299,29 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
     return super.buildUrl(model, stream, urlIndex, credentials);
   }
 
-  prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
-    // 会话 id 只用来吃上游的「每出口 40 个不同 session」闸，派生与下游身份无关：
-    // 每天固定 15 个、每次请求等概率随机取 1 个。
+  prepareRequestCredentials({ body, credentials, providerSessionId, clientTool, egressId, egressIp } = {}) {
+    // 每个出口 IP 15 个会话；IP 变即重建，IP 内每 10 次轮换一个。
     const sourceCredentials = credentials || {};
     return {
       ...sourceCredentials,
-      [SESSION_FIELD]: pickDailySession(),
+      [SESSION_FIELD]: pickSessionForEgress(egressIp, egressId),
     };
   }
 
   async execute(args) {
-    const credentials = this.prepareRequestCredentials(args);
+    let egressIp = args.egressIp || "";
+    let egressId = args.egressId || "";
+    const proxyUrl = args.proxyOptions?.url || args.proxyOptions?.connectionProxyUrl || null;
+    if (!egressIp && proxyUrl) {
+      try {
+        const line = await asipEgressForPort(proxyUrl, { signal: args.signal });
+        egressIp = line?.egress || line?.tag || "";
+        egressId = egressId || proxyUrl;
+      } catch {
+        // 出口身份查不到就退回 egressId 分组；增强信息失败不能拖垮请求。
+      }
+    }
+    const credentials = this.prepareRequestCredentials({ ...args, egressIp, egressId });
     return super.execute({ ...args, credentials });
   }
 

@@ -165,7 +165,7 @@ describe("每端口出口身份：按端口存、能刷新、会过期", () => {
     const got = await asipEgressForPort("http://127.0.0.1:7892");
     expect(h.httpCalls).toContain("/slots");
     // 7892 不在假快照里 → 保持未知，而不是拿别的端口地址顶替。
-    expect(got).toEqual({ egress: null, since: null });
+    expect(got).toEqual({ egress: null, tag: null, since: null });
   });
 
   it("身份过期后被 /slots 的新地址覆盖，since 不沿用旧线", async () => {
@@ -186,6 +186,6 @@ describe("每端口出口身份：按端口存、能刷新、会过期", () => {
     clock += 31000;
 
     const got = await asipEgressForPort(P3);
-    expect(got).toEqual({ egress: null, since: null });
+    expect(got).toEqual({ egress: null, tag: null, since: null });
   });
 });

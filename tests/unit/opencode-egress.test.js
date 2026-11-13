@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { fetchMock, rotateMock } = vi.hoisted(() => {
+const { fetchMock, rotateMock, egressMock } = vi.hoisted(() => {
   process.env.EGRESS_PROBE_MODE = "off";
   process.env.OPENCODE_TRANSPORT = "off";
-  return { fetchMock: vi.fn(), rotateMock: vi.fn() };
+  return {
+    fetchMock: vi.fn(),
+    rotateMock: vi.fn(),
+    egressMock: vi.fn(async () => ({ egress: null, tag: null, since: null })),
+  };
 });
 
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
@@ -15,8 +19,8 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 vi.mock("../../open-sse/utils/asipRotate.js", () => ({
   rotateEgress: rotateMock,
   asipRotationEnabled: () => true,
-  // 执行器按端口取出口身份；mock 里一律「未知」，等价于改动前的 null。
-  asipEgressForPort: async () => ({ egress: null, since: null }),
+  // 执行器按端口取出口身份；默认「未知」，个别用例可改成 tag / IP。
+  asipEgressForPort: egressMock,
   // 执行器每个请求读一次当前出口地址，429 时交给 asip 查换线表。
   currentAsipEgress: () => null,
   currentAsipEgressSince: () => null,
@@ -114,13 +118,15 @@ function run(executor, { body, proxyOptions, providerSessionId, credentials = { 
 beforeEach(() => {
   fetchMock.mockReset();
   rotateMock.mockReset();
+  egressMock.mockReset();
+  egressMock.mockResolvedValue({ egress: null, tag: null, since: null });
   resetEgressState();
 });
 
 // 备选出口机制已整个删除（单池布局下恒为空集）。429 之后唯一还能换来新出口的
 // 动作是 asip 换线，所以这一组用例断言的都是「asip 换了 / 没换」两条路。
-function asipRotated() {
-  rotateMock.mockImplementation(async () => ({ switched: true, switchedAt: Date.now(), reason: "ok" }));
+function asipRotated(extra = {}) {
+  rotateMock.mockImplementation(async () => ({ switched: true, switchedAt: Date.now(), reason: "ok", ...extra }));
 }
 
 describe("OpenCode free-lane egress switching", () => {
@@ -151,9 +157,9 @@ describe("OpenCode free-lane egress switching", () => {
     const secondSession = second[1].headers["x-opencode-session"];
     expect(firstSession).toMatch(OPENCODE_SESSION_RE);
     expect(secondSession).toMatch(OPENCODE_SESSION_RE);
-    // 换的是隧道不是出口：出口 id 没变，会话也就没必要换。会话按 (对话, 出口) 铸造，
-    // 出口没变化时换会话只会让上游看到一个凭空出现的新身份。
-    expect(secondSession).toBe(firstSession);
+    // 出口身份没变，但 429 重试仍强制在池内换下一个会话：上游按 session 也有
+    // 一层门控，沿用刚被 429 的那个 session 只会再撞一次。
+    expect(secondSession).not.toBe(firstSession);
 
     expect(normalizedBody(second[1].body)).toEqual(normalizedBody(first[1].body));
 
@@ -185,6 +191,60 @@ describe("OpenCode free-lane egress switching", () => {
     expect(normalizedBody(second[1].body)).toEqual(normalizedBody(first[1].body));
   });
 
+
+  it("第七闸口没有 /128：按池节点 tag 分池，换节点后不复用旧会话", async () => {
+    const executor = getExecutor("opencode");
+    const proxyOptions = { ...pool("a", "http://proxy-a.example:8080") };
+    const body = makeBody("node-pool");
+    egressMock.mockResolvedValueOnce({ egress: null, tag: "node-A", since: 1 });
+    egressMock.mockResolvedValueOnce({ egress: null, tag: "node-B", since: 2 });
+    fetchMock.mockResolvedValue(okResponse());
+
+    await run(executor, { body, proxyOptions, providerSessionId: "conv-node-a" });
+    await run(executor, { body, proxyOptions, providerSessionId: "conv-node-b" });
+
+    const firstSession = fetchMock.mock.calls[0][1].headers["x-opencode-session"];
+    const secondSession = fetchMock.mock.calls[1][1].headers["x-opencode-session"];
+    expect(firstSession).toMatch(OPENCODE_SESSION_RE);
+    expect(secondSession).toMatch(OPENCODE_SESSION_RE);
+    expect(secondSession).not.toBe(firstSession);
+  });
+
+  it("429 换到池节点后，重试使用新节点的会话池", async () => {
+    const executor = getExecutor("opencode");
+    const proxyOptions = { ...pool("a", "http://proxy-a.example:8080") };
+    const body = makeBody("node-rotate");
+    egressMock.mockResolvedValue({ egress: null, tag: "node-A", since: 1 });
+    asipRotated({ switchToNode: "node-B" });
+    fetchMock
+      .mockResolvedValueOnce(rateLimitedResponse())
+      .mockResolvedValueOnce(okResponse());
+
+    const result = await run(executor, { body, proxyOptions, providerSessionId: "conv-node-rotate" });
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstSession = fetchMock.mock.calls[0][1].headers["x-opencode-session"];
+    const secondSession = fetchMock.mock.calls[1][1].headers["x-opencode-session"];
+    expect(secondSession).not.toBe(firstSession);
+  });
+
+  it("429 换到新 IP 后，重试使用新 IP 的会话池", async () => {
+    const executor = getExecutor("opencode");
+    const proxyOptions = { ...pool("a", "http://proxy-a.example:8080") };
+    const body = makeBody("ip-rotate");
+    egressMock.mockResolvedValue({ egress: "2a09:bac5:1::1", tag: "line-A", since: 1 });
+    asipRotated({ switchToEgress: "2a09:bac5:2::2" });
+    fetchMock
+      .mockResolvedValueOnce(rateLimitedResponse())
+      .mockResolvedValueOnce(okResponse());
+
+    const result = await run(executor, { body, proxyOptions, providerSessionId: "conv-ip-rotate" });
+    expect(result.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstSession = fetchMock.mock.calls[0][1].headers["x-opencode-session"];
+    const secondSession = fetchMock.mock.calls[1][1].headers["x-opencode-session"];
+    expect(secondSession).not.toBe(firstSession);
+  });
 
   it("on a direct-egress FreeUsageLimitError: keeps the body and retries on the same egress", async () => {
     const executor = getExecutor("opencode");
@@ -371,7 +431,7 @@ describe("OpenCode free-lane egress switching", () => {
     expect(sent).toMatch(OPENCODE_SESSION_RE);
   });
 
-  it("picks from the same daily 15 regardless of egress", () => {
+  it("picks a separate 15-session pool per egress", () => {
     const executor = getExecutor("opencode");
     const credentials = { rawHeaders: {} };
     const body = makeBody();
@@ -383,11 +443,18 @@ describe("OpenCode free-lane egress switching", () => {
       egressId,
     })._opencodeSession;
 
-    const seen = new Set();
-    for (let i = 0; i < 300; i++) seen.add(prepare(`proxy:${i % 3}`));
-
-    expect(seen.size).toBe(15);
-    for (const id of seen) expect(id).toMatch(OPENCODE_SESSION_RE);
+    const byEgress = new Map();
+    for (let i = 0; i < 900; i++) {
+      const egressId = `proxy:${i % 3}`;
+      if (!byEgress.has(egressId)) byEgress.set(egressId, new Set());
+      byEgress.get(egressId).add(prepare(egressId));
+    }
+    for (const seen of byEgress.values()) {
+      expect(seen.size).toBe(15);
+      for (const id of seen) expect(id).toMatch(OPENCODE_SESSION_RE);
+    }
+    const signatures = new Set([...byEgress.values()].map((s) => [...s].sort().join("|")));
+    expect(signatures.size).toBe(3);
   });
 
   it("does not probe direct egress on the normal path", async () => {

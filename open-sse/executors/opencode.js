@@ -124,41 +124,72 @@ const MAX_TOOL_NAME_LEN = 128;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
 
-// 每天固定 15 个上游会话，按 YYYYMMDD 派生；每次请求等概率随机取一个。
-// 前缀 12 hex 编码「当天 00:00 + 序号」，counter ∈ 1..15（上游只接受 0..16，>=100 直接 403）。
-const DAILY_SESSION_COUNT = 15;
-let dailySessionCache = { day: "", list: [] };
+// 每个出口 IP 固定 15 个上游会话；IP 变即重建，IP 内每 10 次轮换一个。
+// 旧方案「每天固定 15 个、全天所有出口复用」实测会被上游按 session 全局烧穿：
+// 同一 IP 换 session 立即 OK，而旧 15 个整串 429（见 asip docs §五）。
+const SESSION_POOL_SIZE = 15;
+const SESSION_POOL_SWITCH_EVERY = 10;
+const SESSION_POOL_MAX_KEYS = 8192;
+const sessionPools = new Map();
+const poolKeyBySessionId = new Map();
 
-function sessionDayKey(now = new Date()) {
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, "0");
-  const d = String(now.getDate()).padStart(2, "0");
-  return `${y}${m}${d}`;
+function sessionPoolKey(egressIp, egressId) {
+  const ip = String(egressIp || "").trim();
+  if (ip) return `ip:${ip}`;
+  const id = String(egressId || "").trim();
+  return id ? `eg:${id}` : "eg:default";
 }
 
-function dailySessions(day = sessionDayKey()) {
-  if (dailySessionCache.day === day && dailySessionCache.list.length) return dailySessionCache.list;
-  const dayMs = new Date(
-    Number(day.slice(0, 4)),
-    Number(day.slice(4, 6)) - 1,
-    Number(day.slice(6, 8)),
-    0, 0, 0
-  ).getTime();
+function mintSessionPool() {
   const list = [];
-  for (let i = 0; i < DAILY_SESSION_COUNT; i++) {
-    const prefix = descendingTimeHex(dayMs, i + 1);
-    const digest = crypto.createHash("sha256").update(`opencode-daily-session|${day}|${i}`).digest();
-    let suffix = "";
-    for (let k = 0; k < 14; k++) suffix += BASE62_CHARS[digest[k] % 62];
-    list.push(`ses_${prefix}${suffix}`);
+  for (let i = 0; i < SESSION_POOL_SIZE; i++) list.push(generateSessionId());
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(0, i + 1);
+    [list[i], list[j]] = [list[j], list[i]];
   }
-  dailySessionCache = { day, list };
   return list;
 }
 
-function pickDailySession() {
-  const list = dailySessions();
-  return list[crypto.randomInt(0, list.length)];
+function evictSessionPool() {
+  if (sessionPools.size < SESSION_POOL_MAX_KEYS) return;
+  const oldestKey = sessionPools.keys().next().value;
+  const oldest = sessionPools.get(oldestKey);
+  sessionPools.delete(oldestKey);
+  if (oldest) for (const id of oldest.list) poolKeyBySessionId.delete(id);
+}
+
+function nextSessionInPool(key, { rotate = false } = {}) {
+  let pool = sessionPools.get(key);
+  if (!pool) {
+    evictSessionPool();
+    pool = { list: mintSessionPool(), idx: 0, used: 0, lastUsed: Date.now() };
+    sessionPools.set(key, pool);
+    for (const id of pool.list) poolKeyBySessionId.set(id, key);
+  }
+  pool.lastUsed = Date.now();
+  // LRU：把刚用过的池移到 Map 末尾，evictSessionPool 淘汰的才是真正的冷池。
+  sessionPools.delete(key);
+  sessionPools.set(key, pool);
+  if (rotate || pool.used >= SESSION_POOL_SWITCH_EVERY) {
+    pool.idx = (pool.idx + 1) % pool.list.length;
+    pool.used = 0;
+  }
+  const id = pool.list[pool.idx];
+  pool.used += 1;
+  if (process.env.OPENCODE_SESSION_TRACE === "1") {
+    console.warn(`[SESSION] key=${key} idx=${pool.idx} used=${pool.used} sid=${id}`);
+  }
+  return id;
+}
+
+function pickSessionForEgress(egressIp = "", egressId = "", opts = {}) {
+  return nextSessionInPool(sessionPoolKey(egressIp, egressId), opts);
+}
+
+function nextSessionInPreparedPool(prepared) {
+  const current = prepared?.[SESSION_FIELD];
+  const key = poolKeyBySessionId.get(current) || sessionPoolKey("", "");
+  return nextSessionInPool(key, { rotate: true });
 }
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -450,11 +481,11 @@ function conversationSessionId(credentials, fingerprint) {
   return `${identityKey(credentials)}:conv:${fingerprint}`;
 }
 
-function resolveOpencodeSession(body, credentials, providerSessionId, clientTool, egressId = "") {
-  // 会话 id 只用来吃上游的「每出口 40 个不同 session」闸，派生与下游身份无关：
-  // 每天固定 15 个、每次请求等概率随机取 1 个。其余（透传/翻译/TTL/LRU/对话指纹/
-  // egress 作用域/epoch 轮换）一律不参与。
-  return pickDailySession();
+function resolveOpencodeSession(body, credentials, providerSessionId, clientTool, egressId = "", egressIp = "", { rotate = false } = {}) {
+  // 会话 id 只用来吃上游的「每出口 40 个不同 session」闸：每个出口 IP 15 个，
+  // IP 变即重建；IP 内每 10 次轮换一个，429 重试时强制换下一个。
+  // 出口 IP 未知时按 egressId（端口）分组。
+  return pickSessionForEgress(egressIp, egressId, { rotate });
 }
 
 function normalizeResponsesTools(body) {
@@ -583,7 +614,7 @@ export function resessionReplayEnabled(env = process.env) {
 }
 
 // 只换 session，不动出口，也**不动全局 epoch**：rotateSession() 会永久 bump 该
-// egress 的会话代际，一次复测不该产生跨请求副作用。每天 15 选 1 有 1/15 概率
+// egress 的会话代际，一次复测不该产生跨请求副作用。同一出口池 15 选 1 有 1/15 概率
 // 抽回原值，撞了重抽最多 5 次；仍撞就放弃 —— 绝不拿「其实没换过 session」的
 // 假复测去给结论盖章。nativeSession（调用方显式指定上游会话）时不能换。
 // 只有 2xx 才证明首发是「单次门控误判」。403 是指纹被拒、5xx 是上游故障、
@@ -598,7 +629,7 @@ export function makeResessionCredentials(prepared) {
   const current = prepared[SESSION_FIELD];
   if (!current) return null;
   for (let i = 0; i < 5; i += 1) {
-    const next = pickDailySession();
+    const next = nextSessionInPreparedPool(prepared);
     if (next && next !== current) {
       return { ...prepared, [SESSION_FIELD]: next };
     }
@@ -651,9 +682,9 @@ export class OpenCodeExecutor extends BaseExecutor {
     return true;
   }
 
-  prepareRequestCredentials({ body, credentials, providerSessionId, clientTool, egressId } = {}) {
+  prepareRequestCredentials({ body, credentials, providerSessionId, clientTool, egressId, egressIp, sessionRotate = false } = {}) {
     const sourceCredentials = credentials || {};
-    const session = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool, egressId);
+    const session = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool, egressId, egressIp, { rotate: sessionRotate });
 
     return {
       ...sourceCredentials,
@@ -765,6 +796,32 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 线（它的探针是小请求，小请求能过、大请求挂着），于是出口地址没变；再按
     // 首次的 20s 判死就是把同一次失败重演一遍（实测 43s = 20+20 后 503）。
     // 多端口：asip 给了健康备槽时必须真的改走它，否则 transport 重试仍撞旧端口。
+    // 跨出口重放必须重建会话凭据：首发 session 属于旧出口（translateSessionId
+    // 的 key 含 egressId），带到新出口 = 固定 session 跨 IP 复用，触上游全局
+    // 拉黑。与 429 换线重试同款（prepareRequestCredentials + sessionRotate）。
+    // 同出口重放仍用原凭据（execute() 注释：重新 prepare 会因缺 egressId
+    // 算出另一个会话 id）。
+    const movedEgress = rotation?.switchToEgress || rotation?.switchToNode || null;
+    // 跨出口重放成功重建凭据后，body/session 属于新出口而非原线 ——
+    // 后面的 borrowed 判据必须看这个标记，不能只看端口是否变了。
+    let credsRebuilt = false;
+    if (movedEgress && movedEgress !== (context?.failedEgress || null)) {
+      try {
+        args = {
+          ...args,
+          credentials: this.prepareRequestCredentials({
+            ...args,
+            egressId: rotation.switchToUrl || "asip-rotated",
+            egressIp: movedEgress,
+            sessionRotate: true,
+          }),
+        };
+        credsRebuilt = true;
+      } catch {
+        // 保底沿用旧凭据：总好过放弃重放。credsRebuilt 保持 false，
+        // 后面 borrowed 判据会把这发当借道（body/session 确实还是原线的）。
+      }
+    }
     const replayStartedAt = Date.now();
     const replayResult = await super.execute({
       ...args,
@@ -795,9 +852,11 @@ export class OpenCodeExecutor extends BaseExecutor {
           proxyUrl: accountingProxyUrl,
           reqId: args?.reqId,
           retryAfterMs: replayRetryAfterMs || 0,
-          // 借道口径与 executeInner 换线重试一致：重放打到的端口 != 发起请求的
-          // 原端口时，这发 429 的 body/session 全属于原线，不能把被借端口判死。
-          borrowed: Boolean(rotation.switchToUrl)
+          // 借道 = body/session 属于原线 + 打到了非原端口。跨出口重放已
+          // sessionRotate 重建凭据（credsRebuilt=true）时不再是借道 ——
+          // 这发 429 是被借端口自己额度耗尽，必须标脏。
+          borrowed: !credsRebuilt
+            && Boolean(rotation.switchToUrl)
             && rotation.switchToUrl !== context?.proxyUrl,
         });
         args.log?.warn?.(
@@ -827,6 +886,8 @@ export class OpenCodeExecutor extends BaseExecutor {
       || args.proxyOptions?.connectionProxyUrl || null;
     const requestLine = await asipEgressForPort(requestProxyUrl, { signal: args.signal });
     const requestEgress = requestLine.egress;
+    // 会话池的出口身份：常规闸口用真实 /128；第七闸口没有 IP，用池节点 tag。
+    const requestEgressKey = requestLine.egress || requestLine.tag || "";
     // 那个地址是什么时候接上的。单有地址分不清「已经切走」和「切走之前发出的
     // 429」—— 前者重连即可，后者必须真换线。带上接入时刻，asip 才能判断这个
     // 缓存值在请求发出时是否已经就位。
@@ -907,7 +968,13 @@ export class OpenCodeExecutor extends BaseExecutor {
           "EGRESS",
           "asip rotated (" + rotated.reason + ") before local 429 -> retry on fresh egress"
         );
-        const retryPrepared = this.prepareRequestCredentials({ ...args, egressId: "asip-rotated" });
+        const retryPrepared = this.prepareRequestCredentials({
+          ...args,
+          egressId: rotated.switchToUrl || "asip-rotated",
+          egressIp: rotated.switchToEgress || rotated.switchToNode
+            || rotated.activeEgress || rotated.activeTag || "",
+          sessionRotate: true,
+        });
         const retried = await super.execute({
           ...args,
           log,
@@ -917,10 +984,14 @@ export class OpenCodeExecutor extends BaseExecutor {
             ? { ...proxyOptions, url: rotated.switchToUrl, enabled: true }
             : proxyOptions,
         });
-        if (rotated.switchToUrl && args.usedCredentials) {
+        if (args.usedCredentials) {
           // 后续若因 503 进入 execute() 的重放，必须知道刚发到的是目标端口。
-          args.usedCredentials.requestProxyUrl = rotated.switchToUrl;
-          args.usedCredentials.requestEgress = rotated.switchToEgress || null;
+          if (rotated.switchToUrl) args.usedCredentials.requestProxyUrl = rotated.switchToUrl;
+          if (rotated.switchToEgress) {
+            args.usedCredentials.requestEgress = rotated.switchToEgress;
+            // 新地址的接入时刻未知，不能沿用旧地址的 since。
+            args.usedCredentials.requestEgressSince = null;
+          }
         }
         if (retried?.response && retried.response.status !== 429) return retried;
         // 目标端口也 429：按本地默认窗口冷却，避免下一条新请求又选中它。
@@ -956,7 +1027,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       };
     }
 
-    const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
+    const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id, egressIp: requestEgressKey });
     // 交给 execute() 做无首字节重试用：它必须在**原出口、原会话**上重放，
     // 拿 args.credentials 重新 prepare 会因缺 egressId 算出另一个会话 id。
     if (args.usedCredentials) {
@@ -1001,16 +1072,32 @@ export class OpenCodeExecutor extends BaseExecutor {
         `${upstreamStatus} on ${describeEgress(egress)} (${rotateReason}); rotation only helps when the host routes through sing-box`
       );
     }
+    // 429 记账不需要 body —— 把 rotateEgress 移到条件门外面。
+    // 旧条件 `retryBody || typeof args.body === "string"` 在 body 为 object 且
+    // cloneRequestBody 失败时会跳过整个 EGRESS 块，导致 429 不记账不换线
+    // （实测 311 个/22h 漏拦）。记账/换线必须无条件执行；重试才需要 body。
+    const firstBodyText = upstreamStatus === 429
+      ? await readResponseText(result.response)
+      : null;
+    const rotateRetryAfterMs = upstreamStatus === 429
+      ? parseRetryAfterMs(result.response.headers, firstBodyText)
+      : null;
+
+    // 记账+换线：对 429/403 无条件执行（不依赖 body），但尊重 ASIP_DISABLED。
+    const asip = asipRotationEnabled() ? await rotateEgress(rotateReason, {
+      signal: args?.signal,
+      requestStartedAt,
+      failedEgress: requestEgress,
+      failedEgressSince: requestEgressSince,
+      proxyUrl: egress?.proxyUrl || null,
+      reqId: args?.reqId,
+      retryAfterMs: rotateRetryAfterMs || 0,
+    }) : { switched: false, switchedAt: 0, reason: "disabled", lineChanged: false, restartRequired: false };
+
     if (retryBody || typeof args.body === "string") {
       // 上游 429 的 Retry-After 必须透传给 asip 写 ban_until：默认 60s 回池
       // 与实测 11~13h 的额度封禁严重错配，标脏当天就会被重新选中。
       // readResponseText 用 response.clone()，不影响后面再读一次正文。
-      const firstBodyText = upstreamStatus === 429
-        ? await readResponseText(result.response)
-        : null;
-      const rotateRetryAfterMs = upstreamStatus === 429
-        ? parseRetryAfterMs(result.response.headers, firstBodyText)
-        : null;
 
       // P0-3 原目标：同出口 + 换 session + 克隆原 body，复测一次（与探针同口径）。
       //   200   => 首发是单次门控误判：直接返回，不报障、不标脏、不换线。
@@ -1095,15 +1182,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         }
       }
 
-      const asip = await rotateEgress(rotateReason, {
-        signal: args?.signal,
-        requestStartedAt,
-        failedEgress: requestEgress,
-        failedEgressSince: requestEgressSince,
-        proxyUrl: egress?.proxyUrl || null,
-        reqId: args?.reqId,
-        retryAfterMs: rotateRetryAfterMs || 0,
-      });
+      // asip 已在条件门外面无条件调用（记账+换线），这里直接复用结果。
       // already_retired：asip 没换线，但这条 429 追的地址在请求发出之后已经被
       // 换掉了 —— 手里这条连接还挂在它上面，重连一次就够，不必再烧一条新线。
       // line_ok 与 already_retired 同理：asip 明确说这条线还能用（实测 OK），
@@ -1191,10 +1270,21 @@ export class OpenCodeExecutor extends BaseExecutor {
           );
           const attemptStartedAt = Date.now();
           lastAttemptStartedAt = attemptStartedAt;
+          // 换线重试必须用目标出口自己的会话池：沿用首发 prepared 会把旧 IP 的
+          // session 带到新出口上，正是上游「每出口 distinct session」闸要拒的形态。
+          const attemptEgressId = targetProxyUrl || egress?.id || "";
+          const attemptEgressKey = targetEgress || targetNode || "";
+          const attemptCredentials = this.prepareRequestCredentials({
+            ...args,
+            egressId: attemptEgressId,
+            egressIp: attemptEgressKey,
+            sessionRotate: true,
+          });
+          if (args.usedCredentials) args.usedCredentials.value = attemptCredentials;
           const current = await super.execute({
             ...args,
             log,
-            credentials: prepared,
+            credentials: attemptCredentials,
             proxyOptions: targetProxyUrl
               ? { ...proxyOptions, url: targetProxyUrl, enabled: true }
               : proxyOptions,
@@ -1203,10 +1293,17 @@ export class OpenCodeExecutor extends BaseExecutor {
             ...(retryBody ? { body: cloneRequestBody(retryBody) || retryBody } : {}),
           });
           if (current) attemptResult = current;
-          if (targetProxyUrl && args.usedCredentials) {
+          if (args.usedCredentials) {
             // 目标端口失败后若触发外层 transport 重放，context 必须指向 B 而不是 A。
-            args.usedCredentials.requestProxyUrl = targetProxyUrl;
-            args.usedCredentials.requestEgress = attempt.switchToEgress || null;
+            if (targetProxyUrl) args.usedCredentials.requestProxyUrl = targetProxyUrl;
+            // 同端口换线（targetEgress 非空）也要更新；否则重放会把旧 IP 当
+            // failedEgress 交给 asip，误判 already_retired。新地址的接入时刻未知，
+            // since 必须置空，不能沿用旧地址的。
+            const nextEgress = targetEgress || attempt.switchToEgress || null;
+            if (nextEgress) {
+              args.usedCredentials.requestEgress = nextEgress;
+              args.usedCredentials.requestEgressSince = null;
+            }
           }
           if (current?.response
               && current.response.status !== 429
@@ -1218,12 +1315,14 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 记账与换线是同一次 /rotate：asip 收到 rate429 会 mark blocked 并挑新槽，
           // 旧实现把返回值丢掉，于是「记了账但不再打」，第二发永远不存在。
           const accountingProxyUrl = targetProxyUrl || attemptProxyUrl;
-          // borrowed：这一发是「借道」重试 —— 请求打到了另一台 sing-box 的端口，
-          // 而 body/session 全属于原线。asip 收到它不能把 429 判成被借线自己
-          // 额度耗尽：否则一条健康线会被别人的请求烧掉 24h。
-          // 同端口原地重连（already_retired / line_ok）不算借道，保持原判。
-          const borrowed = Boolean(targetProxyUrl)
-            && targetProxyUrl !== attemptProxyUrl;
+          // 三发循环的跨端口重试已通过 prepareRequestCredentials + sessionRotate
+          // 重建凭据（egressId/egressIp 指向新端口），body/session 属于当前端口
+          // 而非原线 —— 不是 D14 定义的「借道」。旧判据拿 requestProxyUrl
+          // （executeInner 开头的原始端口，循环内从不更新）比较，跨端口重试
+          // 恒判 true → daemon 走 borrowed_skip 不标脏不换线，被限 IP 不进
+          // 24h 台账、后续请求反复撞墙（2026-11-14 实测 36/57 ERROR 429
+          // 全是 borrowed_skip）。三发循环自身的记账一律按本闸失败处理。
+          const borrowed = false;
           if (targetProxyUrl) markAsipProxyCooling(targetProxyUrl);
           let next = null;
           if (accountingProxyUrl) {
@@ -1252,6 +1351,16 @@ export class OpenCodeExecutor extends BaseExecutor {
           attemptProxyUrl = accountingProxyUrl;
           attemptEgress = attempt.switchToEgress || attemptEgress || null;
           if (!next || next.restartRequired) break;
+          // 闸口（池节点）链只给 1 次重试（D14/trackB）：它承接的全是已失败
+          // 流量（:7897 首发恒 0），救活率 0.87%，第二次（同端口换节点）
+          // 74.5% 仍 429，却必烧一个池节点 + 一条记账（1,069 请求×2 条的来源）。
+          if (targetNode || attemptNode) {
+            log?.warn?.(
+              "EGRESS",
+              `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} gate hop -> 1-attempt budget; stop here`,
+            );
+            break;
+          }
           const canContinue = Boolean(next.switchToUrl)
             || Boolean(next.switchToNode && next.switchToNode !== attemptNode)
             || next.switchedAt >= attemptStartedAt
@@ -1321,6 +1430,9 @@ export class OpenCodeExecutor extends BaseExecutor {
       ...args,
       body: retryBody || args.body,
       egressId: retryEgress.id,
+      egressIp: retryEgress.ip
+        || (retryEgress.kind === "proxy" ? (requestLine.tag || "") : ""),
+      sessionRotate: true,
     });
 
     log?.warn?.(

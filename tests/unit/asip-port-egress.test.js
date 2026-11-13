@@ -48,7 +48,17 @@ describe("每端口出口身份", () => {
   it("asip 不可达时 asipEgressForPort 返回未知而不是抛错", async () => {
     await expect(asipEgressForPort("http://127.0.0.1:7892")).resolves.toEqual({
       egress: null,
+      tag: null,
       since: null,
+    });
+  });
+
+  it("第七闸口没有 IP 时返回池节点 tag 作为出口身份", async () => {
+    notePortLine("http://127.0.0.1:7897", "upoz.example:28065-any", null, 4321);
+    await expect(asipEgressForPort("http://127.0.0.1:7897")).resolves.toEqual({
+      egress: null,
+      tag: "upoz.example:28065-any",
+      since: 4321,
     });
   });
 });

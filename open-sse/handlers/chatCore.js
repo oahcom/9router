@@ -11,6 +11,7 @@ import { runWithReqId } from "../utils/requestContext.js";
 import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { PROVIDERS } from "../config/providers.js";
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+import { rotateEgress, asipRotationEnabled } from "../utils/asipRotate.js";
 import { upstreamResponseHeaders } from "../utils/upstreamHeaders.js";
 import { HTTP_STATUS, TOKEN_SAVER_HEADER } from "../config/runtimeConfig.js";
 import { handleBypassRequest } from "../utils/bypassHandler.js";
@@ -35,6 +36,32 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
+
+// 与 executors/base.js 的 shouldRotateOnConnectTimeout 同判据（独立定义：
+// chatCore 也被带 mock 的单测加载，跨文件 import 新导出会让那些 mock 漏项）。
+// 只有经本机 asip sing-box 闸口（环回主机 + ASIP 可换端口）出去的请求，429 的
+// 记账/换线才有意义；端口集合与 base.js/proxyFetch.js 同源（环境变量可覆盖），
+// 三处独立定义是既定取舍，改动时三处同步。
+const ASIP_GATE_PORTS = new Set([
+  ...String(process.env.ASIP_LOCAL_PROXY_PORT || "7890,7892,7893,7894,7895,7896")
+    .split(",").map((s) => s.trim()).filter(Boolean),
+  ...String(process.env.ASIP_PROXY_GATE_PORT || "7897")
+    .split(",").map((s) => s.trim()).filter(Boolean),
+]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+function isAsipLocalGateProxy(rawUrl) {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(String(rawUrl));
+    if (!LOOPBACK_HOSTS.has(parsed.hostname)) return false;
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    return ASIP_GATE_PORTS.has(port);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -501,6 +528,39 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (!providerResponse.ok) {
     trackPendingRequest(model, provider, connectionId, false, true);
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
+
+    // A1 漏拦修复：429 也要走 asip 记账+换线。DefaultExecutor / openai-compatible
+    // 路径没有 EGRESS 逻辑，429 直接落到这个错误出口（实测 501 个/22h 漏拦）。
+    // 这里补一次 rotateEgress，让 asip daemon 能记账、标脏、换线。
+    //
+    // 判据（与 base.js shouldRotateOnConnectTimeout 同款）：只有经本机 asip 闸口
+    // 出去的请求才记账。直连 / 外部代理 / 他人机器的闸口上的 429 是上游账号级
+    // 限流，与本机出口无关 —— 漏给 /rotate 只会落到 daemon 的 legacy 主出口
+    // 路径，把无辜的主出口 IP 标脏 12h 并切走，殃及同出口的其他流量。
+    if (statusCode === 429 && asipRotationEnabled()) {
+      // vercel relay 出站优先于 connectionProxy（proxyFetch 里 relay 分支在前），
+      // 这种请求没碰本机闸口，记账只会误伤。
+      const gateProxyUrl = proxyOptions?.vercelRelayUrl
+        ? null
+        : resolveEffectiveProxyUrl(providerUrl, proxyOptions).url;
+      if (!isAsipLocalGateProxy(gateProxyUrl)) {
+        log?.debug?.("EGRESS", `429 on ${providerUrl}: egress ${gateProxyUrl || "direct"} is not a local asip gate, skip rotate accounting (req=${reqId})`);
+      } else {
+        try {
+          const raHeader = providerResponse.headers?.get?.("retry-after") || "";
+          const retryAfterMs = raHeader ? (parseFloat(raHeader) || 0) * 1000 : 0;
+          await rotateEgress("rate429", {
+            requestStartedAt: requestStartTime,
+            proxyUrl: gateProxyUrl,
+            reqId,
+            retryAfterMs: retryAfterMs || 0,
+          });
+        } catch (e) {
+          log?.warn?.("EGRESS", `chatCore 429 accounting failed: ${e?.message ?? String(e)}`);
+        }
+      }
+    }
+
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,

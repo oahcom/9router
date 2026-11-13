@@ -255,7 +255,7 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
   }
 
 
-  it("isolates stable sessions by downstream identity", () => {
+  it("同一出口共享一个 15 会话池（与下游身份无关）", () => {
     const executor = getExecutor("opencode");
     const body = { messages: [{ role: "user", content: "hello" }] };
     const forKey = (auth) => executor.prepareRequestCredentials({
@@ -263,9 +263,10 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
       credentials: anonymousCredentials(auth),
       providerSessionId: null,
       clientTool: "claude",
+      egressId: "same-egress",
     })._opencodeSession;
 
-    expect(forKey("user-A")).not.toBe(forKey("user-B"));
+    expect(forKey("user-A")).toBe(forKey("user-B"));
     expect(forKey("user-A")).toMatch(OPENCODE_SESSION_RE);
   });
 
@@ -408,8 +409,8 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
   });
 });
 
-describe("OpenCode Daily Session Set (15/day, random pick)", () => {
-  it("只从当天 15 个里取，不为每个对话造新 id", () => {
+describe("OpenCode Per-Egress Session Pool (15/egress, rotate every 10)", () => {
+  it("同一出口只从 15 个里取，不为每个对话造新 id", () => {
     const executor = getExecutor("opencode");
     const seen = new Set();
     for (let i = 0; i < 400; i++) {
@@ -418,6 +419,24 @@ describe("OpenCode Daily Session Set (15/day, random pick)", () => {
     }
     expect(seen.size).toBe(15);
     for (const id of seen) expect(id).toMatch(OPENCODE_SESSION_RE);
+  });
+
+  it("第 151 次回绕到第 1 个（15×10 均分循环）", () => {
+    const executor = getExecutor("opencode");
+    const egressId = `egress-wrap-${Date.now()}`;
+    const picks = [];
+    for (let i = 0; i < 151; i++) {
+      const prepared = executor.prepareRequestCredentials({
+        body: { messages: [{ role: "user", content: "hi" }] },
+        credentials: makeCredentials(),
+        providerSessionId: "wrap-conv",
+        clientTool: "cli",
+        egressId,
+      });
+      picks.push(prepared._opencodeSession);
+    }
+    expect(new Set(picks).size).toBe(15);
+    expect(picks[150]).toBe(picks[0]);
   });
 
   it("忽略下游自带 x-opencode-session，不复用客户端传的 id", () => {
@@ -430,19 +449,79 @@ describe("OpenCode Daily Session Set (15/day, random pick)", () => {
     expect(prepared._opencodeSession).toMatch(OPENCODE_SESSION_RE);
   });
 
-  it("出口 egress 不参与派生：换 egress 仍是同一批 15 个", () => {
+  it("每个出口各自 15 个会话，换 egress 重建一批", () => {
     const executor = getExecutor("opencode");
-    const seen = new Set();
-    for (let i = 0; i < 300; i++) {
+    const byEgress = new Map();
+    for (let i = 0; i < 1500; i++) {
+      const egressId = `egress-${i % 5}`;
       const prepared = executor.prepareRequestCredentials({
         body: { messages: [{ role: "user", content: "hi" }] },
         credentials: makeCredentials(),
         providerSessionId: "same-conv",
         clientTool: "cli",
-        egressId: `egress-${i % 5}`,
+        egressId,
       });
-      seen.add(prepared._opencodeSession);
+      if (!byEgress.has(egressId)) byEgress.set(egressId, new Set());
+      byEgress.get(egressId).add(prepared._opencodeSession);
     }
-    expect(seen.size).toBe(15);
+    for (const seen of byEgress.values()) {
+      expect(seen.size).toBe(15);
+      for (const id of seen) expect(id).toMatch(OPENCODE_SESSION_RE);
+    }
+    const signatures = new Set([...byEgress.values()].map((s) => [...s].sort().join("|")));
+    expect(signatures.size).toBe(5);
+  });
+
+  it("同一出口每 10 次切下一个，11 次出现第二个会话", () => {
+    const executor = getExecutor("opencode");
+    const seen = [];
+    for (let i = 0; i < 11; i++) {
+      seen.push(executor.prepareRequestCredentials({
+        body: { messages: [{ role: "user", content: "hi" }] },
+        credentials: makeCredentials(),
+        providerSessionId: "rotate-conv",
+        clientTool: "cli",
+        egressId: "rotate-port",
+        egressIp: "2a09:bac5:ffff::10",
+      })._opencodeSession);
+    }
+    expect(new Set(seen.slice(0, 10)).size).toBe(1);
+    expect(seen[10]).not.toBe(seen[0]);
+  });
+
+  it("egressIp 优先于 egressId：同一端口不同 IP 不共用会话", () => {
+    const executor = getExecutor("opencode");
+    const a = new Set();
+    const b = new Set();
+    for (let i = 0; i < 300; i++) {
+      a.add(executor.prepareRequestCredentials({
+        body: { messages: [{ role: "user", content: "hi" }] },
+        credentials: makeCredentials(), providerSessionId: "ip-a", clientTool: "cli",
+        egressId: "same-port", egressIp: "2a09:bac5:ffff::a",
+      })._opencodeSession);
+      b.add(executor.prepareRequestCredentials({
+        body: { messages: [{ role: "user", content: "hi" }] },
+        credentials: makeCredentials(), providerSessionId: "ip-b", clientTool: "cli",
+        egressId: "same-port", egressIp: "2a09:bac5:ffff::b",
+      })._opencodeSession);
+    }
+    expect(a.size).toBe(15);
+    expect(b.size).toBe(15);
+    for (const id of a) expect(b.has(id)).toBe(false);
+  });
+
+  it("sessionRotate 强制换到池内下一个会话", () => {
+    const executor = getExecutor("opencode");
+    const base = {
+      body: { messages: [{ role: "user", content: "hi" }] },
+      credentials: makeCredentials(),
+      providerSessionId: "rotate-explicit",
+      clientTool: "cli",
+      egressId: "rotate-explicit-port",
+      egressIp: "2a09:bac5:ffff::20",
+    };
+    const first = executor.prepareRequestCredentials(base)._opencodeSession;
+    const second = executor.prepareRequestCredentials({ ...base, sessionRotate: true })._opencodeSession;
+    expect(second).not.toBe(first);
   });
 });

@@ -164,6 +164,17 @@ export function clearAsipProxyCooling(proxyUrl) {
 
 function applyProxyCooldownFromResponse(proxyUrl, res) {
   if (!proxyUrl || !res) return;
+  // D16：预冷却是「先躲开端口」的保守动作（asip 不可达时的兜底）。当 asip
+  // 回话给出「端口无责」的结论（线已被换走 already_retired / 本次没换线
+  // coalesced、too_frequent / 实测 OK line_ok）时必须撤销，否则健康端口会被
+  // 冷却 15 秒 —— daemon 从不返回 line_ok 以外的清除信号，预冷却是有去无回
+  // 的（already_retired/coalesced/too_frequent 全部白吃冷却）。撤销后再按
+  // avoid_port_until 重打：asip 显式要求避让的窗口（如 coalesced 且在修整）
+  // 仍然生效。
+  if (res.reason === "already_retired" || res.reason === "coalesced"
+      || res.reason === "too_frequent" || res.reason === "line_ok") {
+    clearAsipProxyCooling(proxyUrl);
+  }
   const untilSec = Number(res.avoid_port_until);
   if (Number.isFinite(untilSec) && untilSec > 0) {
     markAsipProxyCooling(proxyUrl, untilSec * 1000);
@@ -526,11 +537,11 @@ export async function refreshSlotEgress({ signal = null } = {}) {
 /** 这条请求走的端口现在挂着哪个出口。查不到时问一次 /slots。 */
 export async function asipEgressForPort(proxyUrl, { signal = null } = {}) {
   const port = portOfProxyUrl(proxyUrl);
-  if (!port) return { egress: null, since: null };
+  if (!port) return { egress: null, tag: null, since: null };
   const cached = PORT_LINES.get(port);
   const now = Date.now();
   if (cached?.egress && now - (cached.at || 0) < PORT_LINE_TTL_MS) {
-    return { egress: cached.egress, since: cached.since ?? null };
+    return { egress: cached.egress, tag: cached.tag || null, since: cached.since ?? null };
   }
   await refreshSlotEgress({ signal });
   const after = PORT_LINES.get(port);
@@ -538,6 +549,9 @@ export async function asipEgressForPort(proxyUrl, { signal = null } = {}) {
   const refreshed = after?.at && Date.now() - after.at < PORT_LINE_TTL_MS;
   return {
     egress: refreshed ? (after.egress || null) : null,
+    // 第七闸口（proxy 池）没有 /128 出口地址；tag 是池节点，换节点时它会变，
+    // 调用方拿它当会话池的出口身份，避免换节点后继续复用旧池。
+    tag: refreshed ? (after.tag || null) : null,
     since: refreshed ? (after.since ?? null) : null,
   };
 }

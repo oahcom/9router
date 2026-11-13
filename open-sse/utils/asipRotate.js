@@ -287,7 +287,7 @@ function callAsip(path, payload, signal = null) {
  */
 export async function rotateEgress(
   reason = "rate429",
-  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null, reqId = null, retryAfterMs = 0 } = {},
+  { signal = null, requestStartedAt = 0, failedEgress = null, failedEgressSince = null, proxyUrl = null, reqId = null, retryAfterMs = 0, borrowed = false } = {},
 ) {
   // 调用方没带 reqId 时退回请求上下文：proxyFetch 那一层拿不到请求标识，
   // 它发起的 transport 换线在 asip 侧于是全是 req=-（实测 281 条），
@@ -313,6 +313,8 @@ export async function rotateEgress(
     ...(failedEgressSince > 0 ? { egress_since: failedEgressSince } : {}),
     ...(proxyUrl ? { egress_proxy_url: proxyUrl } : {}),
     ...(reqId ? { req_id: String(reqId) } : {}),
+    // 借道标记：这条 429 的请求不是本端口发起的。asip 据此只冷却、不判死。
+    ...(borrowed ? { borrowed: true } : {}),
   }, signal);
   // 超时和「asip 没在跑」是两回事：超时说明换线很可能已经发生、只是没等到回话，
   // 调用方要据此提前重建连接（审查发现）。
@@ -326,6 +328,7 @@ export async function rotateEgress(
       "[ASIP] rotate req=" + reqId +
       " port=" + (proxyUrl || "-") +
       " reason=" + (res.reason || "?") +
+      (borrowed ? " borrowed=1" : "") +
       " switched=" + Boolean(res.switched) +
       " restart=" + Boolean(res.restart_required) +
       " line=" + (res.offending_tag || res.active_tag || "-") +

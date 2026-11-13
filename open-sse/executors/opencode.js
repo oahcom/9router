@@ -754,6 +754,10 @@ export class OpenCodeExecutor extends BaseExecutor {
           proxyUrl: accountingProxyUrl,
           reqId: args?.reqId,
           retryAfterMs: replayRetryAfterMs || 0,
+          // 借道口径与 executeInner 换线重试一致：重放打到的端口 != 发起请求的
+          // 原端口时，这发 429 的 body/session 全属于原线，不能把被借端口判死。
+          borrowed: Boolean(rotation.switchToUrl)
+            && rotation.switchToUrl !== context?.proxyUrl,
         });
         args.log?.warn?.(
           "EGRESS",
@@ -1086,6 +1090,12 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 记账与换线是同一次 /rotate：asip 收到 rate429 会 mark blocked 并挑新槽，
           // 旧实现把返回值丢掉，于是「记了账但不再打」，第二发永远不存在。
           const accountingProxyUrl = targetProxyUrl || attemptProxyUrl;
+          // borrowed：这一发是「借道」重试 —— 请求打到了另一台 sing-box 的端口，
+          // 而 body/session 全属于原线。asip 收到它不能把 429 判成被借线自己
+          // 额度耗尽：否则一条健康线会被别人的请求烧掉 24h。
+          // 同端口原地重连（already_retired / line_ok）不算借道，保持原判。
+          const borrowed = Boolean(targetProxyUrl)
+            && targetProxyUrl !== attemptProxyUrl;
           if (targetProxyUrl) markAsipProxyCooling(targetProxyUrl);
           let next = null;
           if (accountingProxyUrl) {
@@ -1101,6 +1111,7 @@ export class OpenCodeExecutor extends BaseExecutor {
                 proxyUrl: accountingProxyUrl,
                 reqId: args?.reqId,
                 retryAfterMs: attemptRetryAfterMs || 0,
+                borrowed,
               });
               log?.warn?.(
                 "EGRESS",

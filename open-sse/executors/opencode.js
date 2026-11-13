@@ -565,6 +565,47 @@ function cloneRequestBody(body) {
   }
 }
 
+// ── P0-3：生产侧 429 的同口径复测 ──────────────────────────────────────────
+// 探针侧 probe_warp.py:598-610 在 quota 之后换一代 session 复测一次，用「换会话」
+// 排除上游对单次请求的门控；生产侧此前一见 FreeUsageLimitError 就报障，零复测，
+// 于是同一个错误码有两套判决标准。这里只提供开关与「确实换过 session 的凭据」，
+// 复测动作在 executeInner 的 429 首发之后、rotateEgress 之前。
+// 默认关闭：OPENCODE_429_RESESSION_REPLAY=on 才启用，未验证前不改生产行为。
+const RESESSION_REPLAY_ENV = "OPENCODE_429_RESESSION_REPLAY";
+// replay 发生在 rotateEgress 之前，上游真把额度耗尽时它会一直等到上游回话，
+// 直接吃掉 ROTATE_ATTEMPT_BUDGET_MS，换线重试首轮即 budget spent。给 replay
+// 一个硬上限：到点放弃复测，把预算留给换线重试。
+const RESESSION_REPLAY_TIMEOUT_MS = 8000;
+
+export function resessionReplayEnabled(env = process.env) {
+  const v = String(env?.[RESESSION_REPLAY_ENV] ?? "").trim().toLowerCase();
+  return v === "on" || v === "1" || v === "true";
+}
+
+// 只换 session，不动出口，也**不动全局 epoch**：rotateSession() 会永久 bump 该
+// egress 的会话代际，一次复测不该产生跨请求副作用。每天 15 选 1 有 1/15 概率
+// 抽回原值，撞了重抽最多 5 次；仍撞就放弃 —— 绝不拿「其实没换过 session」的
+// 假复测去给结论盖章。nativeSession（调用方显式指定上游会话）时不能换。
+// 只有 2xx 才证明首发是「单次门控误判」。403 是指纹被拒、5xx 是上游故障、
+// 429 是确认额度耗尽 —— 这三类都不能跳过报障。抽成纯函数让判据有单测锁住。
+export function isResessionReplaySuccess(status) {
+  return Number.isInteger(status) && status >= 200 && status < 300;
+}
+
+export function makeResessionCredentials(prepared) {
+  if (!prepared || typeof prepared !== "object") return null;
+  if (nativeSession(prepared?.rawHeaders)) return null;
+  const current = prepared[SESSION_FIELD];
+  if (!current) return null;
+  for (let i = 0; i < 5; i += 1) {
+    const next = pickDailySession();
+    if (next && next !== current) {
+      return { ...prepared, [SESSION_FIELD]: next };
+    }
+  }
+  return null;
+}
+
 const ERROR_TEXT_LIMIT = 8 * 1024;
 
 // 503 的错误体可能是 SSE：.text() 会等到流结束才返回，把一次失败拖成分钟级。
@@ -964,9 +1005,96 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 上游 429 的 Retry-After 必须透传给 asip 写 ban_until：默认 60s 回池
       // 与实测 11~13h 的额度封禁严重错配，标脏当天就会被重新选中。
       // readResponseText 用 response.clone()，不影响后面再读一次正文。
-      const rotateRetryAfterMs = upstreamStatus === 429
-        ? parseRetryAfterMs(result.response.headers, await readResponseText(result.response))
+      const firstBodyText = upstreamStatus === 429
+        ? await readResponseText(result.response)
         : null;
+      const rotateRetryAfterMs = upstreamStatus === 429
+        ? parseRetryAfterMs(result.response.headers, firstBodyText)
+        : null;
+
+      // P0-3 原目标：同出口 + 换 session + 克隆原 body，复测一次（与探针同口径）。
+      //   200   => 首发是单次门控误判：直接返回，不报障、不标脏、不换线。
+      //   仍 429 => 确认该出口额度耗尽，落回原报障路径；报障仍以首发的
+      //             requestStartedAt / retryAfterMs 为准，复测这一发不另记账。
+      // 走 super.execute（BaseExecutor）绕开 executeInner 的 429 处置链，杜绝
+      // 「重放 → 换线 → 重放」递归；proxyOptions 原样 = 绝不换端口（换端口就
+      // 变成借道重试，测的不再是这个出口）。
+      const replayBodySource = retryBody
+        || (typeof args.body === "string" ? args.body : null);
+      if (resessionReplayEnabled()
+          && upstreamStatus === 429
+          && /FreeUsageLimitError/.test(firstBodyText || "")
+          && replayBodySource) {
+        const replayCredentials = makeResessionCredentials(prepared);
+        if (replayCredentials) {
+          if (args?.signal?.aborted) {
+            // 客户端已经走了，复测注定没人收结果：直接跳过，别再烧一发上游配额。
+            log?.warn?.("EGRESS", "429 re-session replay skipped (caller signal aborted)");
+          } else {
+          log?.warn?.("EGRESS", "429 re-session replay -> same egress, fresh session");
+          // replay 串行挡在 rotateEgress 之前，不能让它无限等上游：8s 硬上限，
+          // 到点放弃复测，把 ROTATE_ATTEMPT_BUDGET_MS 留给换线重试。
+          // 外层 signal 与定时器指向同一个内部 controller，谁先到点谁 abort。
+          const replayCtrl = new AbortController();
+          const onReplayOuterAbort = () => replayCtrl.abort(args.signal.reason);
+          args.signal?.addEventListener?.("abort", onReplayOuterAbort, { once: true });
+          let replayTimedOut = false;
+          const replayTimer = setTimeout(() => {
+            replayTimedOut = true;
+            replayCtrl.abort();
+          }, RESESSION_REPLAY_TIMEOUT_MS);
+          const replayStartedAt = Date.now();
+          try {
+            const replayed = await super.execute({
+              ...args,
+              log,
+              credentials: replayCredentials,
+              body: cloneRequestBody(replayBodySource) || replayBodySource,
+              proxyOptions,
+              usedCredentials: undefined,
+              signal: replayCtrl.signal,
+            });
+            const replayStatus = replayed?.response?.status ?? null;
+            if (isResessionReplaySuccess(replayStatus)) {
+              log?.warn?.("EGRESS",
+                `429 re-session replay -> ${replayStatus} (false positive); skip accounting`);
+              return replayed;
+            }
+            log?.warn?.("EGRESS",
+              `429 re-session replay -> ${replayStatus ?? "no response"}; continue accounting`);
+          } catch (error) {
+            if (args?.signal?.aborted) {
+              // 外层先断了：照实说，别把客户端断开报成复测超时。
+              log?.warn?.("EGRESS",
+                "429 re-session replay aborted (caller gone); continue accounting");
+            } else if (replayTimedOut || error?.name === "AbortError") {
+              // 超时按复测失败处理：落入下方报障路径，不额外记账、不 return。
+              // AbortError 的裸 message（"This operation was aborted"）没有信息量。
+              log?.warn?.("EGRESS",
+                `429 re-session replay timeout after ${RESESSION_REPLAY_TIMEOUT_MS}ms; continue accounting`);
+            } else {
+              log?.warn?.("EGRESS",
+                `429 re-session replay failed: ${error?.message ?? String(error)}`);
+            }
+          } finally {
+            clearTimeout(replayTimer);
+            args?.signal?.removeEventListener?.("abort", onReplayOuterAbort);
+            const replayElapsedMs = Date.now() - replayStartedAt;
+            if (replayElapsedMs > 3000) {
+              log?.warn?.("EGRESS",
+                `429 re-session replay took ${replayElapsedMs}ms (> 3000ms); watch rotate budget`);
+            }
+          }
+          }
+        } else {
+          // 凭据不可复测，跳过复测直接走报障；区分原因便于排查复测为何没发生。
+          const skipReason = nativeSession(prepared?.rawHeaders)
+            ? "native session"
+            : (!prepared?.[SESSION_FIELD] ? "missing session" : "session reroll collided x5");
+          log?.warn?.("EGRESS", `429 re-session replay skipped (${skipReason}); credentials not retestable`);
+        }
+      }
+
       const asip = await rotateEgress(rotateReason, {
         signal: args?.signal,
         requestStartedAt,

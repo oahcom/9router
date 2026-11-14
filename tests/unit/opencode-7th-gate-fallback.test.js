@@ -281,4 +281,44 @@ describe("7th-gate fallback reachability", () => {
     expect(warned(logWarn, "give-up -> 7th-gate")).toBe(true);
     expect(result.response.status).toBe(429);
   });
+
+  it("retries a cross-port line even when the reply's active_egress is the failed one", async () => {
+    // 跨端口换线时 daemon 回包的 active_egress 是**原端口**那条线的地址，不是目标
+    // 端口的出口。旧实现无条件回退到它 -> targetEgress === attemptEgress -> 判
+    // 「原地打转」白拒一发（2026-11-15 03:55 wgtsasri7：switch_to_url=:7892 却拿
+    // :7894 的 IP 判重复，5 发只打 2 发就 break）。跨端口必须照打：出口身份只有
+    // 同端口（原地换线）时 active_egress 才可信。
+    fetchMock
+      .mockResolvedValueOnce(rateLimited())
+      .mockResolvedValueOnce(rateLimited())
+      .mockResolvedValueOnce(ok());
+    rotateMock
+      .mockResolvedValueOnce({
+        switched: true,
+        switchedAt: Date.now(),
+        reason: "ok",
+        switchToUrl: "http://127.0.0.1:7896",
+        switchToNode: null,
+        switchToEgress: "egress-b",
+        activeEgress: null,
+        lineChanged: true,
+      })
+      // 跨端口换线：没有 switch_to_egress，active_egress 回的是刚打挂的 egress-b
+      .mockResolvedValueOnce({
+        switched: true,
+        restartRequired: false,
+        switchToUrl: "http://127.0.0.1:7898",
+        switchToNode: null,
+        switchToEgress: null,
+        activeEgress: "egress-b",
+        switchedAt: Date.now(),
+        reason: "ok",
+      });
+
+    const { result, logWarn } = await run("fb-cross-port");
+
+    expect(fetchMock).toHaveBeenCalledTimes(3); // 首发 + :7896 + :7898，不许白拒
+    expect(warned(logWarn, "no new egress")).toBe(false);
+    expect(result.response.status).toBe(200);
+  });
 });

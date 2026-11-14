@@ -1337,13 +1337,19 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 于是「targetEgress === attemptEgress」成立 → repeatsEgress →
           // refused（线上实测 30min 内 83 次）。池闸的出口身份只有节点名，
           // 绝不能让旧 IP 顶替；常规闸口的 switch_to_egress 仍是真地址。
+          // 跨端口重试时 daemon 回包的 active_egress 是**原端口**那条线的地址，
+          // 不是目标端口的出口（与池闸同一个陷阱）。旧实现无条件回退到它，
+          // 于是 targetEgress === attemptEgress 成立 -> repeatsEgress -> 白拒
+          // 一发，5 发只打 2 发就 break（2026-11-15 03:55 wgtsasri7 实测：
+          // switch_to_url=:7892 却拿 :7894 的 IP 判「原地打转」）。active_egress
+          // 只在同端口（原地换线）时才有资格代表目标出口。
+          const samePort = !targetProxyUrl || targetProxyUrl === attemptProxyUrl;
           const targetEgress = targetNode
             ? null
-            : (attempt.switchToEgress || attempt.activeEgress || null);
+            : (attempt.switchToEgress || (samePort ? attempt.activeEgress : null) || null);
           const repeatsPoolNode = Boolean(targetNode)
             && (targetNode === attemptNode || triedPoolNodes.has(targetNode));
           const nodeMoved = Boolean(targetNode) && !repeatsPoolNode;
-          const samePort = !targetProxyUrl || targetProxyUrl === attemptProxyUrl;
           // asip 证明过「这条请求发出之后线被换过」：同端口重连拿到的就是新地址，
           // 这时即便它没报地址也有意义（coalesced 走这条）。already_retired 本身
           // 就是这个结论 —— 它只在 exit ledger 里这条地址的退役时刻晚于请求发出时

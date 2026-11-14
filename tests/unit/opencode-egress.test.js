@@ -372,13 +372,13 @@ describe("OpenCode free-lane egress switching", () => {
     const proxyOptions = { ...primary };
     asipRotated();
 
-    // 首发 + OPENCODE_ROTATE_ATTEMPTS(默认 3) 发，每发都换线、每发都 429。
+    // 首发 + OPENCODE_ROTATE_ATTEMPTS(默认 6) 发，每发都换线、每发都 429。
     fetchMock.mockResolvedValue(rateLimitedResponse({ type: "RateLimitError", headers: { "retry-after": "30" } }));
 
     const result = await run(executor, { body: makeBody(), proxyOptions, providerSessionId: "conv-once" });
 
     expect(result.response.status).toBe(429);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(6); // 1 首发 + 5 换线重试（MAX_ROTATE_ATTEMPTS=6）
     expect(getEgressCooldown(identifyFixedEgress(TARGET, primary))).toBeNull();
   });
 

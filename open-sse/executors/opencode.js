@@ -908,11 +908,29 @@ export class OpenCodeExecutor extends BaseExecutor {
         && replay429Next.switchToUrl !== accountingProxyUrl;
       const freshEgress = Boolean(replay429Next?.switchToEgress)
         && replay429Next.switchToEgress !== (rotation.switchToEgress || context?.failedEgress || null);
-      if (!replay429Next?.restartRequired && (freshUrl || freshEgress)) {
+      // already_retired 也算有线可走（与主环 lineMoved 同口径）。
+      // already_retired = daemon 确认 429 追的出口在请求发出之后已被换走，
+      //   同端口重连即新出口，不必烧新线。主环 lineMoved 有此判据，
+      //   重放路径之前漏了（2026-11-14 回潮 leak 10/10 全是这条）。
+      // egressStillCurrent veto（与主环同口径）：daemon 回包 active_egress 仍
+      //   是失败地址（IP 回收/台账旧记录），重连必然还是它，不算"线已移走"。
+      const replayFailedEgress = rotation.switchToEgress || context?.failedEgress || null;
+      const replayEgressStillCurrent = Boolean(replay429Next?.activeEgress)
+        && replay429Next.activeEgress === (replay429Next?.switchToEgress || replayFailedEgress || null);
+      // line_ok 不算：主环对 line_ok 由 repeatsEgress 拒绝重试（同址白打），
+      //   replay 路径同口径 —— 同出口重试必然还是同一个 429。
+      const replayLineMoved = replay429Next?.reason === "already_retired" && !replayEgressStillCurrent;
+      if (!replay429Next?.restartRequired && (freshUrl || freshEgress || replayLineMoved)) {
         args.log?.warn?.(
           "EGRESS",
-          `replay 429 -> continue on fresh ${freshUrl ? replay429Next.switchToUrl : replay429Next.switchToEgress} (no sacrifice)`,
+          `replay 429 -> continue on ${freshUrl ? replay429Next.switchToUrl : freshEgress ? replay429Next.switchToEgress : "same-port (already_retired)"} (no sacrifice)`,
         );
+        // already_retired：旧出口已退役，同端口连接池里 socket 还挂在旧隧道
+        // 上，必须清掉让 executeInner 重连拿到新出口（与主环 lineMoved 后
+        // invalidateEgressConnections 同口径）。line_ok 不清——线没换。
+        if (replay429Next?.reason === "already_retired" && !replayEgressStillCurrent && !freshUrl) {
+          invalidateEgressConnections(accountingProxyUrl);
+        }
         return this.executeInner({
           ...args,
           body: cloneRequestBody(args.body) || args.body,
@@ -1285,6 +1303,8 @@ export class OpenCodeExecutor extends BaseExecutor {
         let attemptEgress = requestEgress;
         let attemptResult = null;
         let attemptNo = 0;
+        // 预算超支允许最后一发（手里有 canContinue 通过的新槽，牺牲不如多试）。
+        let budgetOverrun = false;
         // 上一发是什么时候打出去的。asip 的 switchedAt 只有晚于它才算「这一发
         // 途中换过线」，否则拿旧结论把同一出口再打一遍。
         let lastAttemptStartedAt = requestStartedAt;
@@ -1299,8 +1319,12 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 首发已经打过了，这里只补换线重试的那几发。
         while (attemptNo < MAX_ROTATE_ATTEMPTS - 1) {
           if (attemptNo > 0 && Date.now() - requestStartedAt > ROTATE_ATTEMPT_BUDGET_MS) {
-            log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); giving up`);
-            break;
+            if (budgetOverrun) {
+              log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); giving up`);
+              break;
+            }
+            budgetOverrun = true;
+            log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); last resort on pending slot`);
           }
           attemptNo += 1;
           const targetProxyUrl = attempt.switchToUrl || null;
@@ -1470,6 +1494,69 @@ export class OpenCodeExecutor extends BaseExecutor {
             break;
           }
           attempt = next;
+        }
+        // 第七闸口兜底（2026-11-14 用户："第七闸口轮换池已就绪…可以用来兜底"）：
+        // 常规换线环 give-up（预算耗尽/同址拒绝/无新线）后，若仍 429 且还没
+        // 试过池闸节点，再要一次线。daemon 常规候选为空时自动落第七闸口
+        // （kind=proxy, :7897, switch_to_node）。拿到就打最后一发，拿不到
+        // 或仍 429 才按原样牺牲。D14 池闸 1-attempt budget——这里就是那 1 次。
+        // attemptResult === null = 换线环一发都没打出去（首发 asip 结果被
+        //   同址/同端口拒绝），此时 daemon 可能还有别的槽（含第七闸口）。
+        //   换线环已发过重试时不触发——那说明 daemon 已给过线，再要一次
+        //   只会多一笔记账（2026-11-14 asip-rotate 测试锁定）。
+        if (upstreamStatus === 429 && attemptResult === null
+            && triedPoolNodes.size === 0 && asipRotationEnabled()) {
+          try {
+            const fbPrev = attemptResult || result;
+            const fbRetryAfterMs = parseRetryAfterMs(
+              fbPrev?.response?.headers,
+              fbPrev?.response ? await readResponseText(fbPrev.response) : "",
+            );
+            const fbNext = await rotateEgress("rate429", {
+              signal: args?.signal,
+              requestStartedAt: Date.now(),
+              failedEgress: attemptEgress || null,
+              proxyUrl: attemptProxyUrl || null,
+              reqId: args?.reqId,
+              retryAfterMs: fbRetryAfterMs || 0,
+              borrowed: false,
+            });
+            const fbNode = fbNext?.switchToNode || null;
+            const fbUrl = fbNext?.switchToUrl || null;
+            const fbEgress = fbNode ? null : (fbNext?.switchToEgress || fbNext?.activeEgress || null);
+            const fbUsable = fbNext && !fbNext.restartRequired
+              && (fbNode || fbUrl || fbEgress);
+            const fbNotTried = (fbNode && !triedPoolNodes.has(fbNode))
+              || (fbEgress && fbEgress !== attemptEgress && !triedEgress.has(fbEgress))
+              || (fbUrl && fbUrl !== attemptProxyUrl);
+            if (fbUsable && fbNotTried) {
+              log?.warn?.("EGRESS",
+                `give-up -> 7th-gate fallback (${fbNode || fbUrl || fbEgress}); last attempt`);
+              invalidateEgressConnections(attemptProxyUrl, fbUrl || null);
+              const fbEgressKey = fbEgress || fbNode || "";
+              const fbCredentials = this.prepareRequestCredentials({
+                ...args,
+                egressId: fbUrl || attemptProxyUrl || egress?.id || "",
+                egressIp: fbEgressKey,
+                sessionRotate: true,
+              });
+              const fbResult = await super.execute({
+                ...args,
+                log,
+                credentials: fbCredentials,
+                proxyOptions: fbUrl
+                  ? { ...proxyOptions, url: fbUrl, enabled: true }
+                  : proxyOptions,
+                ...(retryBody ? { body: cloneRequestBody(retryBody) || retryBody } : {}),
+              });
+              if (fbResult?.response && fbResult.response.status !== 429
+                  && !(upstreamStatus === 403 && fbResult.response.status === 403)) {
+                attemptResult = fbResult;
+              }
+            }
+          } catch (fbErr) {
+            log?.warn?.("EGRESS", `7th-gate fallback failed: ${fbErr?.message ?? String(fbErr)}`);
+          }
         }
         result = attemptResult ?? result;
       } else {

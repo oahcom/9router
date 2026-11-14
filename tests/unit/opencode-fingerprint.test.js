@@ -28,11 +28,11 @@ describe("opencodeFingerprint — request side", () => {
     const map = applyFingerprintTools(body, true);
 
     expect(namesOf(body.tools)).toEqual([
-      ...CC_TOOLS.map(() => expect.stringMatching(ALIAS)),
       ...OPENCODE_FINGERPRINT_TOOLS,
+      ...CC_TOOLS.map(() => expect.stringMatching(ALIAS)),
     ]);
     expect(map.size).toBe(CC_TOOLS.length);
-    const aliases = namesOf(body.tools).slice(0, CC_TOOLS.length);
+    const aliases = namesOf(body.tools).slice(OPENCODE_FINGERPRINT_TOOLS.length);
     expect(aliases.map((alias) => map.get(alias))).toEqual(CC_TOOLS);
     expect(new Set(aliases).size).toBe(CC_TOOLS.length);
     // The same caller name hashes to the same alias on the next round.
@@ -56,8 +56,8 @@ describe("opencodeFingerprint — request side", () => {
     const body = { tools: chat(["Edit"]) };
     const map = applyFingerprintTools(body, false);
 
-    expect(namesOf(body.tools)).toEqual([expect.stringMatching(ALIAS), "read", "shell"]);
-    expect(map.get(namesOf(body.tools)[0])).toBe("Edit");
+    expect(namesOf(body.tools)).toEqual(["read", "shell", expect.stringMatching(ALIAS)]);
+    expect(map.get(namesOf(body.tools)[2])).toBe("Edit");
     const read = body.tools.find((tool) => tool.function?.name === "read");
     expect(read.function.parameters.required).toEqual(["path"]);
   });
@@ -70,15 +70,15 @@ describe("opencodeFingerprint — request side", () => {
     // The fingerprint collision still gets the concrete read_client2 alias
     // (read_client was taken), while ordinary caller names are neutralized.
     expect(names).toEqual([
+      "read",
+      "shell",
       "read_client2",
       expect.stringMatching(ALIAS),
       expect.stringMatching(ALIAS),
-      "read",
-      "shell",
     ]);
     expect(map.get("read_client2")).toBe("read");
-    expect(map.get(names[1])).toBe("read_client");
-    expect(map.get(names[2])).toBe("Edit");
+    expect(map.get(names[3])).toBe("read_client");
+    expect(map.get(names[4])).toBe("Edit");
   });
 
   it("keeps a caller tool that already carries OpenCode's exact definition", () => {
@@ -99,7 +99,7 @@ describe("opencodeFingerprint — request side", () => {
   it("drops duplicate declarations of one fingerprint name", () => {
     const body = { tools: flat(["shell", "shell"]) };
     applyFingerprintTools(body, true);
-    expect(namesOf(body.tools)).toEqual(["shell_client", "read", "shell"]);
+    expect(namesOf(body.tools)).toEqual(["read", "shell", "shell_client"]);
   });
 
   it("defaults Responses tool_choice to auto and never to none for chat", () => {
@@ -195,30 +195,30 @@ describe("opencodeFingerprint — in-place normalization", () => {
 
     // `shell` keeps its name because it is a fingerprint tool; Edit is an
     // ordinary caller name and now travels under a neutral alias.
-    expect(names).toEqual(["shell", expect.stringMatching(ALIAS), "read"]);
+    expect(names).toEqual(["read", "shell", expect.stringMatching(ALIAS)]);
     expect(map.size).toBe(1);
-    expect(map.get(names[1])).toBe("Edit");
+    expect(map.get(names[2])).toBe("Edit");
     expect(takeRenamedToolNames(body)).toBe(map);
     expect(restoreToolNames(
-      { output: [{ type: "function_call", name: names[1] }] },
+      { output: [{ type: "function_call", name: names[2] }] },
       map,
     ).output[0].name).toBe("Edit");
     // Only the genuinely absent `read` is still advertised as a placeholder; the
     // CLI's <env> marker rides along on the same instructions field.
     expect(body.instructions).toContain("Do not call the `read` tool; it is a placeholder that does nothing.");
     expect(body.instructions).toContain("<env>");
-    expect(body.tools[0].description).toContain("Commands run on Linux using bash.");
-    expect(body.tools[0].parameters.required).toEqual(["command"]);
+    expect(body.tools[1].description).toContain("Commands run on Linux using bash.");
+    expect(body.tools[1].parameters.required).toEqual(["command"]);
   });
 
   it("normalizes the nested chat shape without adding a system note", () => {
     const body = { tools: [asChat(windowsShell())] };
     const map = applyFingerprintTools(body, false);
 
-    expect(namesOf(body.tools)).toEqual(["shell", "read"]);
+    expect(namesOf(body.tools)).toEqual(["read", "shell"]);
     expect(map.size).toBe(0);
     expect(body.messages).toBeUndefined();
-    expect(body.tools[0].function.description).toContain("Commands run on Linux using bash.");
+    expect(body.tools[1].function.description).toContain("Commands run on Linux using bash.");
   });
 
   it("wires a real OpenCode client down to exactly read + shell", () => {
@@ -249,15 +249,15 @@ describe("opencodeFingerprint — in-place normalization", () => {
     // is neutralized, so none can squat on a concrete shell_client alias or
     // collide with the real shell/read tools.
     expect(names).toEqual([
+      "read",
       expect.stringMatching(ALIAS),
       expect.stringMatching(ALIAS),
       "shell",
-      "read",
     ]);
     expect(new Set(names).size).toBe(names.length);
     expect(map.size).toBe(2);
-    expect([map.get(names[0]), map.get(names[1])]).toEqual(["shell_client", "shell_client2"]);
-    expect(body.tools[2].description).toContain("Commands run on Linux using bash.");
+    expect([map.get(names[1]), map.get(names[2])]).toEqual(["shell_client", "shell_client2"]);
+    expect(body.tools[3].description).toContain("Commands run on Linux using bash.");
   });
 
   it("still conceals a fingerprint name whose arguments do not line up", () => {
@@ -271,7 +271,7 @@ describe("opencodeFingerprint — in-place normalization", () => {
     };
     const map = applyFingerprintTools(body, true);
 
-    expect(namesOf(body.tools)).toEqual(["shell_client", "read", "shell"]);
+    expect(namesOf(body.tools)).toEqual(["read", "shell", "shell_client"]);
     expect(map.get("shell_client")).toBe("shell");
     expect(body.instructions).toContain("Do not call the");
   });
@@ -287,7 +287,7 @@ describe("opencodeFingerprint — in-place normalization", () => {
     };
     const map = applyFingerprintTools(body, true);
 
-    expect(namesOf(body.tools)).toEqual(["read_client", "read", "shell"]);
+    expect(namesOf(body.tools)).toEqual(["read", "shell", "read_client"]);
     expect(map.get("read_client")).toBe("read");
   });
 
@@ -302,7 +302,7 @@ describe("opencodeFingerprint — in-place normalization", () => {
     };
     const map = applyFingerprintTools(body, true);
 
-    expect(namesOf(body.tools)).toEqual(["read_client", "read", "shell"]);
+    expect(namesOf(body.tools)).toEqual(["read", "shell", "read_client"]);
     expect(map.get("read_client")).toBe("read");
   });
 });

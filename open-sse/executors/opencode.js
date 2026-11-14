@@ -97,7 +97,11 @@ const MAX_LOCAL_COOLDOWN_MS = 60_000;
 // 一条请求最多打几发（含首发）。单发打不中不是换线失效：换上去的地址本身常在
 // 几秒内也被封（2026-11-10 23:31 req=waukibt63：新地址服役 139s 即 429，第二发
 // 仍 429）。失败率按单发拦截率做乘法下降；三发（首发 + 两次换线）是效果与耗时的折中。
-const MAX_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.OPENCODE_ROTATE_ATTEMPTS || 3));
+// 封顶次数默认 6 = 六个常规闸口（7890/7892-7896）全覆盖：3 是旧默认，
+// 只够试 2 条备线，仍有健康闸口时请求就被打死（wfzj8cftg 型漏出，与
+// 「有闸口可用时 0 生产 429」目标冲突）。防死循环不靠这个数 —— 同址白打由
+// triedEgress/triedPoolNodes 拒绝，总时长由 ROTATE_ATTEMPT_BUDGET_MS 兜底。
+const MAX_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.OPENCODE_ROTATE_ATTEMPTS || 6));
 // 从首次收到 429 起算的总预算。超预算就不再打：宁可把 429 交回调用方，
 // 也不要把一条请求拖到几十秒——上游限流窗口本来就不是秒级。
 const ROTATE_ATTEMPT_BUDGET_MS = Number(process.env.OPENCODE_ROTATE_BUDGET_MS || 25000);
@@ -273,6 +277,27 @@ function syntheticTransportError(message, failure = null) {
 const TRANSPORT_REPLAY_FAILURES = new Set([
   "header-timeout", "upstream-timeout", "upstream-fetch-failed",
 ]);
+
+/**
+ * 换线后的清池，只失效本次涉及的端口：失败端口 + 换线目标端口。
+ *
+ * 承担的语义与旧的无参调用完全一致：「换出口后池化连接仍拴在旧隧道上，重试/
+ * 下一条必须走新连接」——undici 会复用 TCP，Bun sidecar 按 proxy|generation
+ * 复用 FetchSession，不清就等于拿新选择器走旧连接、429 照旧。
+ * 收窄的只是爆炸半径：换线只动一条线，另外 5 个端口的暖连接是无辜的，全局
+ * bump 会让它们陪葬（egressGeneration 模块注释点名的老毛病）。无关端口若真
+ * 陈旧（daemon 批量换线没通知本进程），socket 失败路径的
+ * invalidatePortConnections 会按端口兜底。URL 判不出来时回退全局——与旧行为
+ * 一致，宁可多清不可漏清。
+ */
+function invalidateEgressConnections(oldUrl, newUrl) {
+  clearProxyDispatchers(oldUrl || undefined);
+  bumpTransportGeneration(oldUrl || undefined);
+  if (newUrl && newUrl !== oldUrl) {
+    clearProxyDispatchers(newUrl);
+    bumpTransportGeneration(newUrl);
+  }
+}
 
 // 上游 ce060c79 的 TLS 兜底默认关着：那条路从本机 IP 直出（绕开池子和 ASIP），
 // wreq-js 缺失时还会在请求里跑一次 npm install —— 两件事都不该在没人要求时发生。
@@ -783,8 +808,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         reqId: args?.reqId,
       });
     }
-    clearProxyDispatchers();
-    bumpTransportGeneration();
+    invalidateEgressConnections(context.proxyUrl, rotation?.switchToUrl);
     args.log?.warn?.(
       "EGRESS",
       `transport stall (${failure}) -> retry once on fresh connection`
@@ -834,18 +858,23 @@ export class OpenCodeExecutor extends BaseExecutor {
     // 补一次记账，「transport 卡住 → 秒切 → 重放撞 429」这条路径上的失败对系统
     // 零影响：目标出口既不标脏、目标端口也不冷却，随后几分钟会被反复复用
     // （2026-11-10 21:22 实测：同一 /128 被复用 ≥4 次、6分47秒后才被别的请求拉黑）。
-    // 只报障记账、绝不再重放，所以不会形成「重放 → 换线 → 重放」循环。
+    // 只报障记账、绝不再同线重放（重放全程仅一次）；429 且有新闸口时续试走
+    // executeInner 的换线环（首发语义），环路防护由该环的 triedEgress/预算/封顶
+    // 承担，不会形成「重放 → 换线 → 重放」循环。
     // proxyUrl 取重放真正走的那台闸：换了端口就是 switchToUrl，没换就是原端口。
     // rotateEgress("rate429") 内部已自带 markAsipProxyCooling(proxyUrl)，
     // asip 侧 finally 也会按既定口径起后台修，这里不重复实现。
     const accountingProxyUrl = rotation?.switchToUrl || context?.proxyUrl || null;
+    // 记账回包里的「下一条线」。429 处置续试（零漏出目标）要用它判断有没有
+    // 新闸口可走，所以提出到 try 外面。
+    let replay429Next = null;
     if (replayResult?.response?.status === 429 && rotation && accountingProxyUrl) {
       try {
         const replayRetryAfterMs = parseRetryAfterMs(
           replayResult.response.headers,
           await readResponseText(replayResult.response),
         );
-        const accounted = await rotateEgress("rate429", {
+        replay429Next = await rotateEgress("rate429", {
           signal: args?.signal,
           requestStartedAt: replayStartedAt,
           failedEgress: rotation.switchToEgress || context?.failedEgress || null,
@@ -861,10 +890,69 @@ export class OpenCodeExecutor extends BaseExecutor {
         });
         args.log?.warn?.(
           "EGRESS",
-          `replay 429 -> accounting on ${accountingProxyUrl} (${accounted?.reason ?? "no-reply"}); no second replay`,
+          `replay 429 -> accounting on ${accountingProxyUrl} (${replay429Next?.reason ?? "no-reply"}); no second replay`,
         );
       } catch (error) {
         args.log?.warn?.("EGRESS", `replay 429 accounting failed: ${error?.message ?? String(error)}`);
+      }
+      // 零漏出续试（2026-11-14 用户目标「有闸口可用时 0 生产 429 打出」）：
+      // 429 是额度证据，不是拥塞证据 —— 上面「只重放一次」的风暴防护管的是
+      // transport 停滞（超时重发会放大拥塞），不适用这里。记账若拿到了新端口
+      // /新出口（= 有闸口可用），就回 executeInner 走正常首发+换线环继续试，
+      // 不再把 429 牺牲给客户端；拿不到新线才按原样交回（无闸口，属合理漏出）。
+      // 「绝不再重放」不变：回 executeInner 是首发+换线环（其内 triedEgress
+      // 防同址白打、ROTATE_ATTEMPT_BUDGET_MS 限总时长、MAX_ROTATE_ATTEMPTS
+      // 封顶），不会形成「重放 → 换线 → 重放」循环，重放全程仍只有一次。
+      // body 从克隆快照再克隆：transformRequest 会就地改（打指纹/改工具名）。
+      const freshUrl = Boolean(replay429Next?.switchToUrl)
+        && replay429Next.switchToUrl !== accountingProxyUrl;
+      const freshEgress = Boolean(replay429Next?.switchToEgress)
+        && replay429Next.switchToEgress !== (rotation.switchToEgress || context?.failedEgress || null);
+      if (!replay429Next?.restartRequired && (freshUrl || freshEgress)) {
+        args.log?.warn?.(
+          "EGRESS",
+          `replay 429 -> continue on fresh ${freshUrl ? replay429Next.switchToUrl : replay429Next.switchToEgress} (no sacrifice)`,
+        );
+        return this.executeInner({
+          ...args,
+          body: cloneRequestBody(args.body) || args.body,
+          usedCredentials: {},
+          proxyOptions: freshUrl
+            ? { ...(args.proxyOptions || {}), url: replay429Next.switchToUrl, enabled: true }
+            : args.proxyOptions,
+        });
+      }
+    }
+    // 重放的 transport 失败同样要留痕（与上面 429 记账同一动机：失败若对系统
+    // 零影响，坏出口会被继续复用）。它同时是 line_ok 二击出局的「第二击」——
+    // daemon 原设计「重放失败即 503，第 2 击正常换线」（_rotate_slot_once D1
+    // 注释）依赖这一击被上报；不上报则计数器永远停在 1，坏线靠 30 分钟探针
+    // 缓存连吃下一个请求（2026-11-14 12:36 wfwy8vx94 实测 81s 零换线）。
+    // 只上报、不重放：上面「绝不再重放」的环路防护原样保留，请求仍按原设计
+    // 牺牲（最多 1 个/坏线），受益的是下一个请求。口径与重放入口同一集合
+    // （首字节前的三类失败）：caller-aborted 本就不在集合里——那是客户端自己
+    // 断开，不是线路坏的证据，不能拿它去 strike 线路。
+    const replayFailureType = replayResult?.response?.status === 503
+      ? (replayResult.response.headers.get("x-transport-failure") || "") : "";
+    const replayStalledAgain = replayResult?.response?.status === 503
+      && replayResult.response.headers.get("x-transport-error-type") === "synthetic"
+      && TRANSPORT_REPLAY_FAILURES.has(replayFailureType);
+    if (replayStalledAgain && asipRotationEnabled() && accountingProxyUrl) {
+      try {
+        await rotateEgress("transport", {
+          signal: args?.signal,
+          requestStartedAt: replayStartedAt,
+          failedEgress: rotation?.switchToEgress || context?.failedEgress || null,
+          failedEgressSince: null,
+          proxyUrl: accountingProxyUrl,
+          reqId: args?.reqId,
+        });
+        args.log?.warn?.(
+          "EGRESS",
+          `replay stalled (${replayFailureType}) -> 2nd strike reported to asip on ${accountingProxyUrl}; no second replay`,
+        );
+      } catch (error) {
+        args.log?.warn?.("EGRESS", `replay stall accounting failed: ${error?.message ?? String(error)}`);
       }
     }
     return replayResult;
@@ -959,10 +1047,9 @@ export class OpenCodeExecutor extends BaseExecutor {
       const rotateHappened = ROTATED_REASONS.includes(rotated.reason)
         && !rotated.restartRequired;
       if (rotateHappened) {
-        clearProxyDispatchers();
         // Bun sidecar 按 proxy 复用 FetchSession，换 selector 不会动已建连接；
         // 换一个 generation 让它重建 session，否则重试还走旧隧道。
-        bumpTransportGeneration();
+        invalidateEgressConnections(requestProxyUrl, rotated.switchToUrl);
         resetEgressState();
         log?.warn?.(
           "EGRESS",
@@ -1002,14 +1089,12 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 超时 = asip 已经在换、只是没等到回话：这次不重试（结果不确定），
         // 但那条隧道确实在换，必须让 sidecar 重建 —— 否则下一条请求继续骑着它，
         // 和主路径那处 timeout 的处理保持一致。
-        clearProxyDispatchers();
-        bumpTransportGeneration();
+        invalidateEgressConnections(requestProxyUrl);
       } else if (rotated.lineChanged) {
         // asip 自己换的线：主循环读库、探测判死、定时轮换这三条路都不经过本进程，
         // 我们手里池化的连接还挂在换下来那条隧道上。不重建就会一直骑到它被重启，
         // 期间每条请求都拿旧出口的 429。
-        clearProxyDispatchers();
-        bumpTransportGeneration();
+        invalidateEgressConnections(requestProxyUrl);
       }
       // upstream 的 retry-after 可能是数万秒（实测见过 34842s = 9.7 小时）。
       // 原样透传等于一次 429 就把服务锁死大半天，这才是服务不可用的直接原因。
@@ -1239,7 +1324,13 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 这时即便它没报地址也有意义（coalesced 走这条）。already_retired 本身
           // 就是这个结论 —— 它只在 exit ledger 里这条地址的退役时刻晚于请求发出时
           // 才回，switchedAt 反而是更早的时刻，不能拿来否决。
-          const lineMoved = attempt.reason === "already_retired"
+          // 唯一例外（客户端 veto）：daemon 回包自带 active_egress（当前出口），
+          // 与本发失败地址相同就说明地址仍是活的当前出口（IP 回收/台账旧记录，
+          // daemon 侧同款 veto 见 _rotate_slot_once）—— 重连必然还是它，
+          // 不算 lineMoved，让下面的 repeatsEgress/samePort 判据拒绝这发白打。
+          const egressStillCurrent = Boolean(attempt.activeEgress)
+            && attempt.activeEgress === (attempt.switchToEgress || attemptEgress || null);
+          const lineMoved = (attempt.reason === "already_retired" && !egressStillCurrent)
             || Number(attempt.switchedAt || 0) >= lastAttemptStartedAt - ROTATE_CLOCK_SLACK_MS;
           // 原地打转：换回来的地址这一发已经打过（六条线共用一个 /64 池，换一台
           // 闸完全可能落回同一个 /128），或者既没换端口、也没有新线可证明。
@@ -1262,14 +1353,22 @@ export class OpenCodeExecutor extends BaseExecutor {
           // 每一发都要清连接池并 bump：sidecar 的 session key 是 proxy|generation，
           // 只清 undici dispatcher 不影响 Bun 那边池化的 socket（上一发刚回 429，
           // socket 还在池里）。最后一发清完即便不重发也无副作用。
-          clearProxyDispatchers();
-          bumpTransportGeneration();
+          invalidateEgressConnections(attemptProxyUrl, targetProxyUrl);
           log?.warn?.(
             "EGRESS",
             `asip rotated egress (${attempt.reason}) -> retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} on fresh connection`,
           );
           const attemptStartedAt = Date.now();
           lastAttemptStartedAt = attemptStartedAt;
+          // 这一发的发出时刻/出口同步进 holder：transport stall 后的重放记账
+          // 与 borrowed 判据都从 usedCredentials 取值，沿用 executeInner 开头
+          // 的原始时刻会把重试误判成「迟到报障」（switched_at > 原始时刻恒真，
+          // daemon 据此回 already_retired 不换线，2026-11-14 04:58 wfgkef17a
+          // 实测三连撞同死 IP 白烧 34s）。
+          if (args.usedCredentials) {
+            args.usedCredentials.requestStartedAt = attemptStartedAt;
+            args.usedCredentials.requestEgress = targetEgress || attemptEgress || null;
+          }
           // 换线重试必须用目标出口自己的会话池：沿用首发 prepared 会把旧 IP 的
           // session 带到新出口上，正是上游「每出口 distinct session」闸要拒的形态。
           const attemptEgressId = targetProxyUrl || egress?.id || "";
@@ -1386,8 +1485,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         if (asip.reason === "timeout" || asip.lineChanged) {
           // sidecar 的 session 和 undici 的 keep-alive 池都得丢，否则下一条请求
           // 还拴在旧隧道上（和上面早退分支保持一致）。
-          clearProxyDispatchers();
-          bumpTransportGeneration();
+          invalidateEgressConnections(requestProxyUrl);
           // bump 本身不打日志，而这条路径正是「没人通知我们、我们自己发现的」——
           // 不留一行就分不清它是真没触发还是触发了但看不见。按 reason 限流复用
           // 同一个聚合器，避免 429 风暴里刷屏。

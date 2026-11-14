@@ -385,10 +385,19 @@ export class BaseExecutor {
             sends,
           });
           if (next) {
+            const prevProxyUrl = egressProxyOptions?.url
+              || egressProxyOptions?.connectionProxyUrl || null;
             egressProxyOptions = next.proxyOptions;
             sends += 1;
             // 换的是出口不是 URL：fallback 序号不能前进，重打同一个上游地址。
-            clearProxyDispatchers();
+            // 清池只失效本次涉及的代理（旧出口 + 新出口），其余端口的暖连接不动
+            // —— 语义不变：重打前旧隧道的连接必须丢，不能骑着它再打一次。
+            const nextProxyUrl = egressProxyOptions?.url
+              || egressProxyOptions?.connectionProxyUrl || null;
+            clearProxyDispatchers(prevProxyUrl || undefined);
+            if (nextProxyUrl && nextProxyUrl !== prevProxyUrl) {
+              clearProxyDispatchers(nextProxyUrl);
+            }
             urlIndex--;
             continue;
           }

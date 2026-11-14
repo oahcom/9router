@@ -314,21 +314,30 @@ export function neutralizeCallerToolNames(tools, map, skip = new Set()) {
 }
 
 /**
- * Append OpenCode's definition for each fingerprint tool not already declared.
+ * Declare OpenCode's definition for each fingerprint tool not already present.
+ *
+ * 补到 tools 数组**最前面**（2026-11-14）：上游 prompt 把 tools 块渲染在会话
+ * 历史之前（受控实验 + 生产相关性证实），前缀缓存按字节匹配 —— 客户端工具表
+ * 中途生长（实测 hermes 会话 TOOL 9→18）时，若 read/shell 接在客户端工具尾部，
+ * 它们的定义会被新增工具顶出共享前缀；钉在头部则 [read][shell][旧工具] 在
+ * 生长轮全部保住，客户端新工具永远追加在旧工具之后。上游若自行按名排序则
+ * 两种排法渲染结果相同（无害）。
  *
  * @returns {string[]} names that were appended
  */
 export function appendMissingFingerprintTools(tools, flat) {
   const appended = [];
   if (!Array.isArray(tools)) return appended;
+  const missing = [];
   for (const name of OPENCODE_FINGERPRINT_TOOLS) {
     if (tools.some((tool) => fingerprintToolKey(toolNameOf(tool)) === name)) continue;
     const { description, parameters } = FINGERPRINT_TOOL_DEFINITIONS[name];
-    tools.push(flat
+    missing.push(flat
       ? { type: "function", name, description, parameters, strict: false }
       : { type: "function", function: { name, description, parameters } });
     appended.push(name);
   }
+  if (missing.length) tools.unshift(...missing);
   return appended;
 }
 
@@ -426,12 +435,13 @@ const ENV_TMP_DIR = path.join(os.tmpdir(), "opencode");
 // path. process.cwd() put the gateway host's real directory into every upsteam
 // prompt, and the model repeated it to end users ("I'm in
 // /home/administrator/9router"), leaking the host layout. Keep it neutral.
-// 每次请求现生成一条随机路径（node:crypto randomInt，CSPRNG）。base 只提供
-// 「看起来像真实项目」的前缀，后缀 2~3 位随机字符 —— 目的是让路径永远不落进
-// 上游的静态黑名单（2026-11-10 的 INC-018 就是 /home/administrator/.9router
-// 被精确字符串拉黑，任何固定值都可能哪天被收进去）。
-// 代价：探测与生产不再发同一个值。若上游只看「路径是否在黑名单」，两边都能过；
-// 若校验路径存在性/格式，随机后缀是破绽。需要钉死单值时用
+// 路径生成（2026-11-14 改为会话稳定，见 envWorkdirFor）：base 只提供
+// 「看起来像真实项目」的前缀 + 3 位后缀。INC-018（2026-11-10，固定值
+// /home/administrator/.9router 被精确字符串拉黑）的防御保留 —— 跨会话多样，
+// 但**同一会话内恒定**：逐请求随机曾让 <env> 块每发都变，上游前缀缓存在
+// 系统提示词尾部就断掉，100K+ 会话历史每条请求全量重算 prefill（实测命中率
+// 5-8%，而自带稳定 env 的透传客户端同一上游吃到 179K 缓存）。真实 CLI 会话
+// 的 cwd 本来就跨轮次不变，逐请求变反而是破绽。需要钉死单值时用
 // OPENCODE_ENV_WORKING_DIR。
 const ENV_WORKDIR_BASES = [
   "/home/user/project",
@@ -454,8 +464,57 @@ export function envWorkdir(now = Date.now()) {
   return `${base}-${suffix}`;
 }
 
-export function envFingerprintPrompt(now = Date.now()) {
-  const wd = envWorkdir(now);
+/**
+ * 会话稳定推导：同一锚点永远得到同一路径，跨锚点仍多样（FNV-1a 混淆）。
+ * 形状与随机版一致（base + 3 位后缀）。无锚点（探测/无消息体）回退随机。
+ */
+export function envWorkdirFor(conversationKey) {
+  if (ENV_WORKDIR_PIN) return ENV_WORKDIR_PIN;
+  if (!conversationKey) return envWorkdir();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < conversationKey.length; i += 1) {
+    h ^= conversationKey.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  const base = ENV_WORKDIR_BASES[h % ENV_WORKDIR_BASES.length];
+  let x = (h ^ 0x9e3779b9) >>> 0;
+  let suffix = "";
+  for (let i = 0; i < 3; i += 1) {
+    suffix += ENV_RAND_ALPHABET[x % ENV_RAND_ALPHABET.length];
+    x = (Math.imul(x ^ (x >>> 15), 0x2545f491) >>> 0) + 0x9e3779b9;
+  }
+  return `${base}-${suffix}`;
+}
+
+/**
+ * 会话锚点：首条用户侧消息的前 512 字符。会话生长时它不变，于是同会话
+ * 每条请求的 <env> 字节恒定、前缀缓存可命中整段历史；跨会话自然分散。
+ */
+function conversationAnchor(body) {
+  try {
+    const msgs = Array.isArray(body?.messages) ? body.messages
+      : Array.isArray(body?.input) ? body.input
+      : null;
+    if (!msgs) return "";
+    for (const m of msgs) {
+      const role = m?.role ?? m?.type;
+      if (role === "system" || role === "instructions"
+          || role === "function_call_output") continue;
+      const t = typeof m?.content === "string" ? m.content
+        : typeof m?.text === "string" ? m.text
+        : (m?.content != null ? JSON.stringify(m.content) : "");
+      if (t) return t.slice(0, 512);
+    }
+    return "";
+  } catch {
+    return "";
+  }
+}
+
+export function envFingerprintPrompt(now = Date.now(), conversationKey = null) {
+  const wd = conversationKey != null
+    ? envWorkdirFor(conversationKey)
+    : envWorkdir(now);
   return [
     ENV_HEADING,
     ENV_TAG,
@@ -512,7 +571,8 @@ function appendSystemText(system, text) {
 export function applyEnvFingerprint(body, flat, { claude = false } = {}) {
   try {
     if (!body || typeof body !== "object") return false;
-    const prompt = envFingerprintPrompt();
+    // 会话锚点推导 env：同会话字节恒定（前缀缓存友好），跨会话多样（INC-018）。
+    const prompt = envFingerprintPrompt(Date.now(), conversationAnchor(body));
 
     if (flat) {
       if (body.instructions !== undefined && typeof body.instructions !== "string") return false;

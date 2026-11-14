@@ -111,11 +111,34 @@ function canonicalHost(hostname) {
 // point a connection's baseUrl anywhere, and before this split that request
 // rode the proxy and died. 192.168.x.x/10.x stay direct — those are the peers
 // this rule exists for.
+// 通配 DNS（nip.io / sslip.io / xip.io / traefik.me）把目标地址编进主机名本身：
+// 点分 `100.100.100.200.nip.io`、连字符 `100-100-100-200.sslip.io`、8 位十六进制
+// `a9fea9fe.nip.io`。这三种形态的解析结果由名字决定，不需要 DNS 就能判。
+//
+// 为什么必须在这里判：闸门的 DNS 复核有 1500ms 时限，超时按「不是元数据」放行
+// （见下方 resolvesToLinkLocalOrMetadataHost 的注释）。本机 resolver 实测
+// p90=5341ms，实测 100.100.100.200.nip.io 8 次里 3 次被判放行——名字里写着的
+// 地址反而要等 DNS 才知道，等于给确定性编码留了一条旁路。
+const WILDCARD_DNS_SUFFIXES = [".nip.io", ".sslip.io", ".xip.io", ".traefik.me"];
+
+function embeddedV4Int(host) {
+  if (!WILDCARD_DNS_SUFFIXES.some((suffix) => host.endsWith(suffix))) return null;
+  const parts = host.split(/[.-]/);
+  for (let i = 0; i + 4 <= parts.length; i++) {
+    const window = parts.slice(i, i + 4);
+    if (!window.every((p) => /^\d{1,3}$/.test(p))) continue;
+    const v4 = ipv4ToInt(window.join("."));
+    if (v4 !== null) return v4;
+  }
+  const hex = parts.find((p) => /^[0-9a-f]{8}$/i.test(p));
+  return hex ? parseInt(hex, 16) >>> 0 : null;
+}
+
 export function isLinkLocalOrMetadataHost(hostname) {
   const host = canonicalHost(hostname);
   if (!host) return false;
   if (METADATA_HOSTNAMES.has(host)) return true;
-  const v4 = ipv4ToInt(host) ?? mappedV4ToInt(host);
+  const v4 = ipv4ToInt(host) ?? mappedV4ToInt(host) ?? embeddedV4Int(host);
   if (v4 !== null) {
     return (v4 & 0xffff0000) >>> 0 === ipv4ToInt("169.254.0.0") || METADATA_V4_HOSTS.includes(v4);
   }
@@ -165,6 +188,8 @@ export async function resolvesToLinkLocalOrMetadataHost(hostname, lookupImpl) {
   if (!host) return false;
   // 字面量 IP 无需解析：上面那个闸门已经判过，dns.lookup 只会原样返回。
   if (ipv4ToInt(host) !== null || host.includes(":")) return false;
+  // 名字自身编码了目标地址（通配 DNS）：解析结果由名字决定，不等 DNS。
+  if (embeddedV4Int(host) !== null) return isLinkLocalOrMetadataHost(host);
   const cached = resolvedHostCache.get(host);
   if (cached && cached.expires > Date.now()) return cached.isMetadata;
 

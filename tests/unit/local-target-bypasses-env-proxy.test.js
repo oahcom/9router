@@ -287,4 +287,24 @@ describe("hostnames that resolve to metadata are refused", () => {
     await resolvesToLinkLocalOrMetadataHost("169.254.169.254", lookup);
     expect(called).toBe(0);
   });
+
+  // 通配 DNS（nip.io / sslip.io / xip.io）把目标地址编进主机名，解析结果由名字
+  // 本身决定。闸门却把「解析超时」当「不是元数据」放行，而本机 resolver 实测
+  // p90=5341ms、闸门时限 1500ms —— 实测 8 次里 3 次放行 100.100.100.200.nip.io。
+  // 名字里写着的地址必须不等 DNS 就能判。
+  const deadLookup = async () => { throw new Error("DNS lookup timed out"); };
+  it.each([
+    ["100.100.100.200.nip.io", "dotted"],
+    ["169.254.169.254.nip.io", "dotted"],
+    ["100-100-100-200.sslip.io", "dashed"],
+    ["169-254-169-254.nip.io", "dashed"],
+    ["a9fea9fe.nip.io", "hex"],
+  ])("refuses %s (%s form) even when the resolver times out", async (host) => {
+    expect(await resolvesToLinkLocalOrMetadataHost(host, deadLookup)).toBe(true);
+    await expect(assertEgressTargetAllowed(`http://${host}/`, deadLookup)).rejects.toThrow(/link-local\/metadata/);
+  });
+
+  it("still allows a public address encoded in a wildcard-DNS name when the resolver times out", async () => {
+    expect(await resolvesToLinkLocalOrMetadataHost("8.8.8.8.nip.io", deadLookup)).toBe(false);
+  });
 });

@@ -1500,11 +1500,13 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 试过池闸节点，再要一次线。daemon 常规候选为空时自动落第七闸口
         // （kind=proxy, :7897, switch_to_node）。拿到就打最后一发，拿不到
         // 或仍 429 才按原样牺牲。D14 池闸 1-attempt budget——这里就是那 1 次。
-        // attemptResult === null = 换线环一发都没打出去（首发 asip 结果被
-        //   同址/同端口拒绝），此时 daemon 可能还有别的槽（含第七闸口）。
-        //   换线环已发过重试时不触发——那说明 daemon 已给过线，再要一次
-        //   只会多一笔记账（2026-11-14 asip-rotate 测试锁定）。
-        if (upstreamStatus === 429 && attemptResult === null
+        // 触发条件：upstreamStatus === 429 且池闸（triedPoolNodes）还没试过。
+        //   budget 耗尽 + 所有常规槽都试过失败 -> 池闸是最后兜底（2026-11-14
+        //   用户："第七闸口轮换池已就绪…可以用来兜底"）。
+        //   triedPoolNodes.size === 0 防止重复打池闸（D14 1-attempt budget）。
+        //   不看 attempt.reason：already_retired（出口卡死在被烧地址、egressStillCurrent
+        //   veto 拒绝同址重试）正是兜底最该出场的场景（2026-11-15 复盘改动点①，契约测试锁定）。
+        if (upstreamStatus === 429
             && triedPoolNodes.size === 0 && asipRotationEnabled()) {
           try {
             const fbPrev = attemptResult || result;
@@ -1526,9 +1528,13 @@ export class OpenCodeExecutor extends BaseExecutor {
             const fbEgress = fbNode ? null : (fbNext?.switchToEgress || fbNext?.activeEgress || null);
             const fbUsable = fbNext && !fbNext.restartRequired
               && (fbNode || fbUrl || fbEgress);
+            // 兜底目标必须真正没试过：换闸（URL 不同）不算——六线共用 /64，
+            // 同一出口 IP 换闸重打必然是同一个 429（in-place guard 同口径）。
+            const fbEgressBurned = Boolean(fbEgress)
+              && (triedEgress.has(fbEgress) || fbEgress === attemptEgress);
             const fbNotTried = (fbNode && !triedPoolNodes.has(fbNode))
-              || (fbEgress && fbEgress !== attemptEgress && !triedEgress.has(fbEgress))
-              || (fbUrl && fbUrl !== attemptProxyUrl);
+              || (fbEgress && !fbEgressBurned)
+              || (fbUrl && fbUrl !== attemptProxyUrl && !fbEgressBurned);
             if (fbUsable && fbNotTried) {
               log?.warn?.("EGRESS",
                 `give-up -> 7th-gate fallback (${fbNode || fbUrl || fbEgress}); last attempt`);

@@ -6,6 +6,11 @@
 // 且不进 asip 的账本 —— 那条请求等于白烧。
 //
 // 现在改成：先在同一批隧道里换一条重打，最多 3 次，仍不通才直连。
+//
+// 2026-11-15 契约再进一步（生产实测：隧道被掐 -> 3 发换线全挂 -> falling back
+// to direct 把请求从真实 IP 发出去）：直连兜底取消，仍不通就抛
+// "refusing direct fallback (IP leak)"。显式 allowDirectFallback=true 才保留旧行为。
+// 2026-11-10 的实测早已说明直连是白烧（本机地址对按 IP 限流的上游必然 429）。
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => {
@@ -69,7 +74,7 @@ beforeEach(() => {
   resetProxyFailureRotateState();
 });
 
-describe("proxy connect failure rotates through tunnels before going direct", () => {
+describe("proxy connect failure rotates through tunnels then refuses direct (IP leak)", () => {
   it("re-covers on the 2nd tunnel when the 1st rotation still fails", async () => {
     h.fetchMock
       .mockRejectedValueOnce(fetchFailed())
@@ -84,32 +89,24 @@ describe("proxy connect failure rotates through tunnels before going direct", ()
     expect(h.rotateMock.mock.calls.every(([reason]) => reason === "transport")).toBe(true);
   });
 
-  it("gives up after 3 rotations and only then falls back to direct", async () => {
+  it("gives up after 3 rotations and refuses the direct fallback (IP leak)", async () => {
     h.fetchMock
       .mockRejectedValueOnce(fetchFailed())
       .mockRejectedValueOnce(fetchFailed())
       .mockRejectedValueOnce(fetchFailed())
-      .mockRejectedValueOnce(fetchFailed())
-      .mockResolvedValueOnce(ok());
+      .mockRejectedValueOnce(fetchFailed());
 
-    const res = await callProxy();
-
-    expect(res.status).toBe(200);
-    expect(h.fetchMock).toHaveBeenCalledTimes(5); // 首发 + 3 发换线 + 1 发直连
+    await expect(callProxy()).rejects.toThrow(/refusing direct fallback \(IP leak\)/);
+    expect(h.fetchMock).toHaveBeenCalledTimes(4); // 首发 + 3 发换线；不再有直连那一发
     expect(h.rotateMock).toHaveBeenCalledTimes(3);
-    // 最后一发是直连：不带 dispatcher（代理路径一定会带）。
-    const last = h.fetchMock.mock.calls.at(-1);
-    expect(last[1].dispatcher ?? null).toBeNull();
   });
 
   it("does not retry when the first rotation reports a restart is required", async () => {
-    h.fetchMock.mockRejectedValueOnce(fetchFailed()).mockResolvedValueOnce(ok());
+    h.fetchMock.mockRejectedValueOnce(fetchFailed());
     h.rotateMock.mockResolvedValueOnce({ switched: false, restartRequired: true, reason: "restart" });
 
-    const res = await callProxy();
-
-    expect(res.status).toBe(200);
-    expect(h.fetchMock).toHaveBeenCalledTimes(2); // 首发 + 直连
+    await expect(callProxy()).rejects.toThrow(/refusing direct fallback \(IP leak\)/);
+    expect(h.fetchMock).toHaveBeenCalledTimes(1); // 只有首发；不再有直连那一发
     expect(h.rotateMock).toHaveBeenCalledTimes(1);
   });
 
@@ -122,11 +119,9 @@ describe("proxy connect failure rotates through tunnels before going direct", ()
       },
     });
 
-    const res = await callProxy({ method: "POST", body });
-
-    expect(res.status).toBe(200);
+    await expect(callProxy({ method: "POST", body })).rejects.toThrow(/refusing direct fallback \(IP leak\)/);
     expect(h.rotateMock).not.toHaveBeenCalled();
-    expect(h.fetchMock).toHaveBeenCalledTimes(2);
+    expect(h.fetchMock).toHaveBeenCalledTimes(1); // 只有首发；不可重放就更不该落直连
   });
 
   it("stops rotating once the 10s window cap is reached", async () => {
@@ -136,13 +131,13 @@ describe("proxy connect failure rotates through tunnels before going direct", ()
     await expect(callProxy()).rejects.toThrow();
     expect(h.rotateMock).toHaveBeenCalledTimes(3);
 
-    // 第二次请求：额度已耗尽，一次都不换，直接直连。
+    // 第二次请求：额度已耗尽，一次都不换，直接抛错（不再落直连）。
     h.fetchMock.mockReset();
     h.rotateMock.mockReset();
-    h.fetchMock.mockRejectedValueOnce(fetchFailed()).mockResolvedValueOnce(ok());
-    await callProxy();
+    h.fetchMock.mockRejectedValueOnce(fetchFailed());
+    await expect(callProxy()).rejects.toThrow(/refusing direct fallback \(IP leak\)/);
 
     expect(h.rotateMock).not.toHaveBeenCalled();
-    expect(h.fetchMock).toHaveBeenCalledTimes(2);
+    expect(h.fetchMock).toHaveBeenCalledTimes(1); // 只有首发；窗口封顶也不落直连
   });
 });

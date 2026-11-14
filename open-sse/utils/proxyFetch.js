@@ -577,10 +577,12 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
         return await proxySend(proxyUrl)(url, options);
       } catch (proxyError) {
         if (proxyError?.code === "ERR_PROXY_DNS_MODE") throw proxyError;
-        if (proxyOptions?.strictProxy === true) {
-          throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
+        if (proxyOptions?.allowDirectFallback === true) {
+          console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass (allowDirectFallback): ${proxyError.message}`);
+        } else {
+          // 杜绝真实 IP 泄漏（2026-11-15）：代理意图明确时绝不落到 direct bypass。
+          throw new Error(`[ProxyFetch] Proxy required but failed${proxyOptions?.strictProxy === true ? " (strictProxy=true)" : ""}; refusing direct bypass (IP leak): ${proxyError.message}`);
         }
-        console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${proxyError.message}`);
       }
     }
     // No proxy — manually resolve real IP to bypass DNS spoof
@@ -641,8 +643,14 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
           }
         }
       }
-      console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${lastError.message}`);
-      return directSend(url, options);
+      if (proxyOptions?.allowDirectFallback === true) {
+        console.warn(`[ProxyFetch] Proxy failed, falling back to direct (allowDirectFallback): ${lastError.message}`);
+        return directSend(url, options);
+      }
+      // 杜绝真实 IP 泄漏（2026-11-15 生产实测：隧道被掐 -> 3 发换线全挂 ->
+      // falling back to direct 把请求从真实 IP 发出去）。代理意图明确时失败
+      // 必须 fail-hard；显式 allowDirectFallback=true 才保留旧行为（非敏感调用方）。
+      throw new Error(`[ProxyFetch] Proxy chain failed after ${PROXY_FAILURE_ROTATE_ATTEMPTS} rotation(s); refusing direct fallback (IP leak): ${lastError.message}`);
     }
   }
 

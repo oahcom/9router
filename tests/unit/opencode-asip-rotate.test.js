@@ -334,13 +334,16 @@ describe("asip rotation without an alternate pool", () => {
         switchToEgress: "2606:slot5::1",
         avoidPortUntil: 0,
       })
-      .mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" });
+      .mockResolvedValueOnce({ switched: true, switchedAt: Date.now(), reason: "ok" })
+      // 2026-11-15 起第七闸口兜底在 give-up 时会多要一次线；要到空（no_slot）
+      // 就不打——「绝不再重放」的 fetch 次数契约不变，只是多一次要线。
+      .mockResolvedValueOnce({ switched: false, restartRequired: false, reason: "no_slot" });
 
     const result = await run("retry-429");
 
     expect(result.response.status, "记账不能改变失败结果").toBe(429);
     expect(fetchMock, "只记账、绝不再重放").toHaveBeenCalledTimes(2);
-    expect(rotateMock).toHaveBeenCalledTimes(2);
+    expect(rotateMock).toHaveBeenCalledTimes(3); // 记账×2 + 第七闸口兜底要线×1（2026-11-15）
     expect(rotateMock.mock.calls[0][0]).toBe("rate429");
     expect(rotateMock.mock.calls[1][0], "重试仍 429 必须补一次 rate429 记账").toBe("rate429");
     const opts = rotateMock.mock.calls[1][1];

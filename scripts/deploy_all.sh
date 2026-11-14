@@ -9,6 +9,9 @@
 #   - 收尾 verify_parity 总表，退出码 = 阶段失败数 + 不一致端数
 set -u
 cd "$(dirname "$0")/.." || exit 2
+# WSL 非交互 shell 会把 Windows PATH 混进来，npm/npx 解析到 Windows shim
+# 直接报 'next' 不是命令（实测踩过）——本地 node 工具链前置。
+export PATH=/home/administrator/.local/bin:$PATH
 
 TARGETS=${*:-"local 97 zeus"}
 FAILED=0
@@ -27,7 +30,7 @@ done
 deploy_local() {
   step "本地 build + 重启（9router + auto-switch-ip）"
   npm run build 2>&1 | tail -2
-  bash scripts/restart_nine_router.sh 2>&1 | tail -5 || FAILED=$((FAILED + 1))
+  bash restart_nine_router.sh 2>&1 | tail -5 || FAILED=$((FAILED + 1))
 }
 
 push_all() {

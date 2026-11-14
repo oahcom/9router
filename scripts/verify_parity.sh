@@ -11,9 +11,11 @@
 # 用法: bash scripts/verify_parity.sh
 set -u
 cd "$(dirname "$0")/.." || exit 2
-LOCAL_SHA=$(git rev-parse --short HEAD)
-LOCAL_DAEMON_SHA=$(cd /home/administrator/dkk-projects/auto-switch-ip 2>/dev/null && git rev-parse --short HEAD)
-echo "== 本地基准: 9router=$LOCAL_SHA daemon=$LOCAL_DAEMON_SHA =="
+# 短 SHA 长度按仓库对象数自适应，两端可能差一截（zeus 7 位 vs 本地 8 位）——
+# 一律用全长 SHA 比较，显示才截短。
+LOCAL_SHA=$(git rev-parse HEAD)
+LOCAL_DAEMON_SHA=$(cd /home/administrator/dkk-projects/auto-switch-ip 2>/dev/null && git rev-parse HEAD)
+echo "== 本地基准: 9router=${LOCAL_SHA:0:8} daemon=${LOCAL_DAEMON_SHA:0:8} =="
 
 FAILS=0
 
@@ -34,14 +36,14 @@ check_remote() {
   local name="$1" host="$2" gitdir="$3" runtime="$4" daemon="$5"
   local out ok=1 sha build rt m1 m2 dsha dref svcs
   out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "
-    cd $gitdir && echo SHA=\$(git rev-parse --short HEAD)
+    cd $gitdir && echo SHA=\$(git rev-parse HEAD)
     echo BUILD=\$(cat $runtime/.next/BUILD_ID 2>/dev/null)
     pid=\$(systemctl show -p MainPID nine-router-src | cut -d= -f2)
     port=\$(ss -ltnp 2>/dev/null | grep \"pid=\$pid,\" | grep -oE ':[0-9]{4,5}' | head -1 | tr -d ':')
     echo RT=\$(curl -s --max-time 8 \"http://127.0.0.1:\${port:-20127}/api/health\" | grep -oE 'buildId\":\"[^\"]+' | cut -d'\"' -f3)
     echo M1=\$(grep -rl 'no sacrifice' $runtime 2>/dev/null | grep -v node_modules | head -1)
     echo M2=\$(grep -rl '2nd strike reported' $runtime 2>/dev/null | grep -v node_modules | head -1)
-    cd $daemon && echo DSHA=\$(git rev-parse --short HEAD)
+    cd $daemon && echo DSHA=\$(git rev-parse HEAD)
     echo DREF=\$(grep -c '_channel_latency_ms' $daemon/daemon.py 2>/dev/null)
     echo SVCS=\$(systemctl is-active nine-router-src)/\$(systemctl is-active auto-switch-ip)
   " 2>&1)

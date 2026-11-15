@@ -341,13 +341,29 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
     options.replayBudget === true,
     Buffer.byteLength(options.body, "utf8"),
   );
+  // 每次 attempt 一条规范单行（2026-11-15 主人：逻辑链不完整就不能信）。
+  // kind=first|replay + body 字节 + 生效预算 + 实际等到 + 结局，按 req= 可把
+  // 「进来→判停→换线→重放→收场」整条链拼出来；也是验证首字节预算公式
+  // （base+15s/500KB）的唯一数据来源。TX-ATTEMPT 前缀保证可数：一次尝试一行。
+  const _txBodyBytes = Buffer.byteLength(options.body, "utf8");
+  const _txKind = options.replayBudget === true ? "replay" : "first";
+  const logAttempt = (outcome) => {
+    transportWarn(log,
+      `TX-ATTEMPT ${_txKind} budget=${headerTimeoutMs}ms body=${_txBodyBytes}B`
+      + ` waited=${Date.now() - attemptStart}ms -> ${outcome}`);
+  };
 
   // A sidecar whose upstream fetch failed may hold a stale pooled socket or a
   // proxy that just reset. Restarting Bun is cheap and clears both; retry the
   // same payload once before declaring the transport unavailable.
+  let attemptStart = Date.now();
   for (let attempt = 0; attempt < 2; attempt++) {
+    attemptStart = Date.now();
     const transport = await ensure();
-    if (!transport) return noteFailure(available() ? "sidecar-start-failed" : "sidecar-backoff");
+    if (!transport) {
+      logAttempt(available() ? "sidecar-start-failed" : "sidecar-backoff");
+      return noteFailure(available() ? "sidecar-start-failed" : "sidecar-backoff");
+    }
 
     try {
       const response = await forward(transport, {
@@ -382,6 +398,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
           } else {
             transportWarn(log, "sidecar reported upstream timeout; reset throttled, fail fast");
           }
+          logAttempt("upstream-timeout");
           return noteFailure("upstream-timeout");
         }
         // sidecar 报的是上游 fetch 失败（非超时）：UND_ERR_SOCKET /
@@ -391,13 +408,16 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
         invalidatePortConnections(proxyUrl, log, "upstream-fetch-failed");
         if (attempt === 0) {
           transportWarn(log, "retrying once on a fresh connection (same egress)");
+          logAttempt("upstream-fetch-failed:retry-fresh-connection");
           continue;
         }
         if (takeResetSlot()) {
           retire();
         }
+        logAttempt("upstream-fetch-failed");
         return noteFailure("upstream-fetch-failed");
       }
+      logAttempt(`headers status=${response.headers.get("x-transport-status") || response.status || 200}`);
       return response;
     } catch (error) {
       // 调用方放弃 = base.execute 的 60s connect timeout，或客户端自己断开。
@@ -412,6 +432,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
           transportWarn(log, "caller aborted before headers; retiring sidecar to drop stale socket");
           retire();
         }
+        logAttempt("caller-aborted");
         return noteFailure(options.signal?.aborted ? "caller-aborted" : "abort-error");
       }
       // 响应头超时 = 出口路径死了（sidecar 本身活着）。不重启 sidecar 再试一次
@@ -427,6 +448,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
         } else {
           transportWarn(log, `${error.message}; sidecar reset throttled, fail fast`);
         }
+        logAttempt("header-timeout");
         return noteFailure("header-timeout");
       }
       transportWarn(log, `forward failed (attempt ${attempt + 1}/2): ${error.message}`);
@@ -434,7 +456,10 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
       // 上游有问题。此时重试会再开一个 sidecar，把一次失败放大成雪崩。
       if (error.code === "ECONNRESET" || error.code === "EPIPE") {
         invalidatePortConnections(proxyUrl, log, `sidecar-socket-reset:${error.code}`);
-        if (attempt === 0) continue;
+        if (attempt === 0) {
+          logAttempt(`socket-reset-${error.code}:retry`);
+          continue;
+        }
         return noteFailure(`sidecar-socket-reset:${error.code}`);
       }
       invalidatePortConnections(proxyUrl, log, "forward-failed");
@@ -442,6 +467,7 @@ export async function fetchViaTransport(url, options = {}, proxyOptions = null, 
         retire();
         continue;
       }
+      logAttempt(`forward-failed:${error.message}`);
       return noteFailure(`forward-failed:${error.message}`);
     }
   }

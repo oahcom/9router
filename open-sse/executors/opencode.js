@@ -854,6 +854,14 @@ export class OpenCodeExecutor extends BaseExecutor {
         ? { ...(args.proxyOptions || {}), url: rotation.switchToUrl, enabled: true }
         : args.proxyOptions,
     });
+    // 重放结局成对标记（2026-11-15 主人：逻辑链必须完整）：begin 有
+    // 「retry once on fresh connection」，这里补 result——status/耗时，按 req=
+    // 把「stall -> replay -> 结局」链拼全；saved/wasted 的判定只认这条。
+    args.log?.warn?.(
+      "EGRESS",
+      `replay result req=${args?.reqId || "?"} status=${replayResult?.response?.status ?? "none"}`
+      + ` in ${Date.now() - replayStartedAt}ms`,
+    );
     // 重放走的是 BaseExecutor，绕开了 executeInner 里的 429 处置链。若不在这里
     // 补一次记账，「transport 卡住 → 秒切 → 重放撞 429」这条路径上的失败对系统
     // 零影响：目标出口既不标脏、目标端口也不冷却，随后几分钟会被反复复用

@@ -919,10 +919,24 @@ export class OpenCodeExecutor extends BaseExecutor {
       // 防同址白打、ROTATE_ATTEMPT_BUDGET_MS 限总时长、MAX_ROTATE_ATTEMPTS
       // 封顶），不会形成「重放 → 换线 → 重放」循环，重放全程仍只有一次。
       // body 从克隆快照再克隆：transformRequest 会就地改（打指纹/改工具名）。
-      const freshUrl = Boolean(replay429Next?.switchToUrl)
-        && replay429Next.switchToUrl !== accountingProxyUrl;
-      const freshEgress = Boolean(replay429Next?.switchToEgress)
-        && replay429Next.switchToEgress !== (rotation.switchToEgress || context?.failedEgress || null);
+      // 本请求已死过的端口/出口全部进黑名单（首发 stall 的 + 重放 429 的）。
+      // 2026-11-15 21:58 whwgchb0g 复盘：首发 7895/HKG-155 stall 20.7s、重放
+      // 7892/ORD-186 吃 429，记账回包把 next 指回 7895/HKG-155（daemon 小请求
+      // 探针判它 OK，大请求挂着）。旧 freshEgress 的 `||` 只对比重放这一步的
+      // 失败出口（rotation.switchToEgress），把首发失败出口甩掉了，已死线被
+      // 当新线放行 → 同线再 stall 20.7s → 49s 后 503。黑名单只挡同死口同死
+      // 出口的白打：端口撞过但出口真换了（already_retired 语义）由
+      // replayLineMoved 兜底，不受黑名单影响。
+      const deadUrls = new Set([context?.proxyUrl, accountingProxyUrl].filter(Boolean));
+      const deadEgresses = new Set([
+        context?.failedEgress,
+        rotation?.switchToEgress,
+      ].filter(Boolean));
+      const targetUrl = replay429Next?.switchToUrl || null;
+      const targetEgress = replay429Next?.switchToEgress || null;
+      const freshUrl = Boolean(targetUrl) && !deadUrls.has(targetUrl)
+        && !(targetEgress && deadEgresses.has(targetEgress));
+      const freshEgress = Boolean(targetEgress) && !deadEgresses.has(targetEgress);
       // already_retired 也算有线可走（与主环 lineMoved 同口径）。
       // already_retired = daemon 确认 429 追的出口在请求发出之后已被换走，
       //   同端口重连即新出口，不必烧新线。主环 lineMoved 有此判据，
@@ -946,7 +960,7 @@ export class OpenCodeExecutor extends BaseExecutor {
         if (replay429Next?.reason === "already_retired" && !replayEgressStillCurrent && !freshUrl) {
           invalidateEgressConnections(accountingProxyUrl);
         }
-        return this.executeInner({
+        const continued = await this.executeInner({
           ...args,
           body: cloneRequestBody(args.body) || args.body,
           usedCredentials: {},
@@ -954,6 +968,49 @@ export class OpenCodeExecutor extends BaseExecutor {
             ? { ...(args.proxyOptions || {}), url: replay429Next.switchToUrl, enabled: true }
             : args.proxyOptions,
         });
+        // 修 B（2026-11-15 whwgchb0g）：续试重入后的失败同样要留痕 —— 它就是
+        // line_ok 二击出局的「第二击」。旧实现直接 return，synthetic 503 不上报，
+        // 计数器永远停在 1，trap 线（小请求探针过、大请求挂着）靠 30 分钟探针
+        // 缓存连吃下一个请求。只上报、不再重试（重放全程仍只有一趟续试）。
+        const continuedFailure = continued?.response?.status === 503
+          ? (continued.response.headers.get("x-transport-failure") || "") : "";
+        const continuedStalled = continued?.response?.status === 503
+          && continued.response.headers.get("x-transport-error-type") === "synthetic"
+          && TRANSPORT_REPLAY_FAILURES.has(continuedFailure);
+        if (continuedStalled && asipRotationEnabled()) {
+          try {
+            await rotateEgress("transport", {
+              signal: args?.signal,
+              requestStartedAt: replayStartedAt,
+              failedEgress: targetEgress || rotation?.switchToEgress || context?.failedEgress || null,
+              failedEgressSince: null,
+              proxyUrl: targetUrl || accountingProxyUrl,
+              reqId: args?.reqId,
+            });
+            args.log?.warn?.(
+              "EGRESS",
+              `continue stalled (${continuedFailure}) -> 2nd strike reported to asip on ${targetUrl || accountingProxyUrl}; no further retry`,
+            );
+          } catch (error) {
+            args.log?.warn?.("EGRESS", `continue stall accounting failed: ${error?.message ?? String(error)}`);
+          }
+        }
+        return continued;
+      }
+      // 修 A2：daemon 把 next 指回了本请求已经死过的线（首发 stall 或重放 429
+      // 的口/出口）却又不是 already_retired 语义 —— 重试它必然是同一次失败的
+      // 重演（whwgchb0g 实测：再 stall 20.7s，49s 才 503）。零 429 目标下也不
+      // 把上游 429 原样交回（它带的是死出口的 Retry-After，客户端会被误导长退
+      // 避）：直接以首发那次的 synthetic 503 快速失败，可重试、无毒。
+      const targetDiesInRequest = Boolean(
+        (targetUrl && deadUrls.has(targetUrl)) || (targetEgress && deadEgresses.has(targetEgress)),
+      );
+      if (targetDiesInRequest) {
+        args.log?.warn?.(
+          "EGRESS",
+          `replay 429 -> daemon next ${targetUrl || "?"} (${targetEgress || "?"}) already died in-request; fail fast with stall 503 (no dead-line retry, no 429 leak)`,
+        );
+        return result;
       }
     }
     // 重放的 transport 失败同样要留痕（与上面 429 记账同一动机：失败若对系统

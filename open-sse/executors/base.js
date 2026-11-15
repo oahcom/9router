@@ -146,7 +146,16 @@ export class BaseExecutor {
    */
   shouldRotateOnConnectTimeout(proxyOptions) {
     if (!asipRotationEnabled()) return false;
-    const rawUrl = proxyOptions?.url ?? proxyOptions?.connectionProxyUrl;
+    // env 代理腿（2026-11-15 whuu6vezg 实测）：连接级没配代理的请求走进程级
+    // HTTPS_PROXY（outboundProxy.js 导出）也会落在本机 asip 闸口上。旧实现
+    // 只看 proxyOptions 字段 → 这类请求判 false → replayBody 不克隆、429
+    // 换线重试整条不跑，只剩 chatCore A1 记账，17s 请求 429 外泄（报障IP=-
+    // 即 A1 只记账的指纹）。no_proxy 精确匹配需要目标 URL，这里拿不到：
+    // 宁可多判 true（代价是多一次换线记账），不可判 false（代价是 429 外泄）。
+    const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy
+      || process.env.ALL_PROXY || process.env.all_proxy
+      || process.env.HTTP_PROXY || process.env.http_proxy || "";
+    const rawUrl = proxyOptions?.url ?? proxyOptions?.connectionProxyUrl ?? (envProxy || null);
     if (!rawUrl) return false;
     try {
       const parsed = new URL(String(rawUrl));

@@ -1501,15 +1501,27 @@ export class OpenCodeExecutor extends BaseExecutor {
           attemptProxyUrl = accountingProxyUrl;
           attemptEgress = attempt.switchToEgress || attemptEgress || null;
           if (!next || next.restartRequired) break;
-          // 闸口（池节点）链只给 1 次重试（D14/trackB）：它承接的全是已失败
-          // 流量（:7897 首发恒 0），救活率 0.87%，第二次（同端口换节点）
-          // 74.5% 仍 429，却必烧一个池节点 + 一条记账（1,069 请求×2 条的来源）。
+          // 闸口（池节点）链：D14 成本上限改成 2 发封顶（triedPoolNodes 计数），
+          // 「手里有没试过的新出口就打完这一发」与 budgetOverrun 同口径。
+          // 旧「1-attempt budget」无条件收手：2026-11-15 21:12 whutr1uza/whuu4edze
+          // 手里攥着 daemon 刚给的新池节点仍被放弃，客户端吃 429 —— 违反零 429
+          // 目标（有闸可用不许牺牲请求）。D14 的浪费面（同节点重放）由
+          // freshNodeInHand 挡掉，总量仍由 MAX_ROTATE_ATTEMPTS 封顶。
           if (targetNode || attemptNode) {
+            const freshNodeInHand = Boolean(next.switchToNode && !triedPoolNodes.has(next.switchToNode))
+              || Boolean(next.switchToEgress && !triedEgress.has(next.switchToEgress))
+              || Boolean(next.switchToUrl && next.switchToUrl !== attemptProxyUrl);
+            if (triedPoolNodes.size >= 2 || !freshNodeInHand) {
+              log?.warn?.(
+                "EGRESS",
+                `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} gate hop -> ${triedPoolNodes.size >= 2 ? "pool 2-attempt cap" : "no fresh node"}; stop here`,
+              );
+              break;
+            }
             log?.warn?.(
               "EGRESS",
-              `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} gate hop -> 1-attempt budget; stop here`,
+              `retry ${attemptNo}/${MAX_ROTATE_ATTEMPTS - 1} gate hop -> fresh ${next.switchToNode || next.switchToEgress || next.switchToUrl}; continue (zero-429)`,
             );
-            break;
           }
           const canContinue = Boolean(next.switchToUrl)
             || Boolean(next.switchToNode && next.switchToNode !== attemptNode)

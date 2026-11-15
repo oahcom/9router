@@ -314,15 +314,19 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   // Headroom: optional external proxy compression; fail open if proxy is absent.
   const headroomDiagnostics = {};
+  // 耗时入链（2026-11-15 主人：逻辑链不完整就不能信）：headroom 在请求路径上
+  // 同步 await，它的延迟直接计入 TTFT 但此前不可见。took= 是归因 TTFT 的必需字段。
+  const headroomStartedAt = Date.now();
   const headroomStats = await compressWithHeadroom(translatedBody, { enabled: tokenSaverEnabled && headroomEnabled, url: headroomUrl, model: upstreamModel, format: finalFormat, compressUserMessages: headroomCompressUserMessages, timeoutMs: headroomTimeoutMs, diagnostics: headroomDiagnostics });
+  const headroomTookMs = Date.now() - headroomStartedAt;
   const headroomLine = formatHeadroomLog(headroomStats);
   const headroomSizeLine = formatHeadroomSizeLog(headroomDiagnostics);
   if (headroomLine) {
-    log?.info?.("HEADROOM", `${headroomLine}${headroomSizeLine ? ` | ${headroomSizeLine}` : ""} | req=${reqId}`);
+    log?.info?.("HEADROOM", `${headroomLine}${headroomSizeLine ? ` | ${headroomSizeLine}` : ""} | took=${headroomTookMs}ms | req=${reqId}`);
     if (isHeadroomPhantomSavings(headroomStats, headroomDiagnostics)) {
-      log?.warn?.("HEADROOM", `reported token delta, but messages and outbound JSON shrank <5% | ${formatHeadroomSizeLog(headroomDiagnostics)} | req=${reqId}`);
+      log?.warn?.("HEADROOM", `reported token delta, but messages and outbound JSON shrank <5% | ${formatHeadroomSizeLog(headroomDiagnostics)} | took=${headroomTookMs}ms | req=${reqId}`);
     }
-  } else if (tokenSaverEnabled && headroomEnabled) log?.warn?.("HEADROOM", `skipped: ${headroomDiagnostics.reason || "compression unavailable"}${headroomDiagnostics.endpoint ? ` (${headroomDiagnostics.endpoint})` : ""} | req=${reqId}`);
+  } else if (tokenSaverEnabled && headroomEnabled) log?.warn?.("HEADROOM", `skipped: ${headroomDiagnostics.reason || "compression unavailable"}${headroomDiagnostics.endpoint ? ` (${headroomDiagnostics.endpoint})` : ""} | took=${headroomTookMs}ms | req=${reqId}`);
 
   // Token-saver flags accumulator for the single "⚙" log line below.
   const xf = [];

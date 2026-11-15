@@ -225,6 +225,40 @@ describe("X2 / replay 硬超时", () => {
     }
   });
 
+  // 2026-11-15 13:17 whdtocshq 实测：预算 25s 早超，asip 又给了没打过的
+  // :7896（coalesced/switch_to_url），代码却因为 budgetOverrun 已用掉直接
+  // give-up，客户端吃 429 —— 而同一秒别的请求在 :7893/:7896 上是通的。
+  // 契约：预算超支只是「别慢慢磨」，手里攥着没试过的新出口必须打完这一发；
+  // 没有新出口才收手（依次给 :7895 -> :7896 -> :7897 三条新线）。
+  it("预算已超支但手里还有没打过的新出口：继续打，不因预算收手", async () => {
+    const clock = vi.spyOn(Date, "now");
+    let now = 0;
+    clock.mockImplementation(() => now);
+    try {
+      fetchMock.mockImplementation(() => {
+        now += 30000; // 每发都超过 25s 预算
+        return Promise.resolve(rateLimited());
+      });
+      rotateMock
+        .mockResolvedValueOnce({ switched: true, switchedAt: 30000, reason: "ok", switchToUrl: "http://127.0.0.1:7895" })
+        .mockResolvedValueOnce({ switched: true, switchedAt: 60000, reason: "coalesced", switchToUrl: "http://127.0.0.1:7896" })
+        .mockResolvedValueOnce({ switched: true, switchedAt: 90000, reason: "coalesced", switchToUrl: "http://127.0.0.1:7897" })
+        .mockResolvedValue({ switched: false, switchedAt: 0, reason: "too_frequent" });
+
+      const { result, log } = await runReplay("budget-fresh-egress");
+
+      expect(result.response.status).toBe(429);
+      const warns = warnLines(log);
+      // 预算超支的第二发仍然是「手里有新出口」-> 必须打出去。
+      expect(warns.some((m) => m.includes("untried egress in hand, one more attempt"))).toBe(true);
+      expect(warns.some((m) => m.includes("retry 3/5 429"))).toBe(true);
+      // 没有新出口时照常收手：give-up 只能来自「无新线」，不能来自预算。
+      expect(warns.some((m) => m.includes("rotate budget spent") && m.includes("giving up"))).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("caller signal 已 abort 时 replay 完全不发起", async () => {
     const ctrl = new AbortController();
     ctrl.abort();

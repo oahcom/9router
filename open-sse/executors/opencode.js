@@ -1319,12 +1319,25 @@ export class OpenCodeExecutor extends BaseExecutor {
         // 首发已经打过了，这里只补换线重试的那几发。
         while (attemptNo < MAX_ROTATE_ATTEMPTS - 1) {
           if (attemptNo > 0 && Date.now() - requestStartedAt > ROTATE_ATTEMPT_BUDGET_MS) {
-            if (budgetOverrun) {
+            // 预算超支只是「别慢慢磨」的信号，不是「手里这条新出口也别打」：
+            // 2026-11-15 13:17 whdtocshq 手里攥着 asip 刚给、还没打过的 :7896
+            // （SIN-138），却因为 budgetOverrun 已用掉而直接 give-up，客户端吃
+            // 429 —— 同一秒别的请求在 :7893/:7896 上都是通的（可用闸口存在）。
+            // 只要手里是没打过的新出口就打完这一发；同址/无新线才收手。
+            // 总量仍由 MAX_ROTATE_ATTEMPTS 封顶，不是无限重试。
+            const freshInHand = Boolean(attempt?.switchToUrl && attempt.switchToUrl !== attemptProxyUrl)
+              || Boolean(attempt?.switchToNode && !triedPoolNodes.has(attempt.switchToNode))
+              || Boolean(attempt?.switchToEgress && !triedEgress.has(attempt.switchToEgress));
+            if (budgetOverrun && !freshInHand) {
               log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); giving up`);
               break;
             }
-            budgetOverrun = true;
-            log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); last resort on pending slot`);
+            if (!budgetOverrun) {
+              budgetOverrun = true;
+              log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); last resort on pending slot`);
+            } else {
+              log?.warn?.("EGRESS", `rotate budget spent after ${attemptNo} attempt(s); untried egress in hand, one more attempt`);
+            }
           }
           attemptNo += 1;
           const targetProxyUrl = attempt.switchToUrl || null;

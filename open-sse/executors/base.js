@@ -39,8 +39,8 @@ let lastConnectTimeoutRotateAt = 0;
 // 上游时就地失败 —— 实测 95 分钟内 35 条最终 429 全部是这一条路径、0 次换线，
 // 而同一时刻走 opencode 的 81 条全部换过线。换出口是 asip 的事，与执行器无关，
 // 所以这里补上同一套「换线再打」，判据仍然是「这条请求是否经本机 sing-box」。
-const MAX_429_SENDS = Math.max(1, Number(process.env.EGRESS_429_SENDS || 3));
-const ROTATE_429_BUDGET_MS = Number(process.env.EGRESS_429_BUDGET_MS || 25000);
+export const MAX_429_SENDS = Math.max(1, Number(process.env.EGRESS_429_SENDS || 3));
+export const ROTATE_429_BUDGET_MS = Number(process.env.EGRESS_429_BUDGET_MS || 25000);
 
 /** 测试隔离用：进程里不需要。 */
 export function resetConnectTimeoutRotateState() {
@@ -403,7 +403,9 @@ export class BaseExecutor {
             // —— 语义不变：重打前旧隧道的连接必须丢，不能骑着它再打一次。
             const nextProxyUrl = egressProxyOptions?.url
               || egressProxyOptions?.connectionProxyUrl || null;
-            clearProxyDispatchers(prevProxyUrl || undefined);
+            // 精准失效（P0-2）：只清本次旧出口。prevProxyUrl 为空（直连）
+            // 时旧 `|| undefined` 会整池 clear()，并发请求全部陪葬。
+            if (prevProxyUrl) clearProxyDispatchers(prevProxyUrl);
             if (nextProxyUrl && nextProxyUrl !== prevProxyUrl) {
               clearProxyDispatchers(nextProxyUrl);
             }

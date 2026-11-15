@@ -101,10 +101,10 @@ const MAX_LOCAL_COOLDOWN_MS = 60_000;
 // 只够试 2 条备线，仍有健康闸口时请求就被打死（wfzj8cftg 型漏出，与
 // 「有闸口可用时 0 生产 429」目标冲突）。防死循环不靠这个数 —— 同址白打由
 // triedEgress/triedPoolNodes 拒绝，总时长由 ROTATE_ATTEMPT_BUDGET_MS 兜底。
-const MAX_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.OPENCODE_ROTATE_ATTEMPTS || 6));
+export const MAX_ROTATE_ATTEMPTS = Math.max(1, Number(process.env.OPENCODE_ROTATE_ATTEMPTS || 6));
 // 从首次收到 429 起算的总预算。超预算就不再打：宁可把 429 交回调用方，
 // 也不要把一条请求拖到几十秒——上游限流窗口本来就不是秒级。
-const ROTATE_ATTEMPT_BUDGET_MS = Number(process.env.OPENCODE_ROTATE_BUDGET_MS || 25000);
+export const ROTATE_ATTEMPT_BUDGET_MS = Number(process.env.OPENCODE_ROTATE_BUDGET_MS || 25000);
 // asip 的 switched_at 是「秒」，转成毫秒后精度只有 1s；拿它跟本进程的 ms 级
 // requestStartedAt 比大小，差 1ms 就会把「刚换过线」判成「没换」。判定窗口统一
 // 放宽 1s：这一秒内的换线仍然算数（线确实是新的），更早的照旧不算。
@@ -290,9 +290,16 @@ const TRANSPORT_REPLAY_FAILURES = new Set([
  * invalidatePortConnections 会按端口兜底。URL 判不出来时回退全局——与旧行为
  * 一致，宁可多清不可漏清。
  */
-function invalidateEgressConnections(oldUrl, newUrl) {
-  clearProxyDispatchers(oldUrl || undefined);
-  bumpTransportGeneration(oldUrl || undefined);
+export function invalidateEgressConnections(oldUrl, newUrl) {  // 导出仅测试用（P0-2 契约）
+  // 精准失效（P0-2，2026-11-15）：只动本次涉及的出口。旧实现 oldUrl 为空时
+  // 用 `|| undefined` 落到 clearProxyDispatchers() 的整池 clear() 与
+  // bumpTransportGeneration(null) 的 globalGen 全端口 bump —— 一次换线把
+  // 同进程其它在途请求的暖连接/ sidecar 会话全部陪葬。出口未知（直连/未指派）
+  // 时宁可不动池：坏连接会自己再失败并走逐端口失效，陪葬是不可逆的。
+  if (oldUrl) {
+    clearProxyDispatchers(oldUrl);
+    bumpTransportGeneration(oldUrl);
+  }
   if (newUrl && newUrl !== oldUrl) {
     clearProxyDispatchers(newUrl);
     bumpTransportGeneration(newUrl);

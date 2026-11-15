@@ -39,7 +39,7 @@ function responseHeaders(input) {
 // （oven-sh/bun#31894）；`keepalive:false` 与裸 Connection: close 都拦不住
 // （#14538、#46027）。FetchSession 的 idleTimeout 是唯一有文档的淘汰口：
 // 10s 后未用的 socket 被丢弃，下一次请求重建，僵尸池最多影响 10s。
-const SESSION_IDLE_TIMEOUT_SEC = 10;
+const SESSION_IDLE_TIMEOUT_SEC = Math.min(120, Math.max(2, Number(process.env.OPENCODE_SESSION_IDLE_TIMEOUT_SEC || 10)));  // 可配：调大换连接复用率，调小换僵尸免疫（默认 10 不变）
 const SESSION_MAX_IDLE_SOCKETS = 8;
 // asip 会单方面重启隧道（实测同线重启 p50 22-24s），9router 未必收到换线通知，
 // generation 也就不一定变。对端没了、本地 socket 仍 ESTAB，持续流量下 idleTimeout

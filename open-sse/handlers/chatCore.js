@@ -578,11 +578,24 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     })).catch(() => { });
 
     const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
+    // 零 429 红线（哨兵口径，2026-11-16）：终场 429 不出客户端出口。换线环已在
+    // executor 内打光（或无闸可换），这里合成可重试 503 + 透传 Retry-After；真实
+    // 429 留在 TX-ATTEMPT / A1 记账供审计。日志同步 503 口径（哨兵查 ERROR 429）。
+    const synthFromRateLimit = statusCode === 429 && asipRotationEnabled();
+    const clientStatus = synthFromRateLimit ? 503 : statusCode;
     if (log?.errorLine) {
       const urlStr = providerUrl ? `\n    URL: ${providerUrl}` : "";
-      log.errorLine(reqTag, "✗", `ERROR ${statusCode} · ${provider}/${model} · ${Date.now() - requestStartTime}ms · req=${reqId}${urlStr}\n    ${errMsg}`);
+      const synthNote = synthFromRateLimit ? " · synthesized from upstream rate-limit" : "";
+      log.errorLine(reqTag, "✗", `ERROR ${clientStatus} · ${provider}/${model} · ${Date.now() - requestStartTime}ms · req=${reqId}${synthNote}${urlStr}\n    ${errMsg}`);
     }
     reqLogger.logError(new Error(message), finalBody || translatedBody);
+    if (synthFromRateLimit) {
+      return createErrorResult(503, `${errMsg}\n    [synthesized: upstream rate-limited after gateway rotation; retryable as 503]`, resetsAtMs, {
+        ...upstreamResponseHeaders(providerResponse.headers),
+        "x-transport-error-type": "synthetic",
+        "x-transport-failure": "upstream-rate-limited",
+      });
+    }
     return createErrorResult(statusCode, errMsg, resetsAtMs, upstreamResponseHeaders(providerResponse.headers));
   }
 

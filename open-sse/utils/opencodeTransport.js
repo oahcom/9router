@@ -276,11 +276,11 @@ function forward(transport, payload, signal, headerTimeoutMs = 0) {
  * 随 prompt 体量增长（同一出口实测 1000KB≈7.1s、2000KB≈10s；p90 444KB 桶
  * TTFT 27.9s）。固定 20s 只够判小请求，300–600KB 的正常请求会被判成假超时，
  * 进而换线 → 重放 → 还是同一出口 → 503。所以：
- *   - 首次 = headerTimeoutMs(20s) + 每 500KB 加 headerTimeoutPer500kbMs(15s)，
- *     封顶 headerTimeoutMaxMs(55s)。0/小 body 仍取 20s，快判语义不变。
- *   - 换线重放取 max(首次预算, headerTimeoutReplayMs=45s)：出口可能压根没变
- *     （asip 判「出口正常」就不换，它的探针是小请求），再按首次预算判一次
- *     等于把同一次失败重演一遍（实测 43s = 20+20 两次同出口超时后 503）。
+ *   - 每次尝试（首发/换线重放）都从本发起算、同一把尺（2026-11-16 裁决）：
+ *     headerTimeoutMs(10s) + 每 500KB 加 headerTimeoutPer500kbMs(25s)，
+ *     封顶 headerTimeoutMaxMs(55s)。0/小 body 仍取 10s，快判语义不变。
+ *   - 重放 = max(首次预算, headerTimeoutReplayMs)：默认 10s 与首发同尺
+ *     （45s 重放地板取消——地板曾让 trap 线白挂 45s 后照样 503）。
  *
  * 上限留在 base 的 60s 连接超时以内：超过它 base 的 connectCtrl 先 abort，
  * 这个预算形同虚设，失败时客户端还要白等满 60s。

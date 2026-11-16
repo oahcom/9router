@@ -85,21 +85,20 @@ export const OPENCODE_TRANSPORT_CONFIG = {
   // 流式请求等待上游响应头的上限：出口隧道中途重连时 forward 会挂到调用方
   // 中止（实测 60s），期间没有首字节。超时即判定该出口不可用，交给上层换线。
   // 非流式不设限：长生成在响应头返回前就可能超过该值，会误杀。
-  headerTimeoutMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS", 20 * 1000),
-  // 换线重放的等待上限。首次 20s 是「快速判死当前出口」的探针，重放再用同一个
-  // 20s 就是把同一次失败原样重演一遍：实测 43s = 20s + 20s，两次都撞同一个死
-  // 出口后回 503。而重放时 asip 往往回「出口正常，不换线」（它的探针是
-  // max_tokens:1 的小请求，小请求能过、大请求挂着），出口地址根本没变 ——
-  // 这时唯一能救回请求的就是「多等一会儿」。
-  // 实测同一出口首字节随请求体线性增长：1000KB≈7.1s、2000KB≈10s，真实请求
-  // p50 就有 452KB，叠上并发排队很容易越 20s。45s 仍在 base 的 60s 连接超时内。
-  headerTimeoutReplayMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_REPLAY_MS", 45 * 1000),
-  // 首字节预算随请求体增长。大 body 的 prefill 本身就慢（实测同一出口
-  // 1000KB≈7.1s、2000KB≈10s；p90 444KB 桶 TTFT 27.9s），固定 20s 只够判
-  // 小请求，300–600KB 的正常请求会被判成假超时 → 换线 → 503。
-  // 每 500KB 加 15s；封顶留在 base 60s 连接超时之前，否则 base 的 connectCtrl
-  // 会先 abort，这个数字形同虚设（失败时客户端还要白等满 60s）。
-  headerTimeoutPer500kbMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_PER_500KB_MS", 15 * 1000),
+  // 2026-11-16 裁决：每次尝试从本发起算、同一把短尺，基线 20s→10s。48h 定标
+  // （健康 2xx n=710）：<50KB 桶 p90=7.5s，10s 只误杀最慢 4%（换线重试廉价）；
+  // trap 线 24KB 挂 20.7s×2+45s 全是纯浪费（wi0mwkj3h/wi159ez4h）。
+  headerTimeoutMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS", 10 * 1000),
+  // 重放预算与首发同尺（2026-11-16 裁决：45s 重放地板取消）——地板曾让 trap
+  // 线全额白挂 45s 后照样 503（wi159ez4h 实测）。公式取 max(首次预算, 本值)，
+  // 默认 10s 即同尺；保留旋钮仅供应急拉高（env 配大即恢复旧「重放多等」语义）。
+  headerTimeoutReplayMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_REPLAY_MS", 10 * 1000),
+  // 首字节预算随请求体增长 = 大请求的保险垫。大 body 的 prefill 本征慢
+  // （48h 定标：>550KB 桶 p90=30.5s、p99=40.7s），基线砍到 10s 后靠这段缩放
+  // 兜住大请求：每 500KB 加 25s（700KB→45s 盖住 p99）。
+  // 封顶留在 base 60s 连接超时之前，否则 base 的 connectCtrl 会先 abort，
+  // 这个数字形同虚设（失败时客户端还要白等满 60s）。
+  headerTimeoutPer500kbMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_PER_500KB_MS", 25 * 1000),
   headerTimeoutMaxMs: envMs("OPENCODE_TRANSPORT_HEADER_TIMEOUT_MAX_MS", 55 * 1000),
   // 被节流的重置：一次上游超时后就 30s 不许重启 sidecar，这期间撞死 socket 的
   // 请求全部直接 503（6h 实测 11 次重启 vs 20 次节流）。5s 只够挡住同一批并发

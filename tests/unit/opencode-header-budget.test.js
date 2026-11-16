@@ -6,15 +6,11 @@ import { OPENCODE_TRANSPORT_CONFIG } from "../../open-sse/config/runtimeConfig.j
 /**
  * 首字节预算的两档语义。
  *
- * 线上的失败形状：一条请求 43s 后回 503，日志里是两次
- * `upstream header timeout (20000ms)` —— 20s + 20s。第二次是换线重放，但
- * asip 的探针打的是 max_tokens:1 的小请求，小请求能过、300KB 的大请求挂着，
- * 于是 asip 判「出口正常」不换线，出口地址根本没变。两次 20s 撞的是同一个
- * 出口，等于把同一次失败重演一遍。
- *
- * 同一出口实测首字节随请求体线性增长（1000KB≈7.1s、2000KB≈10s），真实请求
- * p50 就有 452KB，叠上并发排队很容易越 20s。所以重放要给更长的预算，但首次
- * 必须保持快判，否则死出口每条都白拖 45s。
+ * 2026-11-16 裁决（主人）：每个 header-timeout 从本发起算、同一把短尺——
+ * 基线 10s（48h 定标 <50KB 桶 p90=7.5s，只误杀最慢 4%）+ 每 500KB 25s 保险
+ * （>550KB 桶 p99=40.7s 由缩放兜住），封顶 55s。45s 重放地板取消：地板曾让
+ * trap 线（24KB）首发挂 20.7s + 重放白挂 45s 后照样 503（wi159ez4h 实测）。
+ * 历史语义（20s 快判 + 45s 重放多等）见 git 前史；env 仍可单独拉高重放预算。
  */
 describe("resolveHeaderTimeoutMs", () => {
   it("非流式不设上限", () => {
@@ -22,25 +18,26 @@ describe("resolveHeaderTimeoutMs", () => {
     expect(resolveHeaderTimeoutMs(false, true)).toBe(0);
   });
 
-  it("首次尝试用 20s 快判", () => {
+  it("首次尝试用 10s 快判", () => {
     expect(resolveHeaderTimeoutMs(true, false)).toBe(
       OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs,
     );
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs).toBe(20 * 1000);
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs).toBe(10 * 1000);
   });
 
-  it("换线重放放宽到 45s", () => {
+  it("换线重放与首发同尺（每 attempt 新时钟，45s 地板已取消）", () => {
     expect(resolveHeaderTimeoutMs(true, true)).toBe(
-      OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs,
+      resolveHeaderTimeoutMs(true, false),
     );
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBe(45 * 1000);
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBe(10 * 1000);
   });
 
   it("重放预算必须留在 base 的 60s 连接超时以内", () => {
     // 超过它，base 的 connectCtrl 会先 abort，45s 这个数字就形同虚设；
     // 而且失败时客户端要白等满 60s 才拿到 503。
     expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBeLessThan(60 * 1000);
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBeGreaterThan(
+    // 2026-11-16 起允许相等（同尺）：
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBeGreaterThanOrEqual(
       OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs,
     );
   });
@@ -66,13 +63,13 @@ describe("resolveHeaderTimeoutMs — body-size scaling", () => {
   const MB = 1024 * KB;
 
   it("配置值符合设计", () => {
-    expect(base).toBe(20 * 1000);
-    expect(per).toBe(15 * 1000);
+    expect(base).toBe(10 * 1000);
+    expect(per).toBe(25 * 1000);
     // 必须留在 base 的 60s 连接超时以内，否则 connectCtrl 先 abort。
     expect(max).toBeLessThan(60 * 1000);
   });
 
-  it("0 字节 / 未知体量仍是 20s 快判", () => {
+  it("0 字节 / 未知体量仍是 10s 快判", () => {
     expect(resolveHeaderTimeoutMs(true, false, 0)).toBe(base);
     expect(resolveHeaderTimeoutMs(true, false)).toBe(base);
     expect(resolveHeaderTimeoutMs(true, false, -1)).toBe(base);
@@ -110,18 +107,20 @@ describe("resolveHeaderTimeoutMs — body-size scaling", () => {
     expect(resolveHeaderTimeoutMs(false, true, 5 * MB)).toBe(0);
   });
 
-  it("重放取 max(首次预算, 45s)，且不超过 max", () => {
+  it("重放取 max(首次预算, 重放基线)，默认同尺且不超过 max", () => {
     const replay = OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs;
-    expect(replay).toBe(45 * 1000);
+    expect(replay).toBe(10 * 1000); // 2026-11-16：45s 地板取消
 
-    // 小 body：重放走 45s 下限（原有语义）。
-    expect(resolveHeaderTimeoutMs(true, true, 0)).toBe(replay);
-    expect(resolveHeaderTimeoutMs(true, true, 40 * KB)).toBe(replay);
+    // 同尺：重放预算 = 首发预算（每个 attempt 从本发起算同一把尺）。
+    expect(resolveHeaderTimeoutMs(true, true, 0)).toBe(
+      resolveHeaderTimeoutMs(true, false, 0),
+    );
+    expect(resolveHeaderTimeoutMs(true, true, 40 * KB)).toBe(
+      resolveHeaderTimeoutMs(true, false, 40 * KB),
+    );
 
-    // 大 body：首次预算已经超过 45s，重放要跟着更大的那份，不能被 45s 拉回去。
-    // 900KB → 20s + 1.8*15s = 47s > 45s，满足“首次超过重放下限”。
+    // 大 body：重放跟着首发的更大预算走（900KB → 10s + 1.8*25s = 55s）。
     const first900 = resolveHeaderTimeoutMs(true, false, 900 * KB);
-    expect(first900).toBeGreaterThan(replay);
     expect(resolveHeaderTimeoutMs(true, true, 900 * KB)).toBe(first900);
 
     // 封顶仍生效。

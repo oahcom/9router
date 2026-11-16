@@ -204,10 +204,10 @@ describe("P0-3 parameter coupling guard (explicit ack required)", () => {
     expect(ROTATE_ATTEMPT_BUDGET_MS).toBe(25000);
     expect(MAX_429_SENDS).toBe(3);
     expect(ROTATE_429_BUDGET_MS).toBe(25000);
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs).toBe(20000);
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBe(45000);
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs).toBe(10000);  // 2026-11-16 裁决：基线 20s→10s
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBe(10000);  // 2026-11-16：45s 重放地板取消，与首发同尺
     expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMaxMs).toBe(55000);
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutPer500kbMs).toBe(15000);
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutPer500kbMs).toBe(25000);  // 2026-11-16：保险缩放 15s→25s/500KB
   });
 
   it("invariants: budget covers one send, caps nest, sends bounded by chain", () => {
@@ -216,7 +216,8 @@ describe("P0-3 parameter coupling guard (explicit ack required)", () => {
     expect(ROTATE_ATTEMPT_BUDGET_MS).toBeGreaterThanOrEqual(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs);
     // 2. 重放预算不得超过 header 封顶；封顶不得超过…封顶
     expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs).toBeLessThanOrEqual(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMaxMs);
-    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs).toBeLessThan(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs);
+    // 2026-11-16 裁决后重放与首发同尺（允许相等），45s 地板取消：
+    expect(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMs).toBeLessThanOrEqual(OPENCODE_TRANSPORT_CONFIG.headerTimeoutReplayMs);
     // 3. base.js 429 发数不得多于换线环容量（3×3 发爆炸的防线）
     expect(MAX_429_SENDS).toBeLessThanOrEqual(MAX_ROTATE_ATTEMPTS);
     expect(ROTATE_429_BUDGET_MS).toBeLessThanOrEqual(OPENCODE_TRANSPORT_CONFIG.headerTimeoutMaxMs);

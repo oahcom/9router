@@ -236,6 +236,9 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
  */
 export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, trackDone, appendLog, pxpipe, reqId, reqTag, log }) {
   trackDone();
+  // 响应头到达时刻 = 首字节口径（非流式上游整包到达，头与体几乎同时）。
+  // DONE 行此前只传 total，TTFT 字段整条缺失——延迟口径没法按首字节查。
+  const headerAt = Date.now();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
 
@@ -285,7 +288,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   const usage = extractUsageFromResponse(responseBody);
   appendLog({ tokens: usage, status: "200 OK" });
   saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
-  if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime }, reqId }));
+  if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { ttft: headerAt - requestStartTime, total: Date.now() - requestStartTime }, reqId }));
 
   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
     ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, customToolNames)
@@ -339,7 +342,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   const totalLatency = Date.now() - requestStartTime;
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
-    latency: { ttft: totalLatency, total: totalLatency },
+    latency: { ttft: headerAt - requestStartTime, total: totalLatency },
     tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
     request: extractRequestConfig(body, stream),
     providerRequest: finalBody || translatedBody || null,

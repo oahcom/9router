@@ -193,6 +193,9 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   if (!isSSE) return null; // not handled here
 
   trackDone();
+  // 响应头到达时刻（首字节口径）：流被整体缓冲时至少保底；标准路径另记首块时刻
+  // （≈首 token）。DONE 行的 TTFT 字段此前整条缺失（只传 total），延迟口径没法查。
+  const headerAt = Date.now();
 
   const ctx = {
     provider, model, connectionId,
@@ -213,7 +216,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
       const usage = jsonResponse.usage || {};
       appendLog({ tokens: usage, status: "200 OK" });
       saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
-      if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime }, reqId }));
+      if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { ttft: headerAt - requestStartTime, total: Date.now() - requestStartTime }, reqId }));
 
       // Same cache-inclusive total for the recorded detail, so the DB and the
       // client-facing usage can never disagree.
@@ -225,7 +228,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
 
       saveRequestDetail(buildRequestDetail({
         ...ctx,
-        latency: { ttft: totalLatency, total: totalLatency },
+        latency: { ttft: headerAt - requestStartTime, total: totalLatency },
         tokens: { prompt_tokens: inTokensForLog, completion_tokens: usage.output_tokens || 0 },
         response: { content: textContent, thinking: null, finish_reason: jsonResponse.status || "unknown" },
         status: "success"
@@ -302,7 +305,23 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
 
   // Standard Chat Completions SSE path
   try {
-    const sseText = await providerResponse.text();
+    // 增量读取记首块时刻（≈首 token）：整体 text() 会把 TTFT 淹没在总时长里。
+    let sseText = "";
+    let firstChunkAt = 0;
+    const reader = providerResponse.body?.getReader?.();
+    if (reader) {
+      const dec = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!firstChunkAt && value && value.length) firstChunkAt = Date.now();
+        sseText += dec.decode(value, { stream: true });
+      }
+      sseText += dec.decode();
+    } else {
+      sseText = await providerResponse.text();
+    }
+    const ttftMs = (firstChunkAt || headerAt) - requestStartTime;
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
     if (parsed.error) {
@@ -325,12 +344,12 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     const usage = parsed.usage || {};
     appendLog({ tokens: usage, status: "200 OK" });
     saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
-    if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime }, reqId }));
+    if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { ttft: ttftMs, total: Date.now() - requestStartTime }, reqId }));
 
     const totalLatency = Date.now() - requestStartTime;
     saveRequestDetail(buildRequestDetail({
       ...ctx,
-      latency: { ttft: totalLatency, total: totalLatency },
+      latency: { ttft: ttftMs, total: totalLatency },
       tokens: usage,
       response: {
         content: parsed.choices?.[0]?.message?.content || null,

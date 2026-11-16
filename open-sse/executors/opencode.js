@@ -797,6 +797,73 @@ export class OpenCodeExecutor extends BaseExecutor {
    * 先让 asip 同步换线，再用新 generation 重放一次；asip 不可用或拒绝换线时，
    * 仍保留原出口新连接重试。只重试一次，避免并发超时放大成换线/请求风暴。
    */
+  /**
+   * stall 收场后的「fresh-in-hand 续试」（2026-11-16 主人「有没有走到兜底」复盘）。
+   * 二击上报的 rotateEgress 顺带换出的新线不再弃单——60ed7ad7/5ac82cf3 的
+   * 「只上报、不再重试」把 daemon 刚给的新线丢掉（2026-11-16 本窗 21 例双杀
+   * 弃单时手里有线；第七闸口兜底触发条件挂在 429 收场上，stall 收场永远走不到）。
+   * 这里是换线首打不是重放：不同出口，无「重放→换线→重放」拥塞放大；每个
+   * 收场点最多一发，环防护沿用 executeInner 的 triedEgress/预算/MAX_ROTATE
+   * 封顶（executeInner 不重入 retryOnceAfterStall，重放全程仍只有一趟）。
+   * 死线黑名单/A2 快速失败与 replay-429 续试同口径；daemon 拿不出新线才
+   * 按原样牺牲（无闸口可用，合理失败）。
+   */
+  async stallFreshLineContinue({
+    args, label, strikeNext, deadUrls, deadEgresses, failedEgress, accountingProxyUrl,
+  }) {
+    const targetUrl = strikeNext?.switchToUrl || null;
+    const targetEgress = strikeNext?.switchToEgress || null;
+    const targetNode = strikeNext?.switchToNode || null;
+    // egressStillCurrent veto（与 replay-429 续试同口径）：daemon 回包
+    // active_egress 仍是失败地址（IP 回收/台账旧记录），同口重连必然还是它，
+    // 不算「线已移走」。
+    const stillCurrent = Boolean(strikeNext?.activeEgress)
+      && strikeNext.activeEgress === (targetEgress || failedEgress || null);
+    const freshUrl = Boolean(targetUrl) && !deadUrls.has(targetUrl)
+      && !(targetEgress && deadEgresses.has(targetEgress));
+    const freshEgress = Boolean(targetEgress) && !deadEgresses.has(targetEgress);
+    const freshNode = Boolean(targetNode);
+    const lineMoved = strikeNext?.reason === "already_retired" && !stillCurrent;
+    if (strikeNext?.restartRequired
+        || !(freshUrl || freshEgress || freshNode || lineMoved)) {
+      return null;
+    }
+    args.log?.warn?.(
+      "EGRESS",
+      `${label} -> fresh-line continue on ${targetNode || targetUrl || targetEgress || "same-port (already_retired)"} (no sacrifice)`,
+    );
+    if (lineMoved && !freshUrl) {
+      invalidateEgressConnections(accountingProxyUrl);
+    }
+    let nextArgs = {
+      ...args,
+      body: cloneRequestBody(args.body) || args.body,
+      usedCredentials: {},
+      proxyOptions: targetUrl
+        ? { ...(args.proxyOptions || {}), url: targetUrl, enabled: true }
+        : args.proxyOptions,
+    };
+    // 跨出口/跨节点必须重建会话凭据（与重放步同款：固定 session 跨 IP 复用
+    // 会触上游全局拉黑）；同口换出口（lineMoved）沿用原凭据，重连即新出口。
+    const movedEgress = targetEgress || targetNode || null;
+    if (movedEgress && !deadEgresses.has(movedEgress)) {
+      try {
+        nextArgs = {
+          ...nextArgs,
+          credentials: this.prepareRequestCredentials({
+            ...args,
+            egressId: targetUrl || accountingProxyUrl || "asip-rotated",
+            egressIp: movedEgress,
+            sessionRotate: true,
+          }),
+        };
+      } catch {
+        // 保底沿用旧凭据：总好过放弃续试。
+      }
+    }
+    return await this.executeInner(nextArgs);
+  }
+
   async retryOnceAfterStall(result, args, context = {}) {
     if (result?.response?.status !== 503) return null;
     if (result.response.headers.get("x-transport-error-type") !== "synthetic") return null;
@@ -816,6 +883,9 @@ export class OpenCodeExecutor extends BaseExecutor {
       });
     }
     invalidateEgressConnections(context.proxyUrl, rotation?.switchToUrl);
+    // （2026-11-16 定标：同线重放 4/31=13% 救回、真换线 11/22=50%。「rotate
+    // 没换线就不重放」= 「停滞即换线」提案，会推翻「绝不再重放/declined 保
+    // 同线重放/无闸口 429 合理漏出」等复盘契约，留主人拍板，这里不顺手改。）
     args.log?.warn?.(
       "EGRESS",
       `transport stall (${failure}) -> retry once on fresh connection`
@@ -979,7 +1049,7 @@ export class OpenCodeExecutor extends BaseExecutor {
           && TRANSPORT_REPLAY_FAILURES.has(continuedFailure);
         if (continuedStalled && asipRotationEnabled()) {
           try {
-            await rotateEgress("transport", {
+            const strikeNext = await rotateEgress("transport", {
               signal: args?.signal,
               requestStartedAt: replayStartedAt,
               failedEgress: targetEgress || rotation?.switchToEgress || context?.failedEgress || null,
@@ -989,7 +1059,22 @@ export class OpenCodeExecutor extends BaseExecutor {
             });
             args.log?.warn?.(
               "EGRESS",
-              `continue stalled (${continuedFailure}) -> 2nd strike reported to asip on ${targetUrl || accountingProxyUrl}; no further retry`,
+              `continue stalled (${continuedFailure}) -> 2nd strike reported to asip on ${targetUrl || accountingProxyUrl}`,
+            );
+            // 零 503 牺牲（2026-11-16）：与 replay-stalled 同款，新线不再弃单。
+            const freshContinued = await this.stallFreshLineContinue({
+              args,
+              label: `continue stalled (${continuedFailure})`,
+              strikeNext,
+              deadUrls: new Set([context?.proxyUrl, accountingProxyUrl, targetUrl].filter(Boolean)),
+              deadEgresses: new Set([context?.failedEgress, rotation?.switchToEgress, targetEgress].filter(Boolean)),
+              failedEgress: targetEgress || rotation?.switchToEgress || context?.failedEgress || null,
+              accountingProxyUrl: targetUrl || accountingProxyUrl,
+            });
+            if (freshContinued) return freshContinued;
+            args.log?.warn?.(
+              "EGRESS",
+              `continue stalled (${continuedFailure}) -> no further retry (no fresh line in hand)`,
             );
           } catch (error) {
             args.log?.warn?.("EGRESS", `continue stall accounting failed: ${error?.message ?? String(error)}`);
@@ -1029,7 +1114,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       && TRANSPORT_REPLAY_FAILURES.has(replayFailureType);
     if (replayStalledAgain && asipRotationEnabled() && accountingProxyUrl) {
       try {
-        await rotateEgress("transport", {
+        const strikeNext = await rotateEgress("transport", {
           signal: args?.signal,
           requestStartedAt: replayStartedAt,
           failedEgress: rotation?.switchToEgress || context?.failedEgress || null,
@@ -1039,7 +1124,22 @@ export class OpenCodeExecutor extends BaseExecutor {
         });
         args.log?.warn?.(
           "EGRESS",
-          `replay stalled (${replayFailureType}) -> 2nd strike reported to asip on ${accountingProxyUrl}; no second replay`,
+          `replay stalled (${replayFailureType}) -> 2nd strike reported to asip on ${accountingProxyUrl}`,
+        );
+        // 零 503 牺牲（2026-11-16）：二击上报顺带换出的新线不再弃单。
+        const freshContinued = await this.stallFreshLineContinue({
+          args,
+          label: `replay stalled (${replayFailureType})`,
+          strikeNext,
+          deadUrls: new Set([context?.proxyUrl, accountingProxyUrl].filter(Boolean)),
+          deadEgresses: new Set([context?.failedEgress, rotation?.switchToEgress].filter(Boolean)),
+          failedEgress: rotation?.switchToEgress || context?.failedEgress || null,
+          accountingProxyUrl,
+        });
+        if (freshContinued) return freshContinued;
+        args.log?.warn?.(
+          "EGRESS",
+          `replay stalled (${replayFailureType}) -> no second replay (no fresh line in hand)`,
         );
       } catch (error) {
         args.log?.warn?.("EGRESS", `replay stall accounting failed: ${error?.message ?? String(error)}`);

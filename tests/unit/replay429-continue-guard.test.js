@@ -9,7 +9,8 @@
  * 锁三个行为：
  *   A  daemon 回指本请求已死过的口/出口 -> 不续试，快速返回首发的 synthetic 503（无 429 泄漏）
  *   A' daemon 给真新线（新口+新出口）-> 续试照常并采纳 200
- *   B  续试重入后又 stall -> 第二击上报 asip（rotateEgress("transport")）
+ *   B  续试重入后又 stall -> 第二击上报 asip（rotateEgress("transport")），
+ *      手里有新线则 fresh-line continue（2026-11-16 零 503 牺牲），无新线才牺牲
  *   C  already_retired（同口换出口）不受黑名单影响，仍续试
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -212,26 +213,49 @@ describe("replay-429 continue: in-request dead-line blacklist (fix A)", () => {
     expect(warned(logWarn, "already died in-request")).toBe(false);
   });
 
-  it("reports the 2nd strike to asip when the continued attempt stalls again (fix B)", async () => {
-    // 续试重入后又 stall：旧实现直接 return 零上报，trap 线靠 30 分钟探针缓存
-    // 连吃下一个请求。修复后必须补 line_ok 二击出局的「第二击」。
+  it("continues on a fresh line after the continued attempt stalls (fix B, 2026-11-16 zero-503)", async () => {
+    // 续试重入后又 stall：二击上报（line_ok 二击出局的「第二击」）必须发生，
+    // 且 daemon 换出的新线不再弃单（60ed7ad7/5ac82cf3 的「只上报不再重试」
+    // 2026-11-16 复盘推翻：21 例双杀弃单时手里有线）。
     rotateMock
       .mockResolvedValueOnce(rotateOk({ url: REPLAY_URL, egress: REPLAY_EGRESS }))
       .mockResolvedValueOnce(rotateOk({ url: "http://127.0.0.1:7893", egress: "fresh-ip" }))
-      .mockResolvedValueOnce(rotateOk({ url: "http://127.0.0.1:7896", egress: "next-ip" })); // 第二击上报的回包
+      .mockResolvedValueOnce(rotateOk({ url: "http://127.0.0.1:7896", egress: "next-ip" })); // 第二击上报的回包：真新线
     fetchMock
       .mockResolvedValueOnce(rateLimited()) // 重放 429
-      .mockResolvedValueOnce(stall503()); // 续试再 stall
+      .mockResolvedValueOnce(stall503()) // 续试再 stall
+      .mockResolvedValueOnce(ok()); // fresh-line continue 救回
 
     const { out, logWarn } = await runStallReplay("continue-stall-strike2");
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(out.response.status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(out.response.status).toBe(200);
     // 第三发 rotateEgress = 二击上报（reason="transport"，failedEgress=续试死掉的出口）
     expect(rotateMock).toHaveBeenCalledTimes(3);
     expect(rotateMock.mock.calls[2][0]).toBe("transport");
     expect(rotateMock.mock.calls[2][1].failedEgress).toBe("fresh-ip");
     expect(warned(logWarn, "2nd strike reported")).toBe(true);
+    expect(warned(logWarn, "fresh-line continue")).toBe(true);
+  });
+
+  it("reports the 2nd strike and sacrifices only when no fresh line is in hand", async () => {
+    // 反向：二击上报回包指回本请求已死过的线 -> 无闸口可用，按原样牺牲。
+    rotateMock
+      .mockResolvedValueOnce(rotateOk({ url: REPLAY_URL, egress: REPLAY_EGRESS }))
+      .mockResolvedValueOnce(rotateOk({ url: "http://127.0.0.1:7893", egress: "fresh-ip" }))
+      .mockResolvedValueOnce(rotateOk({ url: DEAD_URL, egress: DEAD_EGRESS })); // 第二击回指死线
+    fetchMock
+      .mockResolvedValueOnce(rateLimited()) // 重放 429
+      .mockResolvedValueOnce(stall503()); // 续试再 stall
+
+    const { out, logWarn } = await runStallReplay("continue-stall-no-fresh");
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(out.response.status).toBe(503);
+    expect(rotateMock).toHaveBeenCalledTimes(3);
+    expect(warned(logWarn, "2nd strike reported")).toBe(true);
+    expect(warned(logWarn, "fresh-line continue")).toBe(false);
+    expect(warned(logWarn, "no further retry (no fresh line in hand)")).toBe(true);
   });
 
   it("still continues on already_retired same-port (egress moved), unaffected by blacklist (fix C)", async () => {

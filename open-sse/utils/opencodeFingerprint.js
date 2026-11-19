@@ -633,16 +633,6 @@ export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   const normalized = neutralizeCallerToolNames(Array.isArray(tools) ? tools : [], map, new Set(map.keys()));
   body.tools = Array.isArray(normalized) ? normalized : [];
   const appended = appendMissingFingerprintTools(body.tools, flat);
-  if (appended.includes("shell")) {
-    // Remember the caller's own command tool so the response side can rewrite a
-    // decoy `shell` call back to it (codex: exec_command, args command->cmd).
-    // Stored as a Map ENTRY, not a Map property or module global: chatCore
-    // rebuilds the map with `new Map([...])` (keeps entries, drops ad-hoc
-    // properties), and request vs response code can be separate bundled module
-    // instances so a module-level global is not shared between them.
-    const dc = findCallerCommandTool(body.tools, map);
-    if (dc) map.set(DECOY_MAP_KEY, JSON.stringify({ ...dc, clientNames: [...(dc.clientNames || [])] }));
-  }
   retargetToolChoice(body, map);
   aliasHistoryToolCalls(body, map);
   if (appended.length) noteUnavailableTools(body, flat, appended, claude);
@@ -653,6 +643,15 @@ export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   // Responses keeps its explicit auto default. Never default to "none": upstream
   // answers tool_choice "none" with 403 FreeTierError.
   if (!body.tool_choice && flat) body.tool_choice = "auto";
+
+  // Remember the caller's real command tool (if any) so the response side can
+  // rewrite a decoy `shell`/`Bash` call back to it (codex: exec_command,
+  // command->cmd). Done last so retarget/aliasHistory above never see the
+  // sentinel entry. Set only when a `shell` decoy was actually appended.
+  if (appended.includes("shell")) {
+    const dc = findCallerCommandTool(body.tools, map, new Set(appended));
+    if (dc) map.set(DECOY_MAP_KEY, JSON.stringify({ ...dc, clientNames: [...(dc.clientNames || [])] }));
+  }
 
   recordRenamedToolNames(body, map);
   return map;
@@ -708,9 +707,13 @@ function rebuildRenamedMap(body) {
   // 命中了但也混着未改名的真名 → 这是首轮（真名会被改），不能跳过改名。
   if (plain > 0) return null;
   // 克隆体上 shell decoy 仍在：把 caller 命令工具描述一并重建，否则响应侧
-  // 拿不到 decoy 元数据（重建的 map 丢了原对象上的 entry）。
-  if (tools.some((t) => (toolNameOf(t) || "").toLowerCase() === "shell")) {
-    const dc = findCallerCommandTool(tools, map);
+  // 拿不到 decoy 元数据（重建的 map 丢了原对象上的 entry）。decoy 是保持真名
+  // 的 read/shell；caller 自己的同名工具早已被改成 fn_ 别名，故按「当前名」区分。
+  const decoyNames = new Set(
+    tools.map((t) => toolNameOf(t)).filter((n) => n === "read" || n === "shell"),
+  );
+  if (decoyNames.has("shell")) {
+    const dc = findCallerCommandTool(tools, map, decoyNames);
     if (dc) map.set(DECOY_MAP_KEY, JSON.stringify({ ...dc, clientNames: [...(dc.clientNames || [])] }));
   }
   recordRenamedToolNames(body, map);
@@ -766,17 +769,23 @@ const DECOY_SHELL_TOOL_NAMES = new Set(["shell", "bash", "sh", "shell_command", 
 const DECOY_MAP_KEY = "\u0000decoy";
 function readDecoyCommand(map) {
   if (!map || typeof map.get !== "function") return null;
+  // Cache the parsed descriptor (and the mutable decoy item-id set) on the map
+  // object so it survives across the per-event restore calls of one stream and
+  // is parsed only once per request.
+  if (map.__decoy) return map.__decoy;
   const raw = map.get(DECOY_MAP_KEY);
   if (!raw || typeof raw !== "string") return null;
   try {
     const dc = JSON.parse(raw);
     if (!dc) return null;
     dc.clientNames = new Set(dc.clientNames || []);
+    dc.itemIds = new Set();
+    map.__decoy = dc;
     return dc;
   } catch { return null; }
 }
 
-function findCallerCommandTool(tools, map) {
+function findCallerCommandTool(tools, map, decoyNames = new Set()) {
   if (!Array.isArray(tools)) return null;
   const clientNames = new Set();
   let found = null;
@@ -784,10 +793,17 @@ function findCallerCommandTool(tools, map) {
     const def = chatFunctionOf(tool) || tool;
     const current = toolNameOf(tool);
     if (!current) continue;
+    // The read/shell decoys keep their literal names; a caller tool of the same
+    // name was already aliased to fn_*, so skip only the literal decoys. Every
+    // other caller original (including a caller-declared shell/read) goes into
+    // clientNames so isDecoyShellName never rewrites the caller's own tool.
+    if (decoyNames.has(current)) continue;
     const original = (map && map.get(current)) || current;
-    if (original === "shell" || original === "read") continue;
     clientNames.add(original.toLowerCase());
     if (found) continue;
+    // Never remap a decoy to the caller's own `shell`/`read` name — those are the
+    // very names that triggered the rewrite.
+    if (original.toLowerCase() === "shell" || original.toLowerCase() === "read") continue;
     const props = def?.parameters?.properties;
     let argKey = "";
     if (props && typeof props === "object") {
@@ -850,11 +866,16 @@ function decoyFixPayload(node, dc) {
   };
 
   if (node.item && isDecoyShellName(node.item.name, dc)) {
+    if (node.item.id) dc.itemIds.add(node.item.id);
     put("item", remapDecoyItem(node.item, dc));
     changed = true;
   }
   if (Array.isArray(node.output)) {
-    const next = node.output.map((it) => remapDecoyItem(it, dc));
+    const next = node.output.map((it) => {
+      const remapped = remapDecoyItem(it, dc);
+      if (remapped !== it && it.id) dc.itemIds.add(it.id);
+      return remapped;
+    });
     if (next.some((it, i) => it !== node.output[i])) { put("output", next); changed = true; }
   }
   // OpenAI Chat Completions shapes: streaming delta.tool_calls and JSON message.tool_calls.
@@ -884,13 +905,17 @@ function decoyFixPayload(node, dc) {
     });
     if (nextChoices.some((c, i) => c !== node.choices[i])) { put("choices", nextChoices); changed = true; }
   }
-  // Argument-only events (function_call_arguments.delta/done) carry no name;
-  // translate the JSON key `"command":` in place (best-effort, key+colon only).
+  // Argument-only events (function_call_arguments.delta/done) carry no name, so
+  // translate only when the event's item_id was registered as a decoy call (set
+  // when its output_item carried the decoy name). This avoids corrupting the
+  // arguments of any legitimate tool that also uses a `command` field.
   if (typeof node.type === "string" && node.type.startsWith("response.function_call_arguments")) {
-    for (const field of ["arguments", "delta"]) {
-      if (typeof node[field] === "string" && node[field].includes('"command":')) {
-        put(field, node[field].split('"command":').join(`"${argKey}":`));
-        changed = true;
+    if (node.item_id && dc.itemIds.has(node.item_id)) {
+      for (const field of ["arguments", "delta"]) {
+        if (typeof node[field] === "string" && node[field].includes('"command":')) {
+          put(field, node[field].split('"command":').join(`"${argKey}":`));
+          changed = true;
+        }
       }
     }
   }
@@ -929,19 +954,20 @@ export function restoreToolNames(payload, map) {
 
   // Claude non-streaming message body.
   if (Array.isArray(payload.content)) {
-    put("content", payload.content.map((block) => {
+    const next = payload.content.map((block) => {
       const original = resolveRestoreName(block?.name, map);
       return block?.type === "tool_use" && original && original !== block.name
         ? { ...block, name: original }
         : block;
-    }));
+    });
+    if (next.some((block, i) => block !== payload.content[i])) put("content", next);
   }
 
   // OpenAI Chat Completions, both streaming delta and JSON message shapes.
   if (Array.isArray(payload.choices)) {
-    put("choices", payload.choices.map((choice) => {
+    const next = payload.choices.map((choice) => {
       let changed = false;
-      const next = { ...choice };
+      const nextChoice = { ...choice };
       for (const holder of ["delta", "message"]) {
         const value = choice?.[holder];
         if (!value || !Array.isArray(value.tool_calls) || value.tool_calls.length === 0) continue;
@@ -953,20 +979,22 @@ export function restoreToolNames(payload, map) {
           }
           return call;
         });
-        next[holder] = { ...value, tool_calls: calls };
+        nextChoice[holder] = { ...value, tool_calls: calls };
       }
-      return changed ? next : choice;
-    }));
+      return changed ? nextChoice : choice;
+    });
+    if (next.some((choice, i) => choice !== payload.choices[i])) put("choices", next);
   }
 
   // OpenAI Responses final JSON body.
   if (Array.isArray(payload.output)) {
-    put("output", payload.output.map((item) => {
+    const next = payload.output.map((item) => {
       const original = resolveRestoreName(item?.name, map);
       return item?.type === "function_call" && original && original !== item.name
         ? { ...item, name: original }
         : item;
-    }));
+    });
+    if (next.some((item, i) => item !== payload.output[i])) put("output", next);
   }
 
   // The terminal `response.completed` / `response.incomplete` event carries the

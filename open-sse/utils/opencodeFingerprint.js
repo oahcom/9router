@@ -633,6 +633,16 @@ export function applyFingerprintTools(body, flat, { claude = false } = {}) {
   const normalized = neutralizeCallerToolNames(Array.isArray(tools) ? tools : [], map, new Set(map.keys()));
   body.tools = Array.isArray(normalized) ? normalized : [];
   const appended = appendMissingFingerprintTools(body.tools, flat);
+  if (appended.includes("shell")) {
+    // Remember the caller's own command tool so the response side can rewrite a
+    // decoy `shell` call back to it (codex: exec_command, args command->cmd).
+    // Stored as a Map ENTRY, not a Map property or module global: chatCore
+    // rebuilds the map with `new Map([...])` (keeps entries, drops ad-hoc
+    // properties), and request vs response code can be separate bundled module
+    // instances so a module-level global is not shared between them.
+    const dc = findCallerCommandTool(body.tools, map);
+    if (dc) map.set(DECOY_MAP_KEY, JSON.stringify({ ...dc, clientNames: [...(dc.clientNames || [])] }));
+  }
   retargetToolChoice(body, map);
   aliasHistoryToolCalls(body, map);
   if (appended.length) noteUnavailableTools(body, flat, appended, claude);
@@ -697,6 +707,12 @@ function rebuildRenamedMap(body) {
   if (aliased === 0) return null;
   // 命中了但也混着未改名的真名 → 这是首轮（真名会被改），不能跳过改名。
   if (plain > 0) return null;
+  // 克隆体上 shell decoy 仍在：把 caller 命令工具描述一并重建，否则响应侧
+  // 拿不到 decoy 元数据（重建的 map 丢了原对象上的 entry）。
+  if (tools.some((t) => (toolNameOf(t) || "").toLowerCase() === "shell")) {
+    const dc = findCallerCommandTool(tools, map);
+    if (dc) map.set(DECOY_MAP_KEY, JSON.stringify({ ...dc, clientNames: [...(dc.clientNames || [])] }));
+  }
   recordRenamedToolNames(body, map);
   return map;
 }
@@ -730,6 +746,155 @@ function resolveRestoreName(name, map) {
     if (viaMap) return viaMap;
   }
   return aliasFor(name);
+}
+
+// --- Decoy interception (codex adaptation) --------------------------------
+// The appended `shell`/`read` are gate-only decoys; the upstream model cannot
+// tell they are fake and sometimes calls `shell` first, which the client
+// answers with "unsupported call: shell". Rewrite that call to the caller's
+// real command tool (codex: exec_command) and translate arguments: OpenCode's
+// `shell` takes `command`, codex's `exec_command` takes `cmd`.
+const DECOY_ARG_COMMAND_KEYS = ["cmd", "command", "command_line", "commandline"];
+const CALLER_COMMAND_TOOL_RE = /(^|[^a-z])(shell|bash|sh|exec_command|exec|command|run_command|terminal|pty|cmd)([^a-z]|$)/i;
+// Names the model may try for "run a shell": the appended `shell` decoy plus
+// Claude-Code-style hallucinations (`Bash`). Remapped to the caller's real
+// command tool unless the caller itself declared that name.
+const DECOY_SHELL_TOOL_NAMES = new Set(["shell", "bash", "sh", "shell_command", "terminal", "bash_command"]);
+// Sentinel Map entry holding the caller command-tool descriptor for this
+// request. A Map entry survives `new Map([...])` rebuilds (which drop ad-hoc
+// Map properties) and crosses bundled module instances (unlike a global).
+const DECOY_MAP_KEY = "\u0000decoy";
+function readDecoyCommand(map) {
+  if (!map || typeof map.get !== "function") return null;
+  const raw = map.get(DECOY_MAP_KEY);
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const dc = JSON.parse(raw);
+    if (!dc) return null;
+    dc.clientNames = new Set(dc.clientNames || []);
+    return dc;
+  } catch { return null; }
+}
+
+function findCallerCommandTool(tools, map) {
+  if (!Array.isArray(tools)) return null;
+  const clientNames = new Set();
+  let found = null;
+  for (const tool of tools) {
+    const def = chatFunctionOf(tool) || tool;
+    const current = toolNameOf(tool);
+    if (!current) continue;
+    const original = (map && map.get(current)) || current;
+    if (original === "shell" || original === "read") continue;
+    clientNames.add(original.toLowerCase());
+    if (found) continue;
+    const props = def?.parameters?.properties;
+    let argKey = "";
+    if (props && typeof props === "object") {
+      for (const key of DECOY_ARG_COMMAND_KEYS) { if (props[key]) { argKey = key; break; } }
+    }
+    if (!argKey) continue;
+    if (CALLER_COMMAND_TOOL_RE.test(original) || /command|exec|shell|bash|pty/i.test(def?.description || "")) {
+      found = { targetName: original, argKey };
+    }
+  }
+  return found ? { ...found, clientNames } : null;
+}
+
+/** Parse full OpenCode-`shell` args and rebuild them for the caller's command tool. */
+function translateDecoyArgs(raw, argKey) {
+  let obj;
+  try { obj = typeof raw === "string" ? JSON.parse(raw) : raw; } catch { return null; }
+  if (!obj || typeof obj !== "object") return null;
+  const command = typeof obj.command === "string" ? obj.command
+    : typeof obj.cmd === "string" ? obj.cmd : "";
+  if (!command) return null;
+  const cmd = typeof obj.workdir === "string" && obj.workdir
+    ? `cd ${obj.workdir} && ${command}` : command;
+  const out = {};
+  out[argKey] = cmd;
+  return JSON.stringify(out);
+}
+
+/** True when `name` is a shell-ish decoy we should rewrite (not the caller's own tool). */
+function isDecoyShellName(name, dc) {
+  if (typeof name !== "string") return false;
+  const lower = name.toLowerCase();
+  if (!DECOY_SHELL_TOOL_NAMES.has(lower)) return false;
+  if (dc?.clientNames?.has(lower)) return false;
+  return true;
+}
+
+/** Rewrite a decoy shell function_call item to the caller's command tool. */
+function remapDecoyItem(item, dc) {
+  if (!item || item.type !== "function_call" || !isDecoyShellName(item.name, dc)) return item;
+  if (typeof item.arguments === "string") {
+    const translated = translateDecoyArgs(item.arguments, dc.argKey);
+    return translated
+      ? { ...item, name: dc.targetName, arguments: translated }
+      : { ...item, name: dc.targetName };
+  }
+  return { ...item, name: dc.targetName };
+}
+
+/** Apply decoy->command-tool remap across the response shapes we see per event. */
+function decoyFixPayload(node, dc) {
+  if (!dc || !node || typeof node !== "object") return node;
+  const { argKey } = dc;
+  let changed = false;
+
+  let out = node;
+  const put = (key, value) => {
+    if (out === node) out = { ...node };
+    out[key] = value;
+  };
+
+  if (node.item && isDecoyShellName(node.item.name, dc)) {
+    put("item", remapDecoyItem(node.item, dc));
+    changed = true;
+  }
+  if (Array.isArray(node.output)) {
+    const next = node.output.map((it) => remapDecoyItem(it, dc));
+    if (next.some((it, i) => it !== node.output[i])) { put("output", next); changed = true; }
+  }
+  // OpenAI Chat Completions shapes: streaming delta.tool_calls and JSON message.tool_calls.
+  if (Array.isArray(node.choices)) {
+    const nextChoices = node.choices.map((choice) => {
+      let c = choice;
+      for (const holder of ["delta", "message"]) {
+        const value = choice?.[holder];
+        if (!value || !Array.isArray(value.tool_calls) || value.tool_calls.length === 0) continue;
+        const calls = value.tool_calls.map((call) => {
+          const fn = call?.function;
+          if (!fn || !isDecoyShellName(fn.name, dc)) return call;
+          const nf = { ...fn, name: dc.targetName };
+          if (typeof fn.arguments === "string") {
+            const full = holder === "message" ? translateDecoyArgs(fn.arguments, argKey) : null;
+            if (full) nf.arguments = full;
+            else if (fn.arguments.includes('"command":')) nf.arguments = fn.arguments.split('"command":').join(`"${argKey}":`);
+          }
+          return { ...call, function: nf };
+        });
+        if (calls.some((x, i) => x !== value.tool_calls[i])) {
+          if (c === choice) c = { ...choice };
+          c[holder] = { ...value, tool_calls: calls };
+        }
+      }
+      return c;
+    });
+    if (nextChoices.some((c, i) => c !== node.choices[i])) { put("choices", nextChoices); changed = true; }
+  }
+  // Argument-only events (function_call_arguments.delta/done) carry no name;
+  // translate the JSON key `"command":` in place (best-effort, key+colon only).
+  if (typeof node.type === "string" && node.type.startsWith("response.function_call_arguments")) {
+    for (const field of ["arguments", "delta"]) {
+      if (typeof node[field] === "string" && node[field].includes('"command":')) {
+        put(field, node[field].split('"command":').join(`"${argKey}":`));
+        changed = true;
+      }
+    }
+  }
+  return changed ? out : node;
 }
 
 /** Restore caller tool spellings in supported response/event shapes. */
@@ -819,5 +984,5 @@ export function restoreToolNames(payload, map) {
     put("item", { ...item, name: itemOriginal });
   }
 
-  return out;
+  return decoyFixPayload(out, readDecoyCommand(map));
 }

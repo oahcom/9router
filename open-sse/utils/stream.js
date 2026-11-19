@@ -5,7 +5,7 @@ import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds } from "./streamHelpers.js";
-import { restoreToolNames } from "./opencodeFingerprint.js";
+import { restoreToolNames, hasFingerprintAliases } from "./opencodeFingerprint.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -195,7 +195,7 @@ export function createSSEStream(options = {}) {
               // client received a call to a tool it never declared and answered
               // "Model tried to call unavailable tool 'read_client'" (#4986).
               let toolNameRestored = false;
-              if (toolNameMap?.size) {
+              if (toolNameMap?.size || hasFingerprintAliases()) {
                 const restored = restoreToolNames(parsed, toolNameMap);
                 if (restored !== parsed) {
                   parsed = restored;

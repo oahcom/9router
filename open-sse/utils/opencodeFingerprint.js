@@ -703,9 +703,40 @@ function rebuildRenamedMap(body) {
 
 // Response side -------------------------------------------------------------
 
+/**
+ * True while any fingerprint alias has ever been registered. The response side
+ * must still run restoreToolNames when the per-request map was lost (clone /
+ * replay / egress failover all clone the body and drop the WeakMap entry), so
+ * callers use this instead of `toolNameMap?.size` to decide whether to restore.
+ */
+export function hasFingerprintAliases() {
+  return aliasReverse.size > 0;
+}
+
+/**
+ * Resolve a wire tool name back to the caller's original spelling.
+ *
+ * Prefer the request-local map, then fall back to the global alias registry.
+ * WHY the fallback: the per-request `map` is recorded in a WeakMap keyed by the
+ * body object; any clone (base.js structuredClone, asip failover retry, 429
+ * replay) drops it. When that happens the response still carries `fn_xxxx`
+ * aliases, and without the global reverse lookup they reach the client verbatim
+ * — codex then answers "unsupported call: fn_xxxx" (observed 7x in one session).
+ */
+function resolveRestoreName(name, map) {
+  if (typeof name !== "string" || name === "") return null;
+  if (map && typeof map.get === "function") {
+    const viaMap = map.get(name);
+    if (viaMap) return viaMap;
+  }
+  return aliasFor(name);
+}
+
 /** Restore caller tool spellings in supported response/event shapes. */
 export function restoreToolNames(payload, map) {
-  if (!map?.size || !payload) return payload;
+  if (!payload) return payload;
+  const hasMap = !!map && typeof map.size === "number" && map.size > 0;
+  if (!hasMap && aliasReverse.size === 0) return payload;
   if (Array.isArray(payload)) return payload.map((item) => restoreToolNames(item, map));
   if (typeof payload !== "object") return payload;
 
@@ -725,17 +756,20 @@ export function restoreToolNames(payload, map) {
   // Claude streaming content_block_start event.
   if (payload.type === "content_block_start") {
     const block = payload.content_block;
-    if (block?.type === "tool_use" && typeof block.name === "string" && map.has(block.name)) {
-      put("content_block", { ...block, name: map.get(block.name) });
+    const original = resolveRestoreName(block?.name, map);
+    if (block?.type === "tool_use" && original && original !== block.name) {
+      put("content_block", { ...block, name: original });
     }
   }
 
   // Claude non-streaming message body.
   if (Array.isArray(payload.content)) {
-    put("content", payload.content.map((block) =>
-      block?.type === "tool_use" && typeof block.name === "string" && map.has(block.name)
-        ? { ...block, name: map.get(block.name) }
-        : block));
+    put("content", payload.content.map((block) => {
+      const original = resolveRestoreName(block?.name, map);
+      return block?.type === "tool_use" && original && original !== block.name
+        ? { ...block, name: original }
+        : block;
+    }));
   }
 
   // OpenAI Chat Completions, both streaming delta and JSON message shapes.
@@ -747,10 +781,10 @@ export function restoreToolNames(payload, map) {
         const value = choice?.[holder];
         if (!value || !Array.isArray(value.tool_calls) || value.tool_calls.length === 0) continue;
         const calls = value.tool_calls.map((call) => {
-          const name = call?.function?.name;
-          if (typeof name === "string" && map.has(name)) {
+          const original = resolveRestoreName(call?.function?.name, map);
+          if (original && original !== call?.function?.name) {
             changed = true;
-            return { ...call, function: { ...call.function, name: map.get(name) } };
+            return { ...call, function: { ...call.function, name: original } };
           }
           return call;
         });
@@ -762,10 +796,12 @@ export function restoreToolNames(payload, map) {
 
   // OpenAI Responses final JSON body.
   if (Array.isArray(payload.output)) {
-    put("output", payload.output.map((item) =>
-      item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)
-        ? { ...item, name: map.get(item.name) }
-        : item));
+    put("output", payload.output.map((item) => {
+      const original = resolveRestoreName(item?.name, map);
+      return item?.type === "function_call" && original && original !== item.name
+        ? { ...item, name: original }
+        : item;
+    }));
   }
 
   // The terminal `response.completed` / `response.incomplete` event carries the
@@ -778,8 +814,9 @@ export function restoreToolNames(payload, map) {
 
   // OpenAI Responses SSE events such as response.output_item.added/done.
   const item = payload.item;
-  if (item?.type === "function_call" && typeof item.name === "string" && map.has(item.name)) {
-    put("item", { ...item, name: map.get(item.name) });
+  const itemOriginal = resolveRestoreName(item?.name, map);
+  if (item?.type === "function_call" && itemOriginal && itemOriginal !== item.name) {
+    put("item", { ...item, name: itemOriginal });
   }
 
   return out;
